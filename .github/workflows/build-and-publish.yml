@@ -1,22 +1,24 @@
 name: Build & Publish · sandboxed.sh
 
-# Builds the multi-stage Dockerfile and pushes to ForgeCart's Nexus registry
-# at nexus.nexus.svc.cluster.local:8087, mirrored to registry.forgecart.com
-# for in-cluster image pulls. Runs on the forgecart Actions Runner Controller
-# pool (`arc-runner-set`) inside the workload cluster — that's why the BuildKit
-# endpoint, Nexus URL, and runner label all use cluster-internal DNS.
+# Builds the multi-stage Dockerfile, pushes to ForgeCart's Nexus registry
+# at nexus.nexus.svc.cluster.local:8087, rolls out the image to the
+# `sandboxed-sh` deployment in the workload cluster, and posts a status
+# embed to Discord. Runs on the forgecart Actions Runner Controller pool
+# (`arc-runner-set`) inside the cluster — that's why the BuildKit endpoint,
+# Nexus URL, kubectl API access, and runner label all use cluster-internal
+# DNS / the in-pod service account.
 #
 # Tags produced:
-#   sha-<short>  — every build
-#   latest       — only on default branch (master)
+#   sha-<short>  — every build, rolled to the live deployment.
+#   latest       — only on master.
 #
-# After a successful push, deployment in forgecart/cloud's application layer
-# picks the new image up via `kubectl set image deployment/sandboxed-sh ...`.
+# Mirrors the build → deploy → notify shape of forgecart/shop-beta's
+# `dev-deploy.yml` (kubectl install from Nexus, `kubectl set image`,
+# `kubectl wait`, Discord embed).
 
 on:
   push:
     branches: [master]
-    # Only rebuild when something the image actually depends on changed.
     paths:
       - "Dockerfile"
       - "docker/**"
@@ -33,11 +35,16 @@ on:
         required: false
         type: boolean
         default: true
+      skip-deploy:
+        description: Skip the kubectl rollout step (build/push only)
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
-  # Master builds queue (don't cancel-in-progress) so we never push an older
-  # commit's image on top of a newer one's :latest. Manual dispatches share
-  # the queue so they can't race a push either.
+  # Master builds queue (don't cancel-in-progress) so we never push an
+  # older commit's image on top of a newer one's :latest, and never roll
+  # a stale image to the cluster mid-rollout.
   group: build-and-publish
   cancel-in-progress: false
 
@@ -46,13 +53,22 @@ permissions:
 
 env:
   NEXUS_REGISTRY: nexus.nexus.svc.cluster.local:8087
+  PUBLIC_REGISTRY: registry.forgecart.com
+  TARGET_NAMESPACE: sandboxed-sh
+  TARGET_DEPLOYMENT: sandboxed-sh
+  TARGET_CONTAINER: sandboxed-sh
 
 jobs:
   build:
     name: Build & Publish Image
     runs-on: arc-runner-set
+    outputs:
+      short_sha: ${{ steps.sha.outputs.short_sha }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - id: sha
+        run: echo "short_sha=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
 
       - uses: ./.github/actions/docker-build
         with:
@@ -64,3 +80,78 @@ jobs:
           nexus-registry: ${{ env.NEXUS_REGISTRY }}
           nexus-username: ${{ secrets.NEXUS_USERNAME }}
           nexus-password: ${{ secrets.NEXUS_PASSWORD }}
+
+  # Roll the freshly-built image to the live deployment. Mirrors the
+  # `deploy-test-server` / `deploy-dev` stages from shop-beta's dev-deploy.yml.
+  # The ARC runner pod's service account talks to the cluster via the
+  # in-pod kubernetes.default token — no kubeconfig is needed.
+  deploy:
+    name: Roll Out to Cluster
+    needs: build
+    if: ${{ inputs.skip-deploy != true }}
+    runs-on: arc-runner-set
+    env:
+      SHORT_SHA: ${{ needs.build.outputs.short_sha }}
+    steps:
+      - name: Install kubectl
+        run: |
+          curl -LO "http://nexus.nexus.svc.cluster.local:8081/repository/raw-proxy-k8s/release/$(curl -L -s http://nexus.nexus.svc.cluster.local:8081/repository/raw-proxy-k8s/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+
+      - name: Roll image
+        run: |
+          kubectl set image deployment/${{ env.TARGET_DEPLOYMENT }} \
+            ${{ env.TARGET_CONTAINER }}=${{ env.PUBLIC_REGISTRY }}/forgecart/sandboxed-sh:sha-${{ env.SHORT_SHA }} \
+            -n ${{ env.TARGET_NAMESPACE }}
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/${{ env.TARGET_DEPLOYMENT }} \
+            -n ${{ env.TARGET_NAMESPACE }} \
+            --timeout=600s
+
+  # Post the build + deploy outcome to Discord. `if: always()` so failures
+  # also notify. Channel + bot token come from org secrets (same ones
+  # shop-beta uses). Mirrors notify-test-results / deploy-dev's embed.
+  notify:
+    name: Notify Discord
+    needs: [build, deploy]
+    if: always()
+    runs-on: arc-runner-set
+    env:
+      DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+      DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+      BUILD_RESULT: ${{ needs.build.result }}
+      DEPLOY_RESULT: ${{ needs.deploy.result }}
+      SHORT_SHA: ${{ needs.build.outputs.short_sha }}
+    steps:
+      - name: Post status to Discord
+        if: ${{ env.DISCORD_BOT_TOKEN != '' && env.DISCORD_CHANNEL_ID != '' }}
+        run: |
+          SE() { case "$1" in success) echo "✅" ;; skipped) echo "⏭️" ;; *) echo "❌" ;; esac; }
+          ALL_GOOD="false"
+          if [ "$BUILD_RESULT" = "success" ] && { [ "$DEPLOY_RESULT" = "success" ] || [ "$DEPLOY_RESULT" = "skipped" ]; }; then
+            ALL_GOOD="true"
+          fi
+          COLOR=$([ "$ALL_GOOD" = "true" ] && echo 3066993 || echo 15158332)
+          TITLE="sandboxed.sh — \`${SHORT_SHA}\`"
+          DESC=$([ "$ALL_GOOD" = "true" ] \
+            && echo "**Build & deploy succeeded** on \`${{ github.ref_name }}\`\n\n> Triggered by **@${{ github.actor }}**" \
+            || echo "**Build or deploy failed** on \`${{ github.ref_name }}\` — see GitHub run for details\n\n> Triggered by **@${{ github.actor }}**")
+          curl -fsSL -H "Content-Type: application/json" \
+            -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+            -d "{
+              \"embeds\": [{
+                \"title\": \"${TITLE}\",
+                \"url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",
+                \"color\": ${COLOR},
+                \"description\": \"${DESC}\",
+                \"fields\": [
+                  {\"name\": \"Build\",  \"value\": \"$(SE $BUILD_RESULT) ${BUILD_RESULT}\",  \"inline\": true},
+                  {\"name\": \"Deploy\", \"value\": \"$(SE $DEPLOY_RESULT) ${DEPLOY_RESULT}\", \"inline\": true},
+                  {\"name\": \"Commit\", \"value\": \"[\`${SHORT_SHA}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})\", \"inline\": true}
+                ],
+                \"footer\": {\"text\": \"${{ github.repository }} • build-and-publish\"},
+                \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"
+              }]
+            }" "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_ID/messages"

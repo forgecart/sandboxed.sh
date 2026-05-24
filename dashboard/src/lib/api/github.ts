@@ -25,6 +25,20 @@ export interface GithubAppStatus {
   enabled: boolean;
   app_id?: string;
   installation_id?: string;
+  /** GitHub's permission map (`{"contents": "read", ...}`). Present when the
+   * App is configured AND the installation details call succeeded. */
+  permissions?: Record<string, string>;
+  /** "all" or "selected" — whether the App is installed on every repo in
+   * the account or just a hand-picked set. */
+  repository_selection?: "all" | "selected";
+  account_login?: string;
+  account_html_url?: string;
+  /** True iff the installation has `contents: read` or `write`. */
+  can_read_contents: boolean;
+  /** True iff the installation has `contents: write`. */
+  can_write_contents: boolean;
+  /** Last-fetch error from `/app/installations/<id>`, surfaced inline. */
+  error?: string;
 }
 
 /**

@@ -71,6 +71,27 @@ pub struct GithubRepo {
     pub description: Option<String>,
 }
 
+/// Subset of `GET /app/installations/<id>` we surface on the Settings page.
+/// We use `serde_json::Value` for the permissions map so additions on
+/// GitHub's side don't require Rust changes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstallationDetails {
+    #[serde(default)]
+    pub permissions: serde_json::Value,
+    #[serde(default)]
+    pub repository_selection: String,
+    #[serde(default)]
+    pub account: Option<InstallationAccount>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstallationAccount {
+    #[serde(default)]
+    pub login: Option<String>,
+    #[serde(default)]
+    pub html_url: Option<String>,
+}
+
 /// Per-repo clone outcome surfaced to the agent + dashboard via
 /// `<mission_workspace>/repos.json`.
 #[derive(Debug, Clone, Serialize)]
@@ -207,6 +228,33 @@ impl GithubAppClient {
             "minted fresh GitHub App installation token"
         );
         Ok(parsed.token)
+    }
+
+    /// Fetch the installation's metadata (permissions, repo-selection scope,
+    /// installed-on account). Requires the App JWT, NOT the installation
+    /// token, because we're asking *about* the installation. Used by the
+    /// Settings → GitHub page to show "which permissions does the App have?".
+    pub async fn installation_details(&self) -> Result<InstallationDetails, String> {
+        let app_jwt = self.build_app_jwt()?;
+        let url = format!("{GITHUB_API}/app/installations/{}", self.installation_id);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&app_jwt)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", USER_AGENT)
+            .send()
+            .await
+            .map_err(|e| format!("installation details request failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("installation details HTTP {status}: {body}"));
+        }
+        resp.json()
+            .await
+            .map_err(|e| format!("decode installation details: {e}"))
     }
 
     /// List repositories the installation can see, following pagination.
@@ -419,29 +467,73 @@ pub async fn list_repositories_handler(
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct GithubAppStatus {
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub installation_id: Option<String>,
+    /// GitHub's permission map for the installation, e.g. `{ "contents": "read",
+    /// "metadata": "read" }`. Surfaced so the Settings page can show users
+    /// exactly which permissions the App is missing for cloning + pushing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<serde_json::Value>,
+    /// Repo selection on the installation: `all` or `selected`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_selection: Option<String>,
+    /// Login + html_url of the org/user this App is installed in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_login: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_html_url: Option<String>,
+    /// Convenience flags so the dashboard doesn't have to know which keys
+    /// in `permissions` matter for cloning vs pushing.
+    pub can_read_contents: bool,
+    pub can_write_contents: bool,
+    /// Last fetch error, if any. Surfaced inline on the Settings page so the
+    /// user sees "Bad PEM" / "App suspended" without digging through pod
+    /// logs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
-/// `GET /api/github/status` — health snapshot for a future Settings page.
-/// Safe to call when the App isn't configured (`enabled: false`).
+/// `GET /api/github/status` — health snapshot for the Settings → GitHub page.
+/// Safe to call when the App isn't configured (`enabled: false`). When the
+/// App is configured this also calls `GET /app/installations/<id>` so the
+/// dashboard can display the installation's permissions, repo-selection
+/// scope, and target account in one shot.
 pub async fn status_handler(State(state): State<Arc<AppState>>) -> Json<GithubAppStatus> {
-    if let Some(client) = state.github_app.as_ref() {
-        Json(GithubAppStatus {
-            enabled: true,
-            app_id: Some(client.app_id.clone()),
-            installation_id: Some(client.installation_id.clone()),
-        })
-    } else {
-        Json(GithubAppStatus {
-            enabled: false,
-            app_id: None,
-            installation_id: None,
-        })
+    let Some(client) = state.github_app.as_ref() else {
+        return Json(GithubAppStatus::default());
+    };
+    let mut status = GithubAppStatus {
+        enabled: true,
+        app_id: Some(client.app_id.clone()),
+        installation_id: Some(client.installation_id.clone()),
+        ..Default::default()
+    };
+    match client.installation_details().await {
+        Ok(details) => {
+            let perms = &details.permissions;
+            status.can_read_contents = perms
+                .get("contents")
+                .and_then(|v| v.as_str())
+                .map(|s| s == "read" || s == "write")
+                .unwrap_or(false);
+            status.can_write_contents = perms
+                .get("contents")
+                .and_then(|v| v.as_str())
+                .map(|s| s == "write")
+                .unwrap_or(false);
+            status.permissions = Some(details.permissions);
+            status.repository_selection = Some(details.repository_selection);
+            status.account_login = details.account.as_ref().and_then(|a| a.login.clone());
+            status.account_html_url = details.account.and_then(|a| a.html_url);
+        }
+        Err(e) => {
+            status.error = Some(e);
+        }
     }
+    Json(status)
 }
