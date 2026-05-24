@@ -2842,7 +2842,6 @@ pub(crate) fn claudecode_resume_current_session_message() -> &'static str {
 
 /// Execute a single turn for a mission.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn run_mission_turn(
     config: Config,
     _root_agent: AgentRef,

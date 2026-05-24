@@ -5942,7 +5942,6 @@ pub async fn stream(
 
 /// Spawn the global control session actor.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn spawn_control_session(
     config: Config,
     root_agent: AgentRef,
@@ -8253,7 +8252,6 @@ async fn agent_finished_automation_messages(
     clippy::collapsible_match,
     clippy::collapsible_else_if
 )]
-#[allow(clippy::too_many_arguments)]
 async fn control_actor_loop(
     config: Config,
     root_agent: AgentRef,
