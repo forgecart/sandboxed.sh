@@ -16,6 +16,9 @@ docs-site/
 ios_dashboard/
 *.md
 LICENSE
+# …but keep SKILL.md (and any other docs) under bundled-library/ — the Rust
+# binary embeds these at compile time via include_str!.
+!bundled-library/**/*.md
 
 # IDE / editor
 .vscode/

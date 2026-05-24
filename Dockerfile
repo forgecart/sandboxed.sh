@@ -30,8 +30,11 @@ RUN mkdir -p src/bin \
     && cargo build --release --lib 2>/dev/null || true \
     && cargo build --release 2>/dev/null || true
 
-# Copy real source and build
+# Copy real source and build. bundled-library/ is required at the workspace
+# root because src/library/mod.rs uses include_str!("../../bundled-library/…")
+# to bake skill manifests + workspace templates into the binary at compile time.
 COPY src/ src/
+COPY bundled-library/ bundled-library/
 RUN cargo build --release --bin sandboxed-sh --bin desktop-mcp --bin workspace-mcp --bin orchestrator-mcp
 
 # ---------------------------------------------------------------------------
