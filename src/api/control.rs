@@ -8939,7 +8939,7 @@ async fn control_actor_loop(
                                 // Use the mission ID that was captured when message was queued
                                 // This prevents race conditions where current_mission changes between queueing and execution
                                 let mission_id = msg_target_mid;
-                                let (workspace_id, model_override, model_effort, mission_agent, backend_id, session_id, mission_config_profile) = if let Some(mid) = mission_id {
+                                let (workspace_id, model_override, model_effort, mission_agent, backend_id, session_id, mission_config_profile, mission_initial_repos) = if let Some(mid) = mission_id {
                                     match mission_store.get_mission(mid).await {
                                         Ok(Some(mission)) => {
                                             // Activate mission: if pending, interrupted, blocked, completed, or failed, update status to active
@@ -8976,6 +8976,7 @@ async fn control_actor_loop(
                                                 Some(mission.backend.clone()),
                                                 mission.session_id.clone(),
                                                 mission.config_profile.clone(),
+                                                mission.initial_repos.clone(),
                                             )
                                         }
                                         Ok(None) => {
@@ -8983,7 +8984,7 @@ async fn control_actor_loop(
                                                 "Mission {} not found while resolving workspace",
                                                 mid
                                             );
-                                            (None, None, None, None, None, None, None)
+                                            (None, None, None, None, None, None, None, Vec::new())
                                         }
                                         Err(e) => {
                                             tracing::warn!(
@@ -8991,11 +8992,11 @@ async fn control_actor_loop(
                                                 mid,
                                                 e
                                             );
-                                            (None, None, None, None, None, None, None)
+                                            (None, None, None, None, None, None, None, Vec::new())
                                         }
                                     }
                                 } else {
-                                    (None, None, None, None, None, None, None)
+                                    (None, None, None, None, None, None, None, Vec::new())
                                 };
                                 // Per-message agent overrides mission agent
                                 let agent_override = per_msg_agent.or(mission_agent);
@@ -9006,6 +9007,7 @@ async fn control_actor_loop(
                                 main_runner_activity = None;
                                 main_runner_subtasks.clear();
                                 let user_id_for_turn = session_user_id.clone();
+                                let github_app_for_turn = github_app.clone();
                                 running = Some(tokio::spawn(async move {
                                     let result = run_single_control_turn(
                                         cfg,
@@ -9031,6 +9033,8 @@ async fn control_actor_loop(
                                         session_id,
                                         false, // force_session_resume: regular message, not a resume
                                         mission_config_profile,
+                                        mission_initial_repos,
+                                        github_app_for_turn,
                                         Some(user_id_for_turn),
                                     )
                                     .await;
@@ -9766,6 +9770,7 @@ async fn control_actor_loop(
                                         let agent_override = mission.agent.clone();
                                         let session_id = mission.session_id.clone();
                                         let mission_config_profile = mission.config_profile.clone();
+                                        let mission_initial_repos = mission.initial_repos.clone();
                                         running_cancel = Some(cancel.clone());
                                         // Capture which mission this task is working on (the resumed mission)
                                         running_mission_id = Some(mission_id);
@@ -9774,6 +9779,7 @@ async fn control_actor_loop(
                                         main_runner_activity = None;
                                         main_runner_subtasks.clear();
                                         let user_id_for_turn = session_user_id.clone();
+                                        let github_app_for_turn = github_app.clone();
                                         running = Some(tokio::spawn(async move {
                                             let result = run_single_control_turn(
                                                 cfg,
@@ -9799,6 +9805,8 @@ async fn control_actor_loop(
                                                 session_id,
                                                 true, // force_session_resume: this is a resume operation
                                                 mission_config_profile,
+                                                mission_initial_repos,
+                                                github_app_for_turn,
                                                 Some(user_id_for_turn),
                                             )
                                             .await;
@@ -10429,7 +10437,7 @@ async fn control_actor_loop(
                     // Use the mission ID that was captured when message was queued
                     // This prevents race conditions where current_mission changes between queueing and execution
                     let mission_id = msg_target_mid;
-                    let (workspace_id, model_override, model_effort, mission_agent, backend_id, session_id, mission_config_profile) = if let Some(mid) = mission_id {
+                    let (workspace_id, model_override, model_effort, mission_agent, backend_id, session_id, mission_config_profile, mission_initial_repos) = if let Some(mid) = mission_id {
                         match mission_store.get_mission(mid).await {
                             Ok(Some(mission)) => (
                                 Some(mission.workspace_id),
@@ -10439,13 +10447,14 @@ async fn control_actor_loop(
                                 Some(mission.backend.clone()),
                                 mission.session_id.clone(),
                                 mission.config_profile.clone(),
+                                mission.initial_repos.clone(),
                             ),
                             Ok(None) => {
                                 tracing::warn!(
                                     "Mission {} not found while resolving workspace",
                                     mid
                                 );
-                                (None, None, None, None, None, None, None)
+                                (None, None, None, None, None, None, None, Vec::new())
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -10453,11 +10462,11 @@ async fn control_actor_loop(
                                     mid,
                                     e
                                 );
-                                (None, None, None, None, None, None, None)
+                                (None, None, None, None, None, None, None, Vec::new())
                             }
                         }
                     } else {
-                        (None, None, None, None, None, None, None)
+                        (None, None, None, None, None, None, None, Vec::new())
                     };
                     // Per-message agent overrides mission agent
                     let agent_override = per_msg_agent.or(mission_agent);
@@ -10467,6 +10476,7 @@ async fn control_actor_loop(
                     main_runner_activity = None;
                     main_runner_subtasks.clear();
                     let user_id_for_turn = session_user_id.clone();
+                    let github_app_for_turn = github_app.clone();
                     running = Some(tokio::spawn(async move {
                         let result = run_single_control_turn(
                             cfg,
@@ -10492,6 +10502,8 @@ async fn control_actor_loop(
                             session_id,
                             false, // force_session_resume: continuation turn, not a resume
                             mission_config_profile,
+                            mission_initial_repos,
+                            github_app_for_turn,
                             Some(user_id_for_turn),
                         )
                         .await;
@@ -11235,6 +11247,8 @@ async fn run_single_control_turn(
     session_id: Option<String>,
     force_session_resume: bool,
     mission_config_profile: Option<String>,
+    initial_repos: Vec<super::github_app::RepoSelection>,
+    github_app: Option<Arc<super::github_app::GithubAppClient>>,
     boss_user_id: Option<String>,
 ) -> crate::agents::AgentResult {
     let is_claudecode = backend_id.as_deref() == Some("claudecode");
@@ -11313,6 +11327,39 @@ async fn run_single_control_turn(
                 config.working_dir.clone(),
             )),
         )
+    };
+
+    // Clone any picked GitHub repos into <mission_work_dir>/repos/<name>/ via
+    // the GitHub App's installation token. Fails soft per-repo. Single-repo
+    // case re-points the agent's cwd at the checkout for convenience. Skipped
+    // when the App isn't configured or no repos were picked — agent then runs
+    // in the empty mission dir like before. Mirrors the hook in
+    // mission_runner::run_mission_turn for the parallel-mission path.
+    let working_dir_path = if !initial_repos.is_empty() {
+        if let Some(client) = github_app.as_ref() {
+            let results = client.clone_repos(&initial_repos, &working_dir_path).await;
+            let succeeded = results.iter().filter(|r| r.success).count();
+            let failed = results.len().saturating_sub(succeeded);
+            tracing::info!(
+                mission_id = ?mission_id,
+                cloned = succeeded,
+                failed = failed,
+                "GitHub App initial-repos clone complete"
+            );
+            super::github_app::GithubAppClient::pick_working_directory(
+                &working_dir_path,
+                &results,
+            )
+        } else {
+            tracing::warn!(
+                mission_id = ?mission_id,
+                count = initial_repos.len(),
+                "Mission has initial_repos but GitHub App is not configured; skipping clone"
+            );
+            working_dir_path
+        }
+    } else {
+        working_dir_path
     };
 
     if let Some(ws) = runtime_workspace.as_ref() {
