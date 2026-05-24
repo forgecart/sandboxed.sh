@@ -72,6 +72,7 @@ export default function WorkspacesPage() {
   const [newWorkspaceName, setNewWorkspaceName] = useState('');
   const [newWorkspaceType, setNewWorkspaceType] = useState<'host' | 'container'>('container');
   const [newWorkspaceTemplate, setNewWorkspaceTemplate] = useState('');
+  const [newWorkspacePrivileged, setNewWorkspacePrivileged] = useState(false);
   const [skillsFilter, setSkillsFilter] = useState('');
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
   const [workspaceTab, setWorkspaceTab] = useState<'overview' | 'skills' | 'environment' | 'template' | 'build'>('overview');
@@ -290,6 +291,7 @@ export default function WorkspacesPage() {
         name: newWorkspaceName,
         workspace_type: workspaceType,
         template: newWorkspaceTemplate || undefined,
+        privileged: workspaceType === 'container' ? newWorkspacePrivileged : undefined,
       });
 
       // Refresh workspace list immediately after creation so it appears in the UI
@@ -321,6 +323,7 @@ export default function WorkspacesPage() {
       setShowNewWorkspaceDialog(false);
       setNewWorkspaceName('');
       setNewWorkspaceTemplate('');
+      setNewWorkspacePrivileged(false);
       setSelectedWorkspace(workspaceToShow);
     } catch (err) {
       showError(err instanceof Error ? err.message : 'Failed to create workspace');
@@ -1237,6 +1240,25 @@ export default function WorkspacesPage() {
                     : 'Creates isolated Linux filesystem'}
                 </p>
               </div>
+
+              {(newWorkspaceTemplate || newWorkspaceType === 'container') && (
+                <div>
+                  <label className="flex items-start gap-3 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={newWorkspacePrivileged}
+                      onChange={(e) => setNewWorkspacePrivileged(e.target.checked)}
+                      className="mt-0.5 h-4 w-4 rounded border-white/20 bg-black/20 text-indigo-500 focus:ring-indigo-500/40 cursor-pointer"
+                    />
+                    <span className="text-xs text-white/70">
+                      <span className="text-white font-medium">Privileged (nested docker)</span>
+                      <span className="block text-white/40 mt-0.5">
+                        Grants the workspace the capabilities it needs to run <code>docker</code> / <code>compose</code> stacks inside. Without this, OCI runtimes can&apos;t mount <code>/proc</code> and every <code>docker run</code> fails with EPERM. Trade-off: punctures some of the workspace&apos;s isolation — leave off unless you need nested containers.
+                      </span>
+                    </span>
+                  </label>
+                </div>
+              )}
             </div>
 
             <div className="px-6 py-4 border-t border-white/[0.06] flex items-center justify-end gap-2">

@@ -189,6 +189,16 @@ pub struct Workspace {
     /// Defaults to "default" if not specified.
     #[serde(default)]
     pub config_profile: Option<String>,
+    /// Grants the underlying systemd-nspawn invocation `--capability=all` +
+    /// a syscall-filter allowlist for `mount`/`unshare`/`pivot_root`, which
+    /// is required for OCI runtimes (`runc`, `crun`) to start containers
+    /// inside the workspace. Without it, every `docker run` fails at
+    /// `mount("proc", ...)` with EPERM. Opt-in per workspace because
+    /// granting these capabilities punctures some of nspawn's isolation
+    /// (a malicious agent could remount the workspace rootfs, etc.); set
+    /// to true only when nested containers / compose stacks are needed.
+    #[serde(default)]
+    pub privileged: bool,
 }
 
 impl Workspace {
@@ -215,6 +225,7 @@ impl Workspace {
             mcps: Vec::new(),
             mcps_replace_defaults: true,
             config_profile: None,
+            privileged: false,
         }
     }
 
@@ -241,6 +252,7 @@ impl Workspace {
             tailscale_mode: None,
             mcps: Vec::new(),
             mcps_replace_defaults: true,
+            privileged: false,
         }
     }
 }
@@ -433,6 +445,7 @@ impl WorkspaceStore {
                     mcps: Vec::new(),
                     mcps_replace_defaults: true,
                     config_profile: None,
+                    privileged: false,
                 };
 
                 orphaned.push(workspace);

@@ -90,6 +90,12 @@ pub struct CreateWorkspaceRequest {
     pub mcps_replace_defaults: bool,
     /// Optional config profile to apply to this workspace.
     pub config_profile: Option<String>,
+    /// Grant the workspace's nspawn invocation `--capability=all` plus the
+    /// syscall allowlist needed for nested OCI runtimes (runc/crun). Opt-in
+    /// because it punctures some of nspawn's isolation. Default false.
+    /// See `Workspace::privileged`.
+    #[serde(default)]
+    pub privileged: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,6 +129,9 @@ pub struct UpdateWorkspaceRequest {
     pub config_profile: Option<String>,
     /// Freeform workspace configuration (merged with existing config).
     pub config: Option<serde_json::Value>,
+    /// Toggle nspawn privileged mode (nested-container capability set). See
+    /// `Workspace::privileged`. Omit to leave unchanged.
+    pub privileged: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,6 +156,7 @@ pub struct WorkspaceResponse {
     pub mcps_replace_defaults: bool,
     pub config_profile: Option<String>,
     pub config: serde_json::Value,
+    pub privileged: bool,
 }
 
 impl From<Workspace> for WorkspaceResponse {
@@ -172,6 +182,7 @@ impl From<Workspace> for WorkspaceResponse {
             mcps_replace_defaults: w.mcps_replace_defaults,
             config_profile: w.config_profile,
             config: w.config,
+            privileged: w.privileged,
         }
     }
 }
@@ -506,6 +517,7 @@ async fn create_workspace(
             mcps: mcps.clone(),
             mcps_replace_defaults,
             config_profile: config_profile.clone(),
+            privileged: req.privileged,
         },
         WorkspaceType::Container => {
             let mut ws = Workspace::new_container(req.name, path);
@@ -521,6 +533,7 @@ async fn create_workspace(
             ws.mcps = mcps;
             ws.mcps_replace_defaults = mcps_replace_defaults;
             ws.config_profile = config_profile;
+            ws.privileged = req.privileged;
             ws
         }
     };
@@ -701,6 +714,10 @@ async fn update_workspace(
         } else {
             workspace.config_profile = Some(trimmed.to_string());
         }
+    }
+
+    if let Some(privileged) = req.privileged {
+        workspace.privileged = privileged;
     }
 
     // Merge freeform config (shallow merge of top-level keys)

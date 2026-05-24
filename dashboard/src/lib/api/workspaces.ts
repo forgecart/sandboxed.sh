@@ -29,6 +29,10 @@ export interface Workspace {
   shared_network?: boolean | null;
   tailscale_mode?: TailscaleMode | null;
   config_profile?: string | null;
+  /** Grants the workspace's nspawn invocation `--capability=all` + the
+   * syscall allowlist needed for nested OCI runtimes (runc/crun). Opt-in
+   * because it punctures some of nspawn's isolation. Default false. */
+  privileged?: boolean;
 }
 
 export type ContainerDistro =
@@ -91,6 +95,8 @@ export async function createWorkspace(data: {
   shared_network?: boolean | null;
   tailscale_mode?: TailscaleMode | null;
   config_profile?: string | null;
+  /** Per-workspace nested-container privilege flag — see Workspace.privileged. */
+  privileged?: boolean;
 }): Promise<Workspace> {
   return apiPost("/api/workspaces", data, "Failed to create workspace");
 }
@@ -108,6 +114,7 @@ export async function updateWorkspace(
     shared_network?: boolean | null;
     tailscale_mode?: TailscaleMode | null;
     config_profile?: string | null;
+    privileged?: boolean;
   }
 ): Promise<Workspace> {
   return apiPut(`/api/workspaces/${id}`, data, "Failed to update workspace");

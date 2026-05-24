@@ -614,24 +614,11 @@ impl WorkspaceExec {
         // permissions are needed to run OCI runtimes (runc / crun) inside.
         // Default nspawn strips CAP_SYS_ADMIN and seccomp-filters mount(),
         // which makes every `docker run` fail at `mount("proc", ...)` ->
-        // EPERM. Gated by SANDBOXED_SH_NSPAWN_PRIVILEGED — opt-in because
-        // enabling these caps trades a slice of the workspace isolation
-        // for working nested containers (per-mission dockerd, compose, …).
-        //
-        // Values:
-        //   1 / true / yes / on  -> add `--capability=all` and
-        //                           `--system-call-filter=...`
-        //   anything else / unset -> nspawn defaults (no nested docker)
-        let nspawn_privileged = std::env::var("SANDBOXED_SH_NSPAWN_PRIVILEGED")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
-        if nspawn_privileged {
+        // EPERM. Per-workspace flag (`Workspace::privileged`) — opt-in
+        // because enabling these caps trades a slice of the workspace
+        // isolation for working nested containers (per-mission dockerd,
+        // compose, ...). Toggle via the create/update workspace API.
+        if self.workspace.privileged {
             cmd.arg("--capability=all");
             // runc/crun need the mount + unshare family of syscalls. nspawn's
             // default seccomp policy denies them. Whitelist explicitly so the
