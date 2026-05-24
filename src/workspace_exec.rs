@@ -610,6 +610,41 @@ impl WorkspaceExec {
         cmd.arg("--register=no");
         cmd.arg("--keep-unit");
 
+        // Grant the workspace whatever extra Linux capabilities + system-call
+        // permissions are needed to run OCI runtimes (runc / crun) inside.
+        // Default nspawn strips CAP_SYS_ADMIN and seccomp-filters mount(),
+        // which makes every `docker run` fail at `mount("proc", ...)` ->
+        // EPERM. Gated by SANDBOXED_SH_NSPAWN_PRIVILEGED — opt-in because
+        // enabling these caps trades a slice of the workspace isolation
+        // for working nested containers (per-mission dockerd, compose, …).
+        //
+        // Values:
+        //   1 / true / yes / on  -> add `--capability=all` and
+        //                           `--system-call-filter=...`
+        //   anything else / unset -> nspawn defaults (no nested docker)
+        let nspawn_privileged = std::env::var("SANDBOXED_SH_NSPAWN_PRIVILEGED")
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        if nspawn_privileged {
+            cmd.arg("--capability=all");
+            // runc/crun need the mount + unshare family of syscalls. nspawn's
+            // default seccomp policy denies them. Whitelist explicitly so the
+            // OCI runtime can pivot_root + remount /proc + create new
+            // namespaces for the container it's launching.
+            cmd.arg("--system-call-filter=add_key keyctl bpf");
+            cmd.arg("--system-call-filter=mount umount2 pivot_root unshare setns");
+            // Container runtimes mknod block/char devices when bind-mounting
+            // host devices (e.g. /dev/null inside a container). Allow it.
+            cmd.arg("--property=DeviceAllow=block-* rwm");
+            cmd.arg("--property=DeviceAllow=char-* rwm");
+        }
+
         let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
             .ok()
             .filter(|s| !s.trim().is_empty())
