@@ -1,0 +1,66 @@
+name: Build & Publish · sandboxed.sh
+
+# Builds the multi-stage Dockerfile and pushes to ForgeCart's Nexus registry
+# at nexus.nexus.svc.cluster.local:8087, mirrored to registry.forgecart.com
+# for in-cluster image pulls. Runs on the forgecart Actions Runner Controller
+# pool (`arc-runner-set`) inside the workload cluster — that's why the BuildKit
+# endpoint, Nexus URL, and runner label all use cluster-internal DNS.
+#
+# Tags produced:
+#   sha-<short>  — every build
+#   latest       — only on default branch (master)
+#
+# After a successful push, deployment in forgecart/cloud's application layer
+# picks the new image up via `kubectl set image deployment/sandboxed-sh ...`.
+
+on:
+  push:
+    branches: [master]
+    # Only rebuild when something the image actually depends on changed.
+    paths:
+      - "Dockerfile"
+      - "docker/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "dashboard/**"
+      - ".github/actions/docker-build/**"
+      - ".github/workflows/build-and-publish.yml"
+  workflow_dispatch:
+    inputs:
+      cache-write:
+        description: Export build cache to Nexus :buildcache
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  # Master builds queue (don't cancel-in-progress) so we never push an older
+  # commit's image on top of a newer one's :latest. Manual dispatches share
+  # the queue so they can't race a push either.
+  group: build-and-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NEXUS_REGISTRY: nexus.nexus.svc.cluster.local:8087
+
+jobs:
+  build:
+    name: Build & Publish Image
+    runs-on: arc-runner-set
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - uses: ./.github/actions/docker-build
+        with:
+          image-name: forgecart/sandboxed-sh
+          dockerfile: Dockerfile
+          context: .
+          push: "true"
+          cache-write: ${{ inputs.cache-write == false && 'false' || 'true' }}
+          nexus-registry: ${{ env.NEXUS_REGISTRY }}
+          nexus-username: ${{ secrets.NEXUS_USERNAME }}
+          nexus-password: ${{ secrets.NEXUS_PASSWORD }}
