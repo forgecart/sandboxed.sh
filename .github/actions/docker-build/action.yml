@@ -1,0 +1,80 @@
+name: Docker Build & Push
+description: Build and push the sandboxed.sh image to ForgeCart's Nexus registry via the persistent in-cluster BuildKit daemon. Mirrored from forgecart/shop-beta.
+
+inputs:
+  image-name:
+    description: Image name (e.g. forgecart/sandboxed-sh)
+    required: true
+  dockerfile:
+    description: Path to the Dockerfile
+    required: true
+  context:
+    description: Docker build context
+    required: false
+    default: "."
+  push:
+    description: Push image to registry
+    required: false
+    default: "true"
+  cache-write:
+    description: Export build cache layers to Nexus :buildcache (set false on PR builds — they only need to read the cache)
+    required: false
+    default: "true"
+  nexus-registry:
+    description: Nexus container registry endpoint
+    required: true
+  nexus-username:
+    description: Nexus registry username
+    required: true
+  nexus-password:
+    description: Nexus registry password
+    required: true
+
+outputs:
+  tags:
+    description: Generated image tags
+    value: ${{ steps.meta.outputs.tags }}
+  digest:
+    description: Image digest
+    value: ${{ steps.build.outputs.digest }}
+
+runs:
+  using: composite
+  steps:
+    - name: Docker metadata
+      id: meta
+      uses: docker/metadata-action@dbef88086f6cef02e264edb7dbf63250c17cef6c  # v5.5.0
+      with:
+        images: ${{ inputs.nexus-registry }}/${{ inputs.image-name }}
+        tags: |
+          type=sha,prefix=sha-
+          type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3.7.0
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435  # v3.11.1
+      with:
+        driver: remote
+        endpoint: tcp://buildkit.arc-runners.svc.cluster.local:1234
+
+    - name: Login to Nexus Container Registry
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+      with:
+        registry: ${{ inputs.nexus-registry }}
+        username: ${{ inputs.nexus-username }}
+        password: ${{ inputs.nexus-password }}
+
+    - name: Build and push
+      id: build
+      uses: docker/build-push-action@ee4ca427a2f43b6a16632044ca514c076267da23  # v6.19.0
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.dockerfile }}
+        push: ${{ inputs.push }}
+        network: host
+        tags: ${{ steps.meta.outputs.tags }}
+        cache-from: type=registry,ref=${{ inputs.nexus-registry }}/${{ inputs.image-name }}:buildcache
+        cache-to: ${{ inputs.cache-write == 'true' && format('type=registry,ref={0}/{1}:buildcache,mode=max', inputs.nexus-registry, inputs.image-name) || '' }}
+        outputs: type=image,push=${{ inputs.push }},compression=zstd,force-compression=true
