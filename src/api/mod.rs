@@ -28,6 +28,7 @@ pub mod desktop;
 mod desktop_stream;
 pub mod fido;
 mod fs;
+pub mod github_app;
 mod github_auth;
 pub(crate) mod grok_goal;
 pub mod library;

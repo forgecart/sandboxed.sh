@@ -20,6 +20,8 @@ vi.mock('@/lib/api', () => ({
   getLibraryOpenCodeSettingsForProfile: vi.fn().mockResolvedValue({ agents: [] }),
   listBackendModelOptions: vi.fn().mockResolvedValue({ backends: {} }),
   listProviders: vi.fn().mockResolvedValue({ providers: [] }),
+  // GitHub App not configured in tests → picker hides silently.
+  listGithubRepositories: vi.fn().mockResolvedValue(null),
 }));
 
 function renderDialog(onCreate: Parameters<typeof NewMissionDialog>[0]['onCreate']) {

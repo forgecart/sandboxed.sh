@@ -109,6 +109,7 @@ impl MissionStore for FileMissionStore {
         config_profile: Option<&str>,
         parent_mission_id: Option<Uuid>,
         working_directory: Option<&str>,
+        initial_repos: &[crate::api::github_app::RepoSelection],
     ) -> Result<Mission, String> {
         let now = now_string();
         let metadata_source = title.and_then(|value| {
@@ -150,6 +151,7 @@ impl MissionStore for FileMissionStore {
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            initial_repos: initial_repos.to_vec(),
         };
         self.missions
             .write()

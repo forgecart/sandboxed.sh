@@ -2880,6 +2880,7 @@ async fn resolve_or_create_mission(
             config_profile: ctx.channel.default_config_profile.clone(),
             parent_mission_id: None,
             working_directory: None,
+            initial_repos: Vec::new(),
             respond: tx,
         })
         .await;
@@ -6007,6 +6008,7 @@ mod tests {
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            initial_repos: Vec::new(),
         }
     }
 

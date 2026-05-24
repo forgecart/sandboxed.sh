@@ -103,6 +103,13 @@ pub struct Mission {
     /// Active via a new user message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_viewed_at: Option<String>,
+    /// GitHub repos to clone into this mission's workspace before the agent
+    /// starts. Picked from the GitHub-App-backed repo dropdown in the New
+    /// Mission dialog. Empty (the default) means no clone happens — the
+    /// agent runs in an empty per-mission directory the same way it has
+    /// historically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub initial_repos: Vec<crate::api::github_app::RepoSelection>,
 }
 
 fn default_backend() -> String {
@@ -999,11 +1006,14 @@ pub trait MissionStore: Send + Sync {
             config_profile,
             None,
             None,
+            &[],
         )
         .await
     }
 
     /// Create a new mission with optional parent and working directory.
+    /// `initial_repos` is the list of GitHub repos to clone into the mission's
+    /// workspace before the agent starts. Empty = no clone.
     async fn create_mission_with_parent(
         &self,
         title: Option<&str>,
@@ -1015,6 +1025,7 @@ pub trait MissionStore: Send + Sync {
         config_profile: Option<&str>,
         parent_mission_id: Option<Uuid>,
         working_directory: Option<&str>,
+        initial_repos: &[crate::api::github_app::RepoSelection],
     ) -> Result<Mission, String>;
 
     /// Update mission status.

@@ -476,7 +476,10 @@ CREATE TABLE IF NOT EXISTS missions (
     resumable INTEGER NOT NULL DEFAULT 0,
     desktop_sessions TEXT,
     terminal_reason TEXT,
-    first_viewed_at TEXT
+    first_viewed_at TEXT,
+    -- JSON-serialized Vec<RepoSelection>; NULL means none. See
+    -- src/api/github_app.rs::RepoSelection.
+    initial_repos TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_missions_updated_at ON missions(updated_at DESC);
@@ -1903,6 +1906,20 @@ impl SqliteMissionStore {
                 .map_err(|e| format!("Failed to add first_viewed_at column: {}", e))?;
         }
 
+        // initial_repos: JSON-serialized Vec<RepoSelection> picked at mission
+        // creation time via the GitHub-App repo picker. NULL or '[]' means
+        // the mission has no initial repos.
+        let has_initial_repos_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'initial_repos'")
+            .map_err(|e| format!("Failed to check for initial_repos column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_initial_repos_column {
+            tracing::info!("Running migration: adding 'initial_repos' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN initial_repos TEXT", [])
+                .map_err(|e| format!("Failed to add initial_repos column: {}", e))?;
+        }
+
         Ok(())
     }
 
@@ -2201,7 +2218,8 @@ impl MissionStore for SqliteMissionStore {
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
                             config_profile, parent_mission_id, working_directory,
                             COALESCE(mission_mode, 'task') as mission_mode,
-                            COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at
+                            COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
+                            initial_repos
                      FROM missions
                      ORDER BY updated_at DESC
                      LIMIT ?1 OFFSET ?2",
@@ -2254,6 +2272,12 @@ impl MissionStore for SqliteMissionStore {
                             goal_mode: row.get::<_, i32>(25).unwrap_or(0) != 0,
                             goal_objective: row.get(26).ok().flatten(),
                             first_viewed_at: row.get(27).ok().flatten(),
+                            initial_repos: row
+                                .get::<_, Option<String>>(28)
+                                .ok()
+                                .flatten()
+                                .and_then(|s| serde_json::from_str(&s).ok())
+                                .unwrap_or_default(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2281,7 +2305,9 @@ impl MissionStore for SqliteMissionStore {
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
                             config_profile, parent_mission_id, working_directory,
-                            COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at FROM missions WHERE id = ?1",
+                            COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
+                            initial_repos
+                     FROM missions WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -2331,6 +2357,12 @@ impl MissionStore for SqliteMissionStore {
                             goal_mode: row.get::<_, i32>(25).unwrap_or(0) != 0,
                             goal_objective: row.get(26).ok().flatten(),
                             first_viewed_at: row.get(27).ok().flatten(),
+                            initial_repos: row
+                                .get::<_, Option<String>>(28)
+                                .ok()
+                                .flatten()
+                                .and_then(|s| serde_json::from_str(&s).ok())
+                                .unwrap_or_default(),
                     })
                 })
                 .optional()
@@ -2392,6 +2424,7 @@ impl MissionStore for SqliteMissionStore {
         config_profile: Option<&str>,
         parent_mission_id: Option<Uuid>,
         working_directory: Option<&str>,
+        initial_repos: &[crate::api::github_app::RepoSelection],
     ) -> Result<Mission, String> {
         let conn = self.conn.clone();
         let now = now_string();
@@ -2419,6 +2452,15 @@ impl MissionStore for SqliteMissionStore {
         let metadata_updated_at = metadata_source.as_ref().map(|_| now.clone());
         // Generate session_id for conversation persistence (used by Claude Code --session-id)
         let session_id = Uuid::new_v4().to_string();
+        let initial_repos_vec = initial_repos.to_vec();
+        let initial_repos_json = if initial_repos_vec.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&initial_repos_vec)
+                    .map_err(|e| format!("serialize initial_repos: {e}"))?,
+            )
+        };
 
         let mission = Mission {
             id,
@@ -2450,6 +2492,7 @@ impl MissionStore for SqliteMissionStore {
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            initial_repos: initial_repos_vec,
         };
 
         let m = mission.clone();
@@ -2460,8 +2503,8 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, resumable, session_id, parent_mission_id, working_directory, mission_mode, goal_mode, goal_objective)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, resumable, session_id, parent_mission_id, working_directory, mission_mode, goal_mode, goal_objective, initial_repos)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                 params![
                     m.id.to_string(),
                     status_to_string(m.status),
@@ -2486,6 +2529,7 @@ impl MissionStore for SqliteMissionStore {
                     mission_mode_str,
                     if m.goal_mode { 1i64 } else { 0i64 },
                     m.goal_objective,
+                    initial_repos_json,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -2503,7 +2547,7 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let mut stmt = conn
-                .prepare("SELECT id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, interrupted_at, resumable, session_id, terminal_reason, parent_mission_id, working_directory, COALESCE(mission_mode, 'task') as mission_mode FROM missions WHERE parent_mission_id = ?1")
+                .prepare("SELECT id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, interrupted_at, resumable, session_id, terminal_reason, parent_mission_id, working_directory, COALESCE(mission_mode, 'task') as mission_mode, initial_repos FROM missions WHERE parent_mission_id = ?1")
                 .map_err(|e| e.to_string())?;
             let missions = stmt
                 .query_map(params![parent_id_str], |row| {
@@ -2539,6 +2583,12 @@ impl MissionStore for SqliteMissionStore {
                             goal_mode: row.get::<_, i32>(23).unwrap_or(0) != 0,
                             goal_objective: row.get(24).ok().flatten(),
                             first_viewed_at: None,
+                            initial_repos: row
+                                .get::<_, Option<String>>(25)
+                                .ok()
+                                .flatten()
+                                .and_then(|s| serde_json::from_str(&s).ok())
+                                .unwrap_or_default(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -3137,6 +3187,7 @@ impl MissionStore for SqliteMissionStore {
                         goal_mode: false,
                         goal_objective: None,
                         first_viewed_at: None,
+                        initial_repos: Vec::new(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -3211,6 +3262,7 @@ impl MissionStore for SqliteMissionStore {
                         goal_mode: row.get::<_, i32>(14).unwrap_or(0) != 0,
                         goal_objective: row.get(15).ok().flatten(),
                         first_viewed_at: None,
+                        initial_repos: Vec::new(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -5187,6 +5239,7 @@ impl MissionStore for SqliteMissionStore {
                         goal_mode: false,
                         goal_objective: None,
                         first_viewed_at: None,
+                        initial_repos: Vec::new(),
                     })
                 })
                 .map_err(|e| e.to_string())?
