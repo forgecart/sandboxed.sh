@@ -6,7 +6,7 @@ import { createPortal } from 'react-dom';
 import { useRouter } from 'next/navigation';
 import { Plus, X, ExternalLink, RefreshCw, SlidersHorizontal } from 'lucide-react';
 import useSWR from 'swr';
-import { getVisibleAgents, getSandboxedConfig, listBackends, listBackendAgents, getClaudeCodeConfig, getLibraryOpenCodeSettingsForProfile, listBackendModelOptions, listProviders, type Backend, type BackendAgent, type BackendModelOption, type ModelEffort, type Provider } from '@/lib/api';
+import { getVisibleAgents, getSandboxedConfig, listBackends, listBackendAgents, getClaudeCodeConfig, getLibraryOpenCodeSettingsForProfile, listBackendModelOptions, listProviders, listGithubRepositories, type Backend, type BackendAgent, type BackendModelOption, type ModelEffort, type Provider, type GithubRepo, type RepoSelection } from '@/lib/api';
 import type { Workspace } from '@/lib/api';
 import { isBackendAvailable, useBackendConfigs } from '@/lib/use-backend-configs';
 
@@ -40,6 +40,9 @@ export interface NewMissionDialogOptions {
   backend?: string;
   /** Whether the mission will be opened in a new tab (skip local state updates) */
   openInNewTab?: boolean;
+  /** GitHub repos picked in the dialog. The backend clones each into
+   * `<mission_workspace>/repos/<name>/` before the agent starts. */
+  initialRepos?: RepoSelection[];
 }
 
 export interface CreatedMission {
@@ -135,6 +138,11 @@ export function NewMissionDialog({
   const router = useRouter();
   const [open, setOpen] = useState(autoOpen);
   const [newMissionWorkspace, setNewMissionWorkspace] = useState('');
+  // Repos picked from the GitHub-App-backed multi-select. Keyed by full_name.
+  const [selectedRepos, setSelectedRepos] = useState<Map<string, RepoSelection>>(
+    new Map(),
+  );
+  const [repoFilter, setRepoFilter] = useState('');
   // Combined value: "backend:agent" or empty for default
   const [selectedAgentValue, setSelectedAgentValue] = useState('');
   const [modelOverride, setModelOverride] = useState('');
@@ -215,6 +223,20 @@ export function NewMissionDialog({
     () => listBackendAgents('grok'),
     { revalidateOnFocus: true, dedupingInterval: 5000 }
   );
+
+  // SWR: fetch GitHub repos the App's installation can see. Resolves to
+  // `null` (not error) when the App isn't configured → picker hides.
+  const {
+    data: githubRepos,
+    isLoading: githubReposLoading,
+    error: githubReposError,
+    mutate: mutateGithubRepos,
+  } = useSWR<GithubRepo[] | null>(
+    open && !isEditMode ? 'github-repositories' : null,
+    listGithubRepositories,
+    { revalidateOnFocus: false, dedupingInterval: 5 * 60 * 1000 },
+  );
+  const githubReposAvailable = githubRepos !== null && githubRepos !== undefined;
 
   // SWR: fallback for opencode agents
   const { data: agentsPayload, mutate: mutateAgentsPayload } = useSWR(open ? 'opencode-agents' : null, getVisibleAgents, {
@@ -583,6 +605,8 @@ export function NewMissionDialog({
 
   const resetForm = () => {
     setNewMissionWorkspace('');
+    setSelectedRepos(new Map());
+    setRepoFilter('');
     setSelectedAgentValue('');
     setModelOverride('');
     setModelEffort('');
@@ -637,6 +661,8 @@ export function NewMissionDialog({
       configProfile: isEditMode
         ? initialValues?.configProfile ?? null
         : workspaceProfile || undefined,
+      initialRepos:
+        selectedRepos.size > 0 ? Array.from(selectedRepos.values()) : undefined,
     };
   };
 
@@ -777,6 +803,145 @@ export function NewMissionDialog({
               </select>
               <p className="text-xs text-white/30 mt-1.5">Where the mission will run</p>
             </div>
+
+            {/* GitHub repos picker (hidden when App not configured or in edit mode) */}
+            {!isEditMode && githubReposAvailable && (
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="block text-xs text-white/50">
+                    Repositories ({selectedRepos.size} picked)
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => mutateGithubRepos()}
+                    title="Refresh repo list"
+                    className="p-1 rounded text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors"
+                  >
+                    <RefreshCw className={`h-3 w-3 ${githubReposLoading ? 'animate-spin' : ''}`} />
+                  </button>
+                </div>
+
+                {/* Selected repos as chips */}
+                {selectedRepos.size > 0 && (
+                  <div className="flex flex-wrap gap-1.5 mb-2">
+                    {Array.from(selectedRepos.values()).map((sel) => {
+                      const repo = githubRepos?.find((r) => r.full_name === sel.full_name);
+                      const branchLabel = sel.branch?.trim() || repo?.default_branch || 'default';
+                      return (
+                        <span
+                          key={sel.full_name}
+                          className="inline-flex items-center gap-1.5 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-1 text-xs text-white/90"
+                        >
+                          <span className="font-mono">{sel.full_name}</span>
+                          <span className="text-white/50">@</span>
+                          <input
+                            type="text"
+                            value={sel.branch ?? ''}
+                            placeholder={repo?.default_branch || 'branch'}
+                            onChange={(e) => {
+                              setSelectedRepos((prev) => {
+                                const next = new Map(prev);
+                                next.set(sel.full_name, {
+                                  full_name: sel.full_name,
+                                  branch: e.target.value || undefined,
+                                });
+                                return next;
+                              });
+                            }}
+                            className="w-20 bg-transparent border-b border-white/10 focus:border-indigo-500/50 focus:outline-none text-xs text-white/80"
+                            title={`Default branch: ${branchLabel}`}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSelectedRepos((prev) => {
+                                const next = new Map(prev);
+                                next.delete(sel.full_name);
+                                return next;
+                              });
+                            }}
+                            className="text-white/40 hover:text-white/80"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Filter + checkbox list */}
+                <input
+                  type="text"
+                  value={repoFilter}
+                  onChange={(e) => setRepoFilter(e.target.value)}
+                  placeholder="Filter forgecart/* repos…"
+                  className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white placeholder:text-white/30 focus:border-indigo-500/50 focus:outline-none"
+                />
+                <div className="mt-1.5 max-h-40 overflow-y-auto rounded-lg border border-white/[0.04] bg-white/[0.01]">
+                  {githubReposLoading && (
+                    <div className="p-2 text-xs text-white/40">Loading repos…</div>
+                  )}
+                  {!githubReposLoading && githubRepos && githubRepos.length === 0 && (
+                    <div className="p-2 text-xs text-white/40">
+                      The GitHub App installation can&apos;t see any repos.
+                    </div>
+                  )}
+                  {githubRepos
+                    ?.filter((r) => {
+                      if (!repoFilter.trim()) return true;
+                      return r.full_name
+                        .toLowerCase()
+                        .includes(repoFilter.trim().toLowerCase());
+                    })
+                    .slice(0, 50)
+                    .map((repo) => {
+                      const checked = selectedRepos.has(repo.full_name);
+                      return (
+                        <label
+                          key={repo.id}
+                          className="flex items-center gap-2 px-2 py-1.5 hover:bg-white/[0.03] cursor-pointer"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) => {
+                              setSelectedRepos((prev) => {
+                                const next = new Map(prev);
+                                if (e.target.checked) {
+                                  next.set(repo.full_name, {
+                                    full_name: repo.full_name,
+                                    branch: undefined,
+                                  });
+                                } else {
+                                  next.delete(repo.full_name);
+                                }
+                                return next;
+                              });
+                            }}
+                            className="h-3.5 w-3.5"
+                          />
+                          <span className="font-mono text-xs text-white/80">{repo.full_name}</span>
+                          <span className="text-xs text-white/30">
+                            default: {repo.default_branch}
+                          </span>
+                          {repo.private && (
+                            <span className="text-[10px] uppercase text-white/30 px-1 border border-white/10 rounded">
+                              private
+                            </span>
+                          )}
+                        </label>
+                      );
+                    })}
+                </div>
+                {githubReposError && (
+                  <p className="text-xs text-red-400 mt-1">{githubReposError.message}</p>
+                )}
+                <p className="text-xs text-white/30 mt-1.5">
+                  Cloned into <code>{'<mission_workspace>/repos/<name>/'}</code> before the agent starts.
+                </p>
+              </div>
+            )}
 
             {/* Agent selection (includes backend) */}
             <div>

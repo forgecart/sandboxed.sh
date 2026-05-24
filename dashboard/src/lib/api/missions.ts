@@ -72,6 +72,8 @@ export interface Mission {
   mission_mode?: "task" | "assistant";
   goal_mode?: boolean;
   goal_objective?: string | null;
+  /** Repos this mission was created with (from the GitHub-App picker). */
+  initial_repos?: RepoSelection[];
 }
 
 export interface StoredEvent {
@@ -98,6 +100,13 @@ export interface MissionSnapshot {
   running?: RunningMissionInfo;
 }
 
+export interface RepoSelection {
+  /** "owner/repo", e.g. "forgecart/shop-beta". */
+  full_name: string;
+  /** Branch to check out. Omit/empty = repo default branch. */
+  branch?: string;
+}
+
 export interface CreateMissionOptions {
   title?: string;
   workspaceId?: string;
@@ -106,6 +115,9 @@ export interface CreateMissionOptions {
   modelEffort?: ModelEffort;
   configProfile?: string;
   backend?: string;
+  /** GitHub repos to clone into the mission workspace before the agent
+   * starts. Sourced from the repo picker in the New Mission dialog. */
+  initialRepos?: RepoSelection[];
 }
 
 export interface UpdateMissionSettingsOptions {
@@ -317,6 +329,7 @@ export async function createMission(
     model_effort?: ModelEffort;
     config_profile?: string;
     backend?: string;
+    initial_repos?: RepoSelection[];
   } = {};
 
   if (options?.title) body.title = options.title;
@@ -326,6 +339,9 @@ export async function createMission(
   if (options?.modelEffort) body.model_effort = options.modelEffort;
   if (options?.configProfile) body.config_profile = options.configProfile;
   if (options?.backend) body.backend = options.backend;
+  if (options?.initialRepos && options.initialRepos.length > 0) {
+    body.initial_repos = options.initialRepos;
+  }
 
   const res = await apiFetch("/api/control/missions", {
     method: "POST",

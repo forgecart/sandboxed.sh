@@ -21,6 +21,7 @@ import {
   resumeMission,
   type ModelEffort,
   type Mission,
+  type RepoSelection,
 } from '@/lib/api';
 import {
   Activity,
@@ -450,7 +451,7 @@ function OverviewPageContent() {
   );
 
   const handleNewMission = useCallback(
-    async (options?: { workspaceId?: string; agent?: string; modelOverride?: string; modelEffort?: ModelEffort; configProfile?: string | null; backend?: string; openInNewTab?: boolean }) => {
+    async (options?: { workspaceId?: string; agent?: string; modelOverride?: string; modelEffort?: ModelEffort; configProfile?: string | null; backend?: string; openInNewTab?: boolean; initialRepos?: RepoSelection[] }) => {
       try {
         setCreatingMission(true);
         const mission = await createMission({
@@ -460,6 +461,7 @@ function OverviewPageContent() {
           modelEffort: options?.modelEffort,
           configProfile: options?.configProfile ?? undefined,
           backend: options?.backend,
+          initialRepos: options?.initialRepos,
         });
         toast.success('New mission created');
         return { id: mission.id };

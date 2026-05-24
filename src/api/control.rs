@@ -3001,6 +3001,8 @@ pub enum ControlCommand {
         parent_mission_id: Option<Uuid>,
         /// Working directory override (for git worktrees etc.)
         working_directory: Option<String>,
+        /// Initial repos to clone into the mission's workspace.
+        initial_repos: Vec<crate::api::github_app::RepoSelection>,
         respond: oneshot::Sender<Result<Mission, String>>,
     },
     /// Update mission status
@@ -3271,6 +3273,10 @@ pub struct ControlHub {
     library: SharedLibrary,
     secrets: Option<Arc<SecretsStore>>,
     telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
+    /// Optional GitHub App client. Threaded into every spawned control
+    /// session so MissionRunner can use it to clone the mission's
+    /// `initial_repos`. Set by `AppState::serve()` after `Config::from_env`.
+    github_app: Option<Arc<super::github_app::GithubAppClient>>,
 }
 
 impl ControlHub {
@@ -3291,7 +3297,14 @@ impl ControlHub {
             library,
             secrets,
             telegram_bridge: None,
+            github_app: None,
         }
+    }
+
+    /// Inject the GitHub App client. Called from `routes.rs::serve()` after
+    /// `AppState` is constructed so the same client instance is shared.
+    pub fn set_github_app(&mut self, github_app: Option<Arc<super::github_app::GithubAppClient>>) {
+        self.github_app = github_app;
     }
 
     /// Set the Telegram bridge reference (called after AppState is created).
@@ -3349,6 +3362,7 @@ impl ControlHub {
             mission_store,
             self.secrets.clone(),
             self.telegram_bridge.clone(),
+            self.github_app.clone(),
             user.id.clone(),
         );
         sessions.insert(user.id.clone(), state.clone());
@@ -4029,6 +4043,11 @@ pub struct CreateMissionRequest {
     pub parent_mission_id: Option<Uuid>,
     /// Working directory override (for git worktrees etc.)
     pub working_directory: Option<String>,
+    /// GitHub repos to clone into the mission workspace before the agent
+    /// starts. Picked from the GitHub-App-backed repo dropdown in the New
+    /// Mission dialog. Empty/omitted = no clone.
+    #[serde(default)]
+    pub initial_repos: Vec<crate::api::github_app::RepoSelection>,
 }
 
 fn deserialize_string_patch<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
@@ -4127,6 +4146,7 @@ pub async fn create_mission(
         backend: None,
         parent_mission_id: None,
         working_directory: None,
+        initial_repos: Vec::new(),
     });
 
     let title = req.title.clone();
@@ -4244,6 +4264,7 @@ pub async fn create_mission(
         }
     }
 
+    let initial_repos = req.initial_repos.clone();
     let control = control_for_user(&state, &user).await;
     control
         .cmd_tx
@@ -4257,6 +4278,7 @@ pub async fn create_mission(
             config_profile: effective_config_profile,
             parent_mission_id: req.parent_mission_id,
             working_directory: req.working_directory,
+            initial_repos,
             respond: tx,
         })
         .await
@@ -5920,6 +5942,7 @@ pub async fn stream(
 
 /// Spawn the global control session actor.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn spawn_control_session(
     config: Config,
     root_agent: AgentRef,
@@ -5929,6 +5952,7 @@ fn spawn_control_session(
     mission_store: Arc<dyn MissionStore>,
     secrets: Option<Arc<SecretsStore>>,
     telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
+    github_app: Option<Arc<super::github_app::GithubAppClient>>,
     user_id: String,
 ) -> ControlState {
     let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(256);
@@ -6024,6 +6048,7 @@ fn spawn_control_session(
         progress,
         mission_store,
         secrets,
+        github_app,
         user_id,
     ));
 
@@ -8228,6 +8253,7 @@ async fn agent_finished_automation_messages(
     clippy::collapsible_match,
     clippy::collapsible_else_if
 )]
+#[allow(clippy::too_many_arguments)]
 async fn control_actor_loop(
     config: Config,
     root_agent: AgentRef,
@@ -8246,6 +8272,7 @@ async fn control_actor_loop(
     progress: Arc<RwLock<ExecutionProgress>>,
     mission_store: Arc<dyn MissionStore>,
     secrets: Option<Arc<SecretsStore>>,
+    github_app: Option<Arc<super::github_app::GithubAppClient>>,
     session_user_id: String,
 ) {
     // Queue stores (id, content, agent, target_mission_id) for the current/primary mission
@@ -8383,11 +8410,13 @@ async fn control_actor_loop(
             None,
             None,
             None,
+            &[],
         )
         .await
     }
 
     // Helper to create a new mission with title
+    #[allow(clippy::too_many_arguments)]
     async fn create_new_mission_with_title(
         mission_store: &Arc<dyn MissionStore>,
         title: Option<&str>,
@@ -8399,6 +8428,7 @@ async fn control_actor_loop(
         config_profile: Option<&str>,
         parent_mission_id: Option<Uuid>,
         working_directory: Option<&str>,
+        initial_repos: &[crate::api::github_app::RepoSelection],
     ) -> Result<Mission, String> {
         mission_store
             .create_mission_with_parent(
@@ -8411,6 +8441,7 @@ async fn control_actor_loop(
                 config_profile,
                 parent_mission_id,
                 working_directory,
+                initial_repos,
             )
             .await
     }
@@ -8644,6 +8675,8 @@ async fn control_actor_loop(
                                                 mission.model_effort.clone(),
                                             );
                                             runner.working_directory = mission.working_directory.clone();
+                                            runner.initial_repos = mission.initial_repos.clone();
+                                            runner.github_app = github_app.clone();
                                             runner.user_id = Some(session_user_id.clone());
                                             // Load existing history
                                             for entry in &mission.history {
@@ -9074,7 +9107,7 @@ async fn control_actor_loop(
                             }
                         }
                     }
-                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, backend, config_profile, parent_mission_id, working_directory, respond } => {
+                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, backend, config_profile, parent_mission_id, working_directory, initial_repos, respond } => {
                         // First persist current mission history
                         persist_mission_history(
                             &mission_store,
@@ -9096,6 +9129,7 @@ async fn control_actor_loop(
                             config_profile.as_deref(),
                             parent_mission_id,
                             working_directory.as_deref(),
+                            &initial_repos,
                         )
                         .await {
                             Ok(mission) => {
@@ -9261,6 +9295,8 @@ async fn control_actor_loop(
                                 mission.model_effort.clone(),
                             );
                             runner.working_directory = mission.working_directory.clone();
+                            runner.initial_repos = mission.initial_repos.clone();
+                            runner.github_app = github_app.clone();
                             runner.user_id = Some(session_user_id.clone());
 
                             // Load existing history into runner to preserve conversation context
@@ -9590,6 +9626,8 @@ async fn control_actor_loop(
                                         mission.model_effort.clone(),
                                     );
                                     runner.working_directory = mission.working_directory.clone();
+                                    runner.initial_repos = mission.initial_repos.clone();
+                                    runner.github_app = github_app.clone();
                                     runner.user_id = Some(session_user_id.clone());
                                     for entry in &mission.history {
                                         runner
@@ -17272,6 +17310,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            initial_repos: Vec::new(),
         };
         let weak = Mission {
             id: Uuid::new_v4(),
@@ -17303,6 +17342,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            initial_repos: Vec::new(),
         };
 
         let strong_score = mission_search_relevance_score(
@@ -17349,6 +17389,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            initial_repos: Vec::new(),
         };
 
         let score = mission_search_relevance_score(
@@ -17392,6 +17433,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            initial_repos: Vec::new(),
         };
 
         let score = mission_search_relevance_score(
@@ -17435,6 +17477,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            initial_repos: Vec::new(),
         };
 
         let score = mission_search_relevance_score(
@@ -17478,6 +17521,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            initial_repos: Vec::new(),
         };
 
         let score = mission_search_relevance_score(
@@ -17605,6 +17649,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            initial_repos: Vec::new(),
         };
         let before = mission_search_freshness_key(
             &[MissionSearchCandidate {

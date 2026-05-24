@@ -2277,6 +2277,17 @@ pub struct MissionRunner {
     /// Optional working directory override (e.g. git worktree path for orchestrated workers)
     pub working_directory: Option<String>,
 
+    /// GitHub repos to clone into the mission workspace before the agent
+    /// starts. Loaded from the mission record at MissionRunner construction
+    /// time; the actual clone happens inside `run_mission_turn` after
+    /// `prepare_mission_workspace_with_skills_backend`.
+    pub initial_repos: Vec<crate::api::github_app::RepoSelection>,
+
+    /// Shared GitHub App client used to mint installation tokens + clone
+    /// `initial_repos`. None when the App isn't configured — clone step is
+    /// then skipped.
+    pub github_app: Option<std::sync::Arc<crate::api::github_app::GithubAppClient>>,
+
     /// API user that owns this mission. Forwarded into the orchestrator MCP
     /// so worker missions land in this user's per-user mission store instead
     /// of the MCP's own `orchestrator-mcp` store.
@@ -2325,6 +2336,8 @@ impl MissionRunner {
             current_activity: None,
             subtasks: Vec::new(),
             working_directory: None,
+            initial_repos: Vec::new(),
+            github_app: None,
             user_id: None,
             active_tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -2474,6 +2487,8 @@ impl MissionRunner {
         let session_id = self.session_id.clone();
         let config_profile = self.config_profile.clone();
         let working_directory = self.working_directory.clone();
+        let initial_repos = self.initial_repos.clone();
+        let github_app = self.github_app.clone();
         let user_id = self.user_id.clone();
         let user_message = msg.content.clone();
         let msg_id = msg.id;
@@ -2526,6 +2541,8 @@ impl MissionRunner {
                 session_id,
                 config_profile,
                 working_directory,
+                initial_repos,
+                github_app,
                 user_id,
             )
             .await;
@@ -2825,6 +2842,7 @@ pub(crate) fn claudecode_resume_current_session_message() -> &'static str {
 
 /// Execute a single turn for a mission.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn run_mission_turn(
     config: Config,
     _root_agent: AgentRef,
@@ -2850,6 +2868,8 @@ async fn run_mission_turn(
     session_id: Option<String>,
     mission_config_profile: Option<String>,
     mission_working_directory: Option<String>,
+    initial_repos: Vec<crate::api::github_app::RepoSelection>,
+    github_app: Option<Arc<crate::api::github_app::GithubAppClient>>,
     boss_user_id: Option<String>,
 ) -> AgentResult {
     let mut config = config;
@@ -3009,6 +3029,40 @@ async fn run_mission_turn(
             tracing::warn!("Failed to prepare mission workspace, using default: {}", e);
             workspace_root
         }
+    };
+
+    // Clone any picked GitHub repos into <mission_work_dir>/repos/<name>/ via
+    // the GitHub App's installation token. Fails soft per repo — a single bad
+    // repo doesn't fail the whole mission spawn. When the App isn't
+    // configured or no repos were picked we skip entirely and the agent runs
+    // in the empty mission dir as before. When exactly one repo cloned
+    // successfully, the agent's cwd is pointed at that checkout so it can
+    // start working without an explicit `cd`.
+    let mission_work_dir = if !initial_repos.is_empty() {
+        if let Some(client) = github_app.as_ref() {
+            let results = client.clone_repos(&initial_repos, &mission_work_dir).await;
+            let succeeded = results.iter().filter(|r| r.success).count();
+            let failed = results.len().saturating_sub(succeeded);
+            tracing::info!(
+                mission_id = %mission_id,
+                cloned = succeeded,
+                failed = failed,
+                "GitHub App initial-repos clone complete"
+            );
+            crate::api::github_app::GithubAppClient::pick_working_directory(
+                &mission_work_dir,
+                &results,
+            )
+        } else {
+            tracing::warn!(
+                mission_id = %mission_id,
+                count = initial_repos.len(),
+                "Mission has initial_repos but GitHub App is not configured; skipping clone"
+            );
+            mission_work_dir
+        }
+    } else {
+        mission_work_dir
     };
 
     // Override with mission-specific working_directory (e.g. git worktree for orchestrated workers)

@@ -271,6 +271,19 @@ pub struct AuthConfig {
     /// (e.g. `https://dashboard.example.com`). Falls back to the request's
     /// `Host` header at runtime if unset.
     pub public_base_url: Option<String>,
+
+    /// GitHub App numeric ID. Optional — together with `github_app_installation_id`
+    /// and `github_app_private_key`, enables minting installation tokens for
+    /// the repo-picker UI on mission creation + cloning repos into the
+    /// workspace before the agent starts.
+    pub github_app_id: Option<String>,
+
+    /// GitHub App installation ID (the install of the App into your org).
+    pub github_app_installation_id: Option<String>,
+
+    /// GitHub App RSA private key (PEM contents, multiline). Used to sign
+    /// the App-level JWT exchanged for short-lived installation tokens.
+    pub github_app_private_key: Option<String>,
 }
 
 impl Default for AuthConfig {
@@ -285,6 +298,9 @@ impl Default for AuthConfig {
             github_oauth_allowlist: Vec::new(),
             github_oauth_redirect_allowlist: vec!["sandboxed://auth/callback".to_string()],
             public_base_url: None,
+            github_app_id: None,
+            github_app_installation_id: None,
+            github_app_private_key: None,
         }
     }
 }
@@ -328,6 +344,22 @@ impl AuthConfig {
             return AuthMode::SingleTenant;
         }
         AuthMode::Disabled
+    }
+
+    /// Whether the GitHub App (repo picker / clone-on-mission-start) is
+    /// fully configured. All three fields must be non-empty.
+    pub fn github_app_enabled(&self) -> bool {
+        self.github_app_id
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            && self
+                .github_app_installation_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            && self
+                .github_app_private_key
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
     }
 
     /// Whether "Sign in with GitHub" is fully configured and should be
@@ -513,6 +545,15 @@ impl Config {
                 .or_else(|_| std::env::var("PUBLIC_BASE_URL"))
                 .ok()
                 .filter(|s| !s.is_empty()),
+            github_app_id: std::env::var("GITHUB_APP_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            github_app_installation_id: std::env::var("GITHUB_APP_INSTALLATION_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            github_app_private_key: std::env::var("GITHUB_APP_PRIVATE_KEY")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         };
 
         // In non-dev mode, require auth secrets to be set.

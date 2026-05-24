@@ -17,6 +17,7 @@ export * from "./api/workspaces";
 export * from "./api/providers";
 export * from "./api/automations";
 export * from "./api/telegram";
+export * from "./api/github";
 
 // Import core utilities for use in this file (remaining APIs not yet split)
 import {

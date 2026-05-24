@@ -67,6 +67,7 @@ use super::deferred_proxy as deferred_proxy_api;
 use super::desktop;
 use super::desktop_stream;
 use super::fs;
+use super::github_app;
 use super::github_auth;
 use super::library as library_api;
 use super::mcp as mcp_api;
@@ -142,6 +143,12 @@ pub struct AppState {
     /// `/api/ai/providers/:id/usage` and refreshed in the background so the
     /// dashboard sees fresh values without paying a round-trip latency cost.
     pub provider_usage_cache: Arc<super::provider_usage_cache::ProviderUsageCache>,
+    /// Optional GitHub App client. Some when GITHUB_APP_{ID,INSTALLATION_ID,
+    /// PRIVATE_KEY} are all set in env. Drives `GET /api/github/repositories`
+    /// and the workspace-bootstrap clone step for missions that pick repos
+    /// from the dashboard. None when the App isn't configured — the routes
+    /// return 404 and the dashboard picker hides itself.
+    pub github_app: Option<Arc<super::github_app::GithubAppClient>>,
 }
 
 /// Start the HTTP server.
@@ -447,6 +454,29 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let telegram_bridge = Arc::new(super::telegram::TelegramBridge::new());
 
     // Spawn the single global control session actor.
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    let github_app =
+        super::github_app::GithubAppClient::maybe_from_config(&config.auth, http_client.clone());
+    if let Some(client) = github_app.as_ref() {
+        // Eagerly mint one installation token so a config error (bad PEM,
+        // wrong installation id) surfaces in the boot logs instead of on the
+        // first dashboard load.
+        let probe = Arc::clone(client);
+        tokio::spawn(async move {
+            match probe.installation_token().await {
+                Ok(_) => tracing::info!("GitHub App installation token minted on boot"),
+                Err(e) => tracing::warn!("GitHub App probe failed (continuing): {e}"),
+            }
+        });
+    } else {
+        tracing::info!(
+            "GitHub App not configured (set GITHUB_APP_ID + GITHUB_APP_INSTALLATION_ID + GITHUB_APP_PRIVATE_KEY); repo picker disabled"
+        );
+    }
+
     let mut control_state = control::ControlHub::new(
         config.clone(),
         Arc::clone(&root_agent),
@@ -456,6 +486,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         secrets.clone(),
     );
     control_state.set_telegram_bridge(Arc::clone(&telegram_bridge));
+    control_state.set_github_app(github_app.clone());
 
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -501,6 +532,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         fido_hub: Arc::new(super::fido::FidoSigningHub::new()),
         control_metrics: Arc::new(super::control_metrics::ControlMetrics::new()),
         provider_usage_cache: super::provider_usage_cache::ProviderUsageCache::new(),
+        github_app,
     });
 
     // Start background refresh of provider rate-limit / usage info so the
@@ -629,6 +661,12 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024 * 1024));
 
     let protected_routes = Router::new()
+        // GitHub App: repo picker + status
+        .route(
+            "/api/github/repositories",
+            get(github_app::list_repositories_handler),
+        )
+        .route("/api/github/status", get(github_app::status_handler))
         .route("/api/stats", get(get_stats))
         .route("/api/ai/usage/summary", get(get_ai_usage_summary))
         .route("/api/task", post(create_task))

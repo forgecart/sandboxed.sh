@@ -105,6 +105,7 @@ import {
   type DesktopSessionDetail,
   type StoredEvent,
   type SharedFile,
+  type RepoSelection,
 } from "@/lib/api";
 import { QueueStrip, type QueueItem } from "@/components/queue-strip";
 import { AsyncButton } from "@/components/ui/async-button";
@@ -6816,6 +6817,7 @@ export default function ControlClient() {
     configProfile?: string | null;
     backend?: string;
     openInNewTab?: boolean;
+    initialRepos?: RepoSelection[];
   }) => {
     try {
       setMissionLoading(true);
@@ -6826,6 +6828,7 @@ export default function ControlClient() {
         modelEffort: options?.modelEffort,
         configProfile: options?.configProfile ?? undefined,
         backend: options?.backend,
+        initialRepos: options?.initialRepos,
       });
 
       // Only update local state for same-tab navigation

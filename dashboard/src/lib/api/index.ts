@@ -41,6 +41,7 @@ export {
   type MissionSnapshot,
   type CreateMissionOptions,
   type UpdateMissionSettingsOptions,
+  type RepoSelection,
   type RunningMissionInfo,
   type MissionSearchResult,
   type MissionMomentSearchResult,
@@ -207,3 +208,11 @@ export {
   searchBotStructuredMemory,
   listBotActionExecutions,
 } from "./telegram";
+
+// GitHub App (repo picker + clone-on-start)
+export {
+  type GithubRepo,
+  type GithubAppStatus,
+  listGithubRepositories,
+  getGithubAppStatus,
+} from "./github";
