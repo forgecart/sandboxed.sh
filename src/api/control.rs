@@ -11346,10 +11346,7 @@ async fn run_single_control_turn(
                 failed = failed,
                 "GitHub App initial-repos clone complete"
             );
-            super::github_app::GithubAppClient::pick_working_directory(
-                &working_dir_path,
-                &results,
-            )
+            super::github_app::GithubAppClient::pick_working_directory(&working_dir_path, &results)
         } else {
             tracing::warn!(
                 mission_id = ?mission_id,
