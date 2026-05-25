@@ -449,12 +449,17 @@ impl K8sPodClient {
     ) -> Result<Output> {
         let pod_name = pod_name(workspace_id);
 
-        // Build a shell command line so we can `cd <cwd> && <env...> <program> <args...>`
-        // in a single `exec` invocation — the kube exec subresource
-        // doesn't have a cwd / env knob like `Command` does.
+        // Build a shell command line so we can `mkdir -p <cwd> && cd
+        // <cwd> && <env...> <program> <args...>` in a single `exec`
+        // invocation — the kube exec subresource doesn't have a cwd
+        // / env knob like `Command` does. `mkdir -p` is idempotent
+        // and lazily creates the per-mission workspace dirs that the
+        // control plane assumed lived on the host filesystem (they
+        // live on the pod's PVC under /workspaces/...).
         let mut shell_cmd = String::new();
         if let Some(cwd) = cwd {
-            shell_cmd.push_str(&format!("cd {} && ", shell_quote(&cwd.to_string_lossy())));
+            let cwd_str = shell_quote(&cwd.to_string_lossy());
+            shell_cmd.push_str(&format!("mkdir -p {cwd} && cd {cwd} && ", cwd = cwd_str));
         }
         for (k, v) in env {
             if k.trim().is_empty() {

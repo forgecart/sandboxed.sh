@@ -962,9 +962,7 @@ impl WorkspaceExec {
             // /workspaces tree, falling back to /workspaces if the
             // caller passed a path outside the workspace root.
             let pod_cwd = match cwd.strip_prefix(&self.workspace.path) {
-                Ok(rel) if rel.as_os_str().is_empty() => {
-                    std::path::PathBuf::from("/workspaces")
-                }
+                Ok(rel) if rel.as_os_str().is_empty() => std::path::PathBuf::from("/workspaces"),
                 Ok(rel) => std::path::PathBuf::from("/workspaces").join(rel),
                 Err(_) => {
                     // cwd already looks pod-internal (e.g.
