@@ -664,17 +664,10 @@ function deriveItemViews(
       flushThinkingGroup();
       currentToolGroup.push(item);
     } else if (item.kind === "thinking" || item.kind === "stream") {
-      if (showThinkingPanel) {
-        // Thinking/stream items are routed to the side panel in this
-        // mode — they don't render inline at all. Keep the tool group
-        // open across them so consecutive tool calls (with thinking
-        // between) stay collapsed into a single group in the main
-        // chat; otherwise the user sees every tool as an individual
-        // row with no "Show N previous tools" collapse button.
-        continue;
-      }
-      // Inline thinking: break the current tool group so ordering
-      // renders as tool → thinking → tool in the chat.
+      // Thoughts always render inline in the main chat now — the
+      // side `ThinkingPanel` was removed per UX request. Break the
+      // current tool group so ordering renders as
+      // tool → thinking → tool in the chat.
       flushToolGroup();
       currentThinkingGroup.push(item as SidePanelItem);
     } else {
@@ -5273,15 +5266,11 @@ export default function ControlClient() {
     if (items[items.length - 1]?.kind === "assistant") return false;
     return !items.some(
       (it) =>
-        ((it.kind === "thinking" || it.kind === "stream") &&
-          !it.done &&
-          !showThinkingPanel) ||
+        ((it.kind === "thinking" || it.kind === "stream") && !it.done) ||
         it.kind === "phase",
     );
-  }, [items, showThinkingPanel]);
+  }, [items]);
 
-  // Auto-show thinking panel when thinking starts (only on transition to active)
-  const prevHasActiveThinking = useRef(false);
   useEffect(() => {
     desktopSessionsRef.current = desktopSessions;
   }, [desktopSessions]);
@@ -5294,17 +5283,8 @@ export default function ControlClient() {
     hasDesktopSessionRef.current = hasDesktopSession;
   }, [hasDesktopSession]);
 
-  useEffect(() => {
-    // Only auto-show when transitioning from no active thinking to active thinking
-    if (
-      hasActiveThinking &&
-      !prevHasActiveThinking.current &&
-      !thinkingPanelManuallyHidden
-    ) {
-      setShowThinkingPanel(true);
-    }
-    prevHasActiveThinking.current = hasActiveThinking;
-  }, [hasActiveThinking, setShowThinkingPanel, thinkingPanelManuallyHidden]);
+  // (Auto-show ThinkingPanel effect removed — thinking now renders
+  // inline in the main chat thread, no side panel involved.)
 
   useEffect(() => {
     setThinkingPanelManuallyHidden(false);
@@ -11591,9 +11571,8 @@ export default function ControlClient() {
             </div>
           </div>
 
-          {/* Right column: Workbench, Thinking Panel and Desktop Stream stacked */}
+          {/* Right column: Workbench, Desktop Stream and Changes stacked */}
           {(showWorkbenchPanel ||
-            showThinkingPanel ||
             showDesktopStream ||
             showChangesPanel ||
             (showWorkerPanel && isBossMission) ||
@@ -11667,7 +11646,6 @@ export default function ControlClient() {
                     // `overflow-y-auto` to clip rather than push the flex
                     // child to its content height.
                     showWorkbenchPanel ||
-                      showThinkingPanel ||
                       showDesktopStream ||
                       hasInMissionSubagents
                       ? "flex-1 min-h-0"
@@ -11690,7 +11668,6 @@ export default function ControlClient() {
                   onClose={handleCloseWorkerPanel}
                   className={cn(
                     showWorkbenchPanel ||
-                      showThinkingPanel ||
                       showDesktopStream ||
                       childMissions.length > 0
                       ? "flex-1 min-h-0"
@@ -11699,23 +11676,8 @@ export default function ControlClient() {
                 />
               )}
 
-              {/* Thinking Panel */}
-              {showThinkingPanel && (
-                <ThinkingPanel
-                  items={thinkingItems}
-                  onClose={handleCloseThinkingPanel}
-                  className={
-                    showWorkbenchPanel ||
-                    showDesktopStream ||
-                    showChangesPanel ||
-                    (showWorkerPanel && isBossMission)
-                      ? "flex-1 min-h-0"
-                      : "flex-1"
-                  }
-                  basePath={missionWorkingDirectory}
-                  missionId={viewingMissionId}
-                />
-              )}
+              {/* (Thinking Panel removed — thoughts now render
+                  inline in the main chat thread.) */}
 
               {/* Changes Panel — per-mission git status + unified
                   diff viewer running inside the K8sPod. Click the
