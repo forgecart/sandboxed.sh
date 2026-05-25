@@ -2336,6 +2336,274 @@ function DockerServicesPanel({
   );
 }
 
+// Strip of clickable tabs above the chat: "Main thread" + one
+// tab per Agent tool call. Switches the chat view scope below.
+function SubagentTabStrip({
+  subagents,
+  activeTab,
+  onSelect,
+}: {
+  subagents: Array<{
+    id: string;
+    toolCallId: string;
+    name: string;
+    args: unknown;
+    result?: unknown;
+  }>;
+  activeTab: string | null;
+  onSelect: (tab: string | null) => void;
+}) {
+  const labelOf = (args: unknown): string => {
+    if (args && typeof args === "object") {
+      const obj = args as Record<string, unknown>;
+      for (const k of ["description", "subagent_type", "agent", "name"]) {
+        const v = obj[k];
+        if (typeof v === "string" && v.trim()) return v.trim();
+      }
+    }
+    return "Sub-agent";
+  };
+  return (
+    <div className="flex items-center gap-1.5 px-4 py-2 border-b border-white/[0.06] bg-white/[0.01] overflow-x-auto">
+      <button
+        type="button"
+        onClick={() => onSelect(null)}
+        className={cn(
+          "shrink-0 px-2.5 py-1 rounded-full text-xs font-medium transition-colors",
+          activeTab === null
+            ? "bg-indigo-500/20 text-indigo-200 border border-indigo-500/40"
+            : "text-white/50 hover:text-white/80 hover:bg-white/[0.04] border border-transparent",
+        )}
+      >
+        Main thread
+      </button>
+      <div className="h-4 w-px bg-white/[0.06] mx-0.5" />
+      {subagents.map((s) => {
+        const done = s.result !== undefined;
+        const active = activeTab === s.toolCallId;
+        const tone = done ? "bg-emerald-400" : "bg-amber-400 animate-pulse";
+        return (
+          <button
+            key={s.id}
+            type="button"
+            onClick={() => onSelect(s.toolCallId)}
+            className={cn(
+              "shrink-0 flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs transition-colors",
+              active
+                ? "bg-violet-500/20 text-violet-200 border border-violet-500/40"
+                : "text-white/50 hover:text-white/80 hover:bg-white/[0.04] border border-transparent",
+            )}
+            title={labelOf(s.args)}
+          >
+            <span className={cn("h-1.5 w-1.5 rounded-full", tone)} />
+            <span className="truncate max-w-[180px]">{labelOf(s.args)}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// Chat-like view of one sub-agent's scoped activity. Shows the
+// spawn prompt, every tool call the sub-agent ran, and any
+// streamed text — all read-only (Claude Code's `Agent` tool is
+// single-shot, no follow-up channel exists).
+function SubagentChatView({
+  subagent,
+  activity,
+}: {
+  subagent: {
+    id: string;
+    toolCallId: string;
+    name: string;
+    args: unknown;
+    result?: unknown;
+  };
+  activity: Array<
+    | {
+        kind: "tool_call";
+        tool_call_id: string;
+        name: string;
+        args: unknown;
+        ts: number;
+      }
+    | {
+        kind: "tool_result";
+        tool_call_id: string;
+        name: string;
+        result: unknown;
+        ts: number;
+      }
+    | { kind: "text"; content: string; ts: number }
+  >;
+}) {
+  const description =
+    subagent.args && typeof subagent.args === "object"
+      ? (
+          (subagent.args as Record<string, unknown>).description as
+            | string
+            | undefined
+        ) ?? null
+      : null;
+  const prompt =
+    subagent.args && typeof subagent.args === "object"
+      ? ((subagent.args as Record<string, unknown>).prompt as
+          | string
+          | undefined) ?? null
+      : null;
+  const isDone = subagent.result !== undefined;
+  // Pair tool_call + tool_result by tool_call_id so we render each
+  // sub-agent action as a single card.
+  type Pair = {
+    call: Extract<(typeof activity)[number], { kind: "tool_call" }>;
+    result?: Extract<(typeof activity)[number], { kind: "tool_result" }>;
+  };
+  const pairsAndText: Array<
+    Pair | Extract<(typeof activity)[number], { kind: "text" }>
+  > = [];
+  for (const item of activity) {
+    if (item.kind === "tool_call") {
+      pairsAndText.push({ call: item });
+    } else if (item.kind === "tool_result") {
+      // Match back to the most recent matching tool_call.
+      for (let i = pairsAndText.length - 1; i >= 0; i--) {
+        const p = pairsAndText[i];
+        if (
+          p &&
+          "call" in p &&
+          p.call.tool_call_id === item.tool_call_id &&
+          !p.result
+        ) {
+          p.result = item;
+          break;
+        }
+      }
+    } else {
+      pairsAndText.push(item);
+    }
+  }
+
+  // Parse the final answer from subagent.result (it's the Agent
+  // tool_use's tool_result content, shaped like `{ content: "..." }`).
+  let finalAnswer: string | null = null;
+  if (subagent.result && typeof subagent.result === "object") {
+    const r = subagent.result as Record<string, unknown>;
+    if (typeof r.content === "string") finalAnswer = r.content;
+  } else if (typeof subagent.result === "string") {
+    finalAnswer = subagent.result;
+  }
+
+  return (
+    <div className="space-y-3 max-w-3xl mx-auto">
+      {/* Read-only banner */}
+      <div className="rounded-md border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-200/80 flex items-start gap-2">
+        <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+        <span>
+          Background sub-agents are single-shot. The composer is disabled here
+          — add follow-up instructions in the <strong>Main thread</strong> tab
+          instead.
+        </span>
+      </div>
+
+      {/* Spawn prompt as a "user message" bubble */}
+      {(description || prompt) && (
+        <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3 space-y-2">
+          {description && (
+            <p className="text-xs font-medium text-white/70">{description}</p>
+          )}
+          {prompt && (
+            <pre className="text-xs text-white/60 whitespace-pre-wrap font-mono leading-relaxed max-h-64 overflow-y-auto">
+              {prompt}
+            </pre>
+          )}
+        </div>
+      )}
+
+      {/* Live activity */}
+      {pairsAndText.length === 0 && !isDone && (
+        <div className="flex items-center gap-2 text-xs text-white/40">
+          <Loader className="h-3 w-3 animate-spin" />
+          Sub-agent is starting…
+        </div>
+      )}
+      {pairsAndText.map((entry, i) => {
+        if ("kind" in entry && entry.kind === "text") {
+          return (
+            <div
+              key={`text-${i}`}
+              className="rounded-md border border-white/[0.04] bg-white/[0.01] p-2 text-xs text-white/70 whitespace-pre-wrap leading-relaxed"
+            >
+              {entry.content}
+            </div>
+          );
+        }
+        const pair = entry as Pair;
+        const callArgs = pair.call.args;
+        const resultStr = pair.result
+          ? typeof pair.result.result === "string"
+            ? pair.result.result
+            : JSON.stringify(pair.result.result).slice(0, 800)
+          : null;
+        return (
+          <div
+            key={pair.call.tool_call_id}
+            className={cn(
+              "rounded-md border bg-white/[0.02] overflow-hidden",
+              pair.result ? "border-emerald-500/20" : "border-purple-500/30",
+            )}
+          >
+            <div className="flex items-center gap-2 px-3 py-1.5 text-xs">
+              {pair.result ? (
+                <CheckCircle className="h-3 w-3 text-emerald-400" />
+              ) : (
+                <Loader className="h-3 w-3 text-purple-300 animate-spin" />
+              )}
+              <span className="font-mono font-medium text-white/80">
+                {pair.call.name}
+              </span>
+              <span className="text-white/30 truncate">
+                {(() => {
+                  if (callArgs && typeof callArgs === "object") {
+                    const obj = callArgs as Record<string, unknown>;
+                    for (const k of [
+                      "command",
+                      "file_path",
+                      "pattern",
+                      "query",
+                      "description",
+                    ]) {
+                      const v = obj[k];
+                      if (typeof v === "string") return v.slice(0, 120);
+                    }
+                  }
+                  return "";
+                })()}
+              </span>
+            </div>
+            {resultStr && (
+              <pre className="text-[11px] text-white/50 bg-black/20 px-3 py-2 whitespace-pre-wrap max-h-40 overflow-y-auto font-mono">
+                {resultStr}
+              </pre>
+            )}
+          </div>
+        );
+      })}
+
+      {/* Final answer when complete */}
+      {finalAnswer && (
+        <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-3 space-y-2">
+          <p className="text-[10px] uppercase tracking-wide text-emerald-300/70">
+            Final answer
+          </p>
+          <div className="text-sm text-white/85 whitespace-pre-wrap leading-relaxed">
+            {finalAnswer}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MissionWorkbenchPanel({
   mission,
   workspaceLabel,
@@ -4269,6 +4537,7 @@ export default function ControlClient() {
   );
 
   // Parallel missions state
+  // (sub-agent tab is reset when the viewed mission changes — see effect below)
   const [runningMissions, setRunningMissions] = useState<RunningMissionInfo[]>(
     [],
   );
@@ -4791,6 +5060,13 @@ export default function ControlClient() {
   useEffect(() => {
     setThinkingPanelManuallyHidden(false);
   }, [setThinkingPanelManuallyHidden, viewingMissionId]);
+
+  // Reset the sub-agent tab focus whenever the viewed mission
+  // changes so a sub-agent from mission A doesn't stay focused
+  // when the user switches to mission B.
+  useEffect(() => {
+    setActiveSubagentTab(null);
+  }, [viewingMissionId]);
 
   // Tell the backend the user opened this mission. The server records
   // `first_viewed_at` on the first call (starting the 1h ack grace timer
@@ -10441,12 +10717,38 @@ export default function ControlClient() {
               parentMission={viewingParentMission}
               onSelectWorker={handleViewMission}
             />
+            {/* Sub-agent tab strip — one chip per Agent tool call.
+                Clicking switches the chat below to that sub-agent's
+                scoped activity. Hidden when no sub-agents exist. */}
+            {hasInMissionSubagents && (
+              <SubagentTabStrip
+                subagents={inMissionSubagents}
+                activeTab={activeSubagentTab}
+                onSelect={setActiveSubagentTab}
+              />
+            )}
             {/* Messages */}
             <div
               ref={containerRef}
               data-testid="chat-scroll-container"
               className="flex-1 overflow-y-auto p-6"
             >
+              {/* Sub-agent tab is active → render the scoped chat
+                  view for that sub-agent instead of the main thread.
+                  Read-only; the composer is gated below. */}
+              {activeSubagentTab && (() => {
+                const sa = inMissionSubagents.find(
+                  (s) => s.toolCallId === activeSubagentTab,
+                );
+                if (!sa) return null;
+                return (
+                  <SubagentChatView
+                    subagent={sa}
+                    activity={subagentActivityByParent[activeSubagentTab] || []}
+                  />
+                );
+              })()}
+              {!activeSubagentTab && (<>
               {/* Backwards pagination — only when there's actually more older
               history to fetch and the chat isn't empty. Click prepends the
               previous page; scroll position is preserved so the message
@@ -10765,6 +11067,7 @@ export default function ControlClient() {
                   )}
                 </div>
               )}
+              </>)}
             </div>
 
             {/* Scroll to bottom button */}
@@ -10873,6 +11176,15 @@ export default function ControlClient() {
                   onClearAll={handleClearQueue}
                 />
 
+                {activeSubagentTab ? (
+                  <div className="flex items-center gap-2 px-4 py-3 rounded-xl border border-amber-500/20 bg-amber-500/5 text-xs text-amber-200/80">
+                    <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                    <span>
+                      Background sub-agents are single-shot — input disabled.
+                      Switch to <strong>Main thread</strong> to send a message.
+                    </span>
+                  </div>
+                ) : (
                 <form
                   onSubmit={(e) => e.preventDefault()}
                   className="flex gap-3 items-end"
@@ -10964,6 +11276,7 @@ export default function ControlClient() {
                     </button>
                   )}
                 </form>
+                )}
               </div>
             </div>
           </div>
