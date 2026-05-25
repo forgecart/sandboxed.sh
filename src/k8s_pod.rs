@@ -545,7 +545,10 @@ impl K8sPodClient {
                 errs.push(format!("delete configmap: {}", e));
             }
         }
-        for pvc in [workspaces_pvc_name(workspace_id), docker_pvc_name(workspace_id)] {
+        for pvc in [
+            workspaces_pvc_name(workspace_id),
+            docker_pvc_name(workspace_id),
+        ] {
             if let Err(e) = self.pvcs().delete(&pvc, &DeleteParams::default()).await {
                 if !is_404(&e) {
                     errs.push(format!("delete pvc {}: {}", pvc, e));
@@ -693,7 +696,8 @@ mod tests {
         let id = uuid::Uuid::nil();
         let p = pod_name(id);
         assert!(p.len() <= 63);
-        assert!(p.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        assert!(p
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
     }
 }
-
