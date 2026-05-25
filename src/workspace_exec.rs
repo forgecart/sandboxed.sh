@@ -956,10 +956,32 @@ impl WorkspaceExec {
                 )
             })?;
             let env_for_attempt = self.build_env(env);
+            // The caller's `cwd` is a host-side path (the workspace's
+            // synthetic /root/.sandboxed-sh/k8s-pods/<name> dir).
+            // Strip that prefix and map the remainder onto the pod's
+            // /workspaces tree, falling back to /workspaces if the
+            // caller passed a path outside the workspace root.
+            let pod_cwd = match cwd.strip_prefix(&self.workspace.path) {
+                Ok(rel) if rel.as_os_str().is_empty() => {
+                    std::path::PathBuf::from("/workspaces")
+                }
+                Ok(rel) => std::path::PathBuf::from("/workspaces").join(rel),
+                Err(_) => {
+                    // cwd already looks pod-internal (e.g.
+                    // /workspaces/mission-*/repos/...), so use it
+                    // verbatim. Anything completely outside the pod's
+                    // tree falls back to /workspaces.
+                    if cwd.starts_with("/workspaces") {
+                        cwd.to_path_buf()
+                    } else {
+                        std::path::PathBuf::from("/workspaces")
+                    }
+                }
+            };
             return k8s
                 .exec_command(
                     self.workspace.id,
-                    Some(cwd),
+                    Some(&pod_cwd),
                     program,
                     args,
                     &env_for_attempt,
