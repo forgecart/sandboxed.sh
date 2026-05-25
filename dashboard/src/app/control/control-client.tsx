@@ -10730,15 +10730,47 @@ export default function ControlClient() {
                             </span>
                           </div>
                         )}
-                        {activeMission.model_effort && (
+                        {(activeMission.backend === "claudecode" ||
+                          activeMission.backend === "codex") && (
                           <div className="flex items-center justify-between gap-2">
                             <span className="text-white/40">Model effort</span>
-                            <span
-                              className="font-mono text-[11px] text-amber-300 truncate max-w-[160px]"
-                              title={activeMission.model_effort}
+                            <select
+                              value={activeMission.model_effort ?? ""}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                void handleUpdateMissionSettings({
+                                  modelEffort: (v || undefined) as
+                                    | ModelEffort
+                                    | undefined,
+                                });
+                              }}
+                              disabled={missionLoading}
+                              className="font-mono text-[11px] text-amber-300 bg-white/[0.04] border border-white/[0.06] rounded px-1.5 py-0.5 focus:outline-none focus:border-amber-400/50 disabled:opacity-50 max-w-[120px]"
+                              title="Change the mission's reasoning effort"
                             >
-                              {activeMission.model_effort}
-                            </span>
+                              <option value="" className="bg-[#1a1a1a]">
+                                default
+                              </option>
+                              <option value="low" className="bg-[#1a1a1a]">
+                                low
+                              </option>
+                              <option value="medium" className="bg-[#1a1a1a]">
+                                medium
+                              </option>
+                              <option value="high" className="bg-[#1a1a1a]">
+                                high
+                              </option>
+                              {activeMission.backend === "claudecode" && (
+                                <option value="xhigh" className="bg-[#1a1a1a]">
+                                  xhigh
+                                </option>
+                              )}
+                              {activeMission.backend === "claudecode" && (
+                                <option value="max" className="bg-[#1a1a1a]">
+                                  max
+                                </option>
+                              )}
+                            </select>
                           </div>
                         )}
                         {lastResolvedModel && (
