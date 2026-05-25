@@ -830,7 +830,7 @@ function QuestionToolItem({
       <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
         <Bot className="h-4 w-4 text-indigo-400" />
       </div>
-      <div className="max-w-[90%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+      <div className="max-w-[85%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
         <div className="mb-2 text-xs text-white/40">
           Tool: <span className="font-mono text-indigo-400">question</span>
         </div>
@@ -1142,7 +1142,7 @@ function ChatLoadingSkeleton() {
   // max-w-[80%].
   const rows: Array<"assistant" | "user"> = ["assistant", "user", "assistant"];
   return (
-    <div className="mx-auto max-w-5xl space-y-6 animate-pulse">
+    <div className="mx-auto w-full max-w-4xl xl:max-w-5xl space-y-6 animate-pulse">
       {rows.map((role, idx) => {
         const isAssistant = role === "assistant";
         return (
@@ -4104,7 +4104,7 @@ const ChatItemRow = memo(function ChatItemRow({
         )}
       >
         <CopyButton text={item.content} className="self-start mt-2" />
-        <div className="max-w-[90%]">
+        <div className="max-w-[85%]">
           <div
             className={cn(
               "rounded-2xl rounded-tr-md px-4 py-3 text-white selection-light",
@@ -4156,7 +4156,7 @@ const ChatItemRow = memo(function ChatItemRow({
         <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
           <Bot className="h-4 w-4 text-indigo-400" />
         </div>
-        <div className="max-w-[90%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3 text-base leading-relaxed">
+        <div className="max-w-[85%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3 text-base leading-relaxed">
           <div className="mb-2 flex items-center gap-2 text-xs text-white/40">
             <MessageStatusIcon
               className={cn("h-3 w-3", turnStatus.iconClass)}
@@ -4307,7 +4307,7 @@ const ChatItemRow = memo(function ChatItemRow({
             <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
               <Bot className="h-4 w-4 text-indigo-400" />
             </div>
-            <div className="max-w-[90%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3 text-base leading-relaxed">
+            <div className="max-w-[85%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3 text-base leading-relaxed">
               <div className="mb-2 text-xs text-white/40">
                 Tool:{" "}
                 <span className="font-mono text-indigo-400">{item.name}</span>
@@ -4354,7 +4354,7 @@ const ChatItemRow = memo(function ChatItemRow({
             <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
               <Bot className="h-4 w-4 text-indigo-400" />
             </div>
-            <div className="max-w-[90%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+            <div className="max-w-[85%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
               <div className="mb-2 text-xs text-white/40">
                 Tool:{" "}
                 <span className="font-mono text-indigo-400">{item.name}</span>
@@ -11209,7 +11209,15 @@ export default function ControlClient() {
                   </div>
                 </div>
               ) : (
-                <div className="w-full space-y-6">
+                // Research-backed reading width: ~66 char sweet spot
+                // (UXPin / Justinmind / Untitled UI all converge on
+                // 50-75 chars per line for body copy). At
+                // `text-base` (16px) `max-w-4xl` (896px) gives
+                // ~70-75 CPL. Bump to `max-w-5xl` on very wide
+                // monitors so the chat doesn't feel narrow on
+                // 1440px+ screens. `leading-relaxed` (1.625)
+                // matches the 150% line-height sweet spot.
+                <div className="mx-auto w-full max-w-4xl xl:max-w-5xl space-y-6">
                   <div
                     className="relative w-full"
                     style={{ height: `${chatVirtualizer.getTotalSize()}px` }}
@@ -11410,7 +11418,7 @@ export default function ControlClient() {
             <div className="border-t border-white/[0.06] bg-white/[0.01] p-4">
               {/* Upload progress */}
               {uploadProgress && (
-                <div className="mx-auto max-w-5xl mb-3">
+                <div className="mx-auto w-full max-w-4xl xl:max-w-5xl mb-3">
                   <div className="flex items-center gap-3 rounded-lg border border-white/[0.06] bg-white/[0.02] px-4 py-3">
                     <Loader className="h-4 w-4 animate-spin text-indigo-400" />
                     <div className="flex-1 min-w-0">
@@ -11441,7 +11449,7 @@ export default function ControlClient() {
 
               {/* Upload queue (for files waiting) */}
               {uploadQueue.length > 0 && !uploadProgress && (
-                <div className="mx-auto max-w-5xl mb-3 flex flex-wrap gap-2">
+                <div className="mx-auto w-full max-w-4xl xl:max-w-5xl mb-3 flex flex-wrap gap-2">
                   {uploadQueue.map((name) => (
                     <AttachmentPreview
                       key={name}
@@ -11490,7 +11498,7 @@ export default function ControlClient() {
               )}
               <div
                 className={cn(
-                  "mx-auto max-w-5xl w-full space-y-2",
+                  "mx-auto w-full max-w-4xl xl:max-w-5xl w-full space-y-2",
                   showResumeUI && "hidden",
                 )}
               >
