@@ -2473,8 +2473,11 @@ pub fn write_codex_credentials_for_workspace(
     use crate::workspace::WorkspaceType;
 
     let codex_dir = match workspace.workspace_type {
-        WorkspaceType::Container => {
-            // For container workspaces, write to <workspace_root>/root/.codex
+        WorkspaceType::Container | WorkspaceType::K8sPod => {
+            // For container / k8s_pod workspaces, write to
+            // <workspace_root>/root/.codex on the host. The
+            // K8sPod backend uploads this into the pod via kube exec
+            // tar at mission-start time.
             workspace.path.join("root").join(".codex")
         }
         WorkspaceType::Host => {
@@ -4518,8 +4521,13 @@ pub fn write_claudecode_credentials_for_workspace(
         .ok_or_else(|| "No Anthropic OAuth entry found".to_string())?;
 
     let claude_dir = match workspace.workspace_type {
-        WorkspaceType::Container => {
-            // Container workspaces: write to /root/.claude inside the container
+        WorkspaceType::Container | WorkspaceType::K8sPod => {
+            // Container / K8sPod workspaces: stage credentials under
+            // <workspace_root>/root/.claude. For nspawn-Container this
+            // is the live `/root/.claude` inside the container's
+            // rootfs; for K8sPod the backend uploads this directory
+            // into the pod via tar over kube exec at mission-start
+            // time.
             workspace.path.join("root").join(".claude")
         }
         WorkspaceType::Host => unreachable!("host handled above"),

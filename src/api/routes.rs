@@ -149,6 +149,13 @@ pub struct AppState {
     /// from the dashboard. None when the App isn't configured — the routes
     /// return 404 and the dashboard picker hides itself.
     pub github_app: Option<Arc<super::github_app::GithubAppClient>>,
+    /// Kubernetes client + workspace-pod image / namespace for the
+    /// `k8s_pod` workspace backend. `Some` when
+    /// `SANDBOXED_SH_K8S_WORKSPACE_IMAGE` and
+    /// `SANDBOXED_SH_K8S_WORKSPACE_NAMESPACE` are both set and an
+    /// in-cluster kube client could be created at startup. When
+    /// `None`, creating a `workspace_type: k8s_pod` returns a 400.
+    pub k8s_pod: Option<Arc<crate::k8s_pod::K8sPodClient>>,
 }
 
 /// Start the HTTP server.
@@ -477,6 +484,17 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         );
     }
 
+    // Optional k8s-pod backend for `workspace_type: k8s_pod`. Probes
+    // the cluster API at boot — if either env var is missing or no
+    // ServiceAccount token is mounted, k8s_pod is None and creating a
+    // k8s_pod workspace returns a 400 with a hint.
+    let k8s_pod = crate::k8s_pod::K8sPodClient::try_init().await.map(Arc::new);
+    if k8s_pod.is_none() {
+        tracing::info!(
+            "k8s_pod workspace backend not configured (set SANDBOXED_SH_K8S_WORKSPACE_IMAGE + SANDBOXED_SH_K8S_WORKSPACE_NAMESPACE); k8s_pod workspace type disabled"
+        );
+    }
+
     let mut control_state = control::ControlHub::new(
         config.clone(),
         Arc::clone(&root_agent),
@@ -533,6 +551,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         control_metrics: Arc::new(super::control_metrics::ControlMetrics::new()),
         provider_usage_cache: super::provider_usage_cache::ProviderUsageCache::new(),
         github_app,
+        k8s_pod,
     });
 
     // Start background refresh of provider rate-limit / usage info so the

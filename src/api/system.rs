@@ -424,6 +424,7 @@ async fn probe_workspace_component(
     let workspace_type = match workspace.workspace_type {
         WorkspaceType::Host => "host",
         WorkspaceType::Container => "container",
+        WorkspaceType::K8sPod => "k8s_pod",
     };
     let workspace_status = match workspace.status {
         WorkspaceStatus::Pending => "pending",

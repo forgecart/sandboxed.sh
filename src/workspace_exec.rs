@@ -921,6 +921,19 @@ impl WorkspaceExec {
                     stderr,
                 )
             }
+            WorkspaceType::K8sPod => {
+                // K8sPod execs go through the kube API in
+                // `workspace_backend_k8s_pod::K8sPodBackend`, not
+                // through `Command`. Reaching `build_command()` for a
+                // K8sPod is a programming error — the trait dispatch
+                // in `output()` / `pty_attach()` should have routed
+                // around it. Bail loudly.
+                anyhow::bail!(
+                    "K8sPod workspaces don't use std::process::Command for exec — \
+                     route through WorkspaceBackend::exec instead. workspace_id={}",
+                    self.workspace.id
+                );
+            }
         }
     }
 
@@ -931,6 +944,29 @@ impl WorkspaceExec {
         args: &[String],
         env: HashMap<String, String>,
     ) -> anyhow::Result<std::process::Output> {
+        // K8sPod workspaces dispatch through the kube exec subresource
+        // — completely different code path from nspawn/host. Bail out
+        // here so we don't try to build a `std::process::Command` for
+        // them.
+        if self.workspace.workspace_type == WorkspaceType::K8sPod {
+            let k8s = crate::k8s_pod::global_client().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "k8s_pod backend not configured but workspace {} is type K8sPod",
+                    self.workspace.id
+                )
+            })?;
+            let env_for_attempt = self.build_env(env);
+            return k8s
+                .exec_command(
+                    self.workspace.id,
+                    Some(cwd),
+                    program,
+                    args,
+                    &env_for_attempt,
+                )
+                .await;
+        }
+
         // Retry loop: when multiple missions target the same container workspace,
         // concurrent systemd-nspawn boots race for a directory lock. The loser gets
         // "Directory tree … is currently busy".  On retry build_command() re-checks
@@ -1114,6 +1150,19 @@ impl WorkspaceExec {
                     }
                     cmd
                 }
+            }
+            WorkspaceType::K8sPod => {
+                // K8sPod attaches its PTY via the kube exec subresource
+                // (`tty: true`, `stdin: true`) in
+                // `workspace_backend_k8s_pod::K8sPodBackend::attach_pty`.
+                // The caller should have routed there; reaching this
+                // branch is a bug.
+                anyhow::bail!(
+                    "K8sPod workspaces don't use portable-pty CommandBuilder — \
+                     route through WorkspaceBackend::attach_pty instead. \
+                     workspace_id={}",
+                    self.workspace.id
+                );
             }
         };
 

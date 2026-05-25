@@ -46,6 +46,14 @@ pub enum WorkspaceType {
     /// Execute inside isolated container environment
     #[serde(alias = "chroot")]
     Container,
+    /// Each workspace runs as its own privileged Kubernetes Pod with
+    /// dedicated `/proc/sys`, netns, and PVC-backed `/workspaces` +
+    /// `/var/lib/docker`. The control plane uses the kube API for
+    /// every workspace-side operation (`exec`, file ops, pty
+    /// attach). Required for nested-docker / per-workspace compose
+    /// stacks — the nspawn `Container` type can't write the
+    /// `/proc/sys/net/*` sysctls dockerd needs.
+    K8sPod,
 }
 
 impl WorkspaceType {
@@ -53,6 +61,7 @@ impl WorkspaceType {
         match self {
             Self::Host => "host",
             Self::Container => "container",
+            Self::K8sPod => "k8s_pod",
         }
     }
 }
@@ -882,12 +891,14 @@ fn opencode_entry_from_mcp(
                 }
 
                 let resolved_command = match workspace_type {
-                    WorkspaceType::Container => resolve_container_command_path(
-                        command,
-                        workspace_root,
-                        container_fallback,
-                        per_workspace_runner,
-                    ),
+                    WorkspaceType::Container | WorkspaceType::K8sPod => {
+                        resolve_container_command_path(
+                            command,
+                            workspace_root,
+                            container_fallback,
+                            per_workspace_runner,
+                        )
+                    }
                     WorkspaceType::Host => resolve_host_command_path(command),
                 };
                 let mut cmd = vec![resolved_command];
@@ -1080,8 +1091,9 @@ async fn write_opencode_config(
     let per_workspace_runner = env_var_bool("SANDBOXED_SH_PER_WORKSPACE_RUNNER", true);
     let mut tools = serde_json::Map::new();
     match workspace_type {
-        WorkspaceType::Container => {
-            // Container workspace: OpenCode runs inside the container, so built-in bash is safe.
+        WorkspaceType::Container | WorkspaceType::K8sPod => {
+            // Workspace-internal types: OpenCode runs inside the
+            // container / pod, so built-in bash is safe.
             tools.insert("Bash".to_string(), json!(true));
             tools.insert("bash".to_string(), json!(true));
             // Disable legacy MCP tool namespaces by default.
@@ -1719,7 +1731,9 @@ async fn write_claudecode_config(
     // - Therefore, built-in Bash is safe to allow for both host + container workspaces.
     // - Legacy MCP tools are still allowed as a wildcard for compatibility.
     let permissions: Vec<&str> = match workspace_type {
-        WorkspaceType::Container => vec!["Bash", "Edit", "Write", "Read", "mcp__*"],
+        WorkspaceType::Container | WorkspaceType::K8sPod => {
+            vec!["Bash", "Edit", "Write", "Read", "mcp__*"]
+        }
         WorkspaceType::Host => vec!["Bash", "Edit", "Write", "Read", "mcp__*"],
     };
     let mut settings = json!({
@@ -1803,6 +1817,17 @@ async fn write_claudecode_config(
                     "This is an **isolated container workspace** managed by sandboxed.sh.\n\n",
                 );
                 claude_md.push_str("- Shell commands execute inside the container\n");
+                claude_md.push_str("- Use the built-in `Bash` tool for shell commands\n");
+                claude_md.push_str(
+                    "- Skills are available in `.claude/skills/` - use `/help` to list them\n",
+                );
+            }
+            WorkspaceType::K8sPod => {
+                claude_md.push_str(
+                    "This is an **isolated Kubernetes Pod workspace** managed by sandboxed.sh.\n\n",
+                );
+                claude_md.push_str("- Shell commands execute inside the workspace pod\n");
+                claude_md.push_str("- `docker run` / `docker compose` work natively (privileged pod with its own dockerd)\n");
                 claude_md.push_str("- Use the built-in `Bash` tool for shell commands\n");
                 claude_md.push_str(
                     "- Skills are available in `.claude/skills/` - use `/help` to list them\n",

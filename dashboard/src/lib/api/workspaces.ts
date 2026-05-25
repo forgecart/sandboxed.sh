@@ -8,7 +8,7 @@ import { apiGet, apiPost, apiPut, apiDel, apiFetch } from "./core";
 // Types
 // ---------------------------------------------------------------------------
 
-export type WorkspaceType = "host" | "container";
+export type WorkspaceType = "host" | "container" | "k8s_pod";
 export type WorkspaceStatus = "pending" | "building" | "ready" | "error";
 export type TailscaleMode = "exit_node" | "tailnet_only";
 

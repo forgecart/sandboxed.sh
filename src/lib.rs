@@ -40,6 +40,7 @@ pub mod backend;
 pub mod backend_config;
 pub mod config;
 pub mod cost;
+pub mod k8s_pod;
 pub mod library;
 pub mod mcp;
 pub mod nspawn;

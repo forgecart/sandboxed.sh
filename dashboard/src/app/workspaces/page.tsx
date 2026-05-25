@@ -70,7 +70,9 @@ export default function WorkspacesPage() {
 
   const [showNewWorkspaceDialog, setShowNewWorkspaceDialog] = useState(false);
   const [newWorkspaceName, setNewWorkspaceName] = useState('');
-  const [newWorkspaceType, setNewWorkspaceType] = useState<'host' | 'container'>('container');
+  const [newWorkspaceType, setNewWorkspaceType] = useState<'host' | 'container' | 'k8s_pod'>(
+    'container',
+  );
   const [newWorkspaceTemplate, setNewWorkspaceTemplate] = useState('');
   const [newWorkspacePrivileged, setNewWorkspacePrivileged] = useState(false);
   const [skillsFilter, setSkillsFilter] = useState('');
@@ -298,13 +300,19 @@ export default function WorkspacesPage() {
       // even if the build step fails later
       await mutateWorkspaces();
 
-      // For container workspaces WITHOUT a template, trigger build manually.
-      // Template-based workspaces are auto-built by the backend, so skip the explicit build call.
+      // For container / k8s_pod workspaces WITHOUT a template,
+      // trigger build manually. Template-based workspaces are
+      // auto-built by the backend, so skip the explicit build call.
       let workspaceToShow = created;
-      if (workspaceType === 'container' && !newWorkspaceTemplate) {
+      const needsBuild =
+        (workspaceType === 'container' || workspaceType === 'k8s_pod') && !newWorkspaceTemplate;
+      if (needsBuild) {
         try {
           workspaceToShow = await buildWorkspace(
             created.id,
+            // K8sPod uses a baked image, not a debootstrap distro — the
+            // backend ignores `distro` for that type but the API requires
+            // a value, so default to ubuntu-noble for both.
             (created.distro as ContainerDistro) || 'ubuntu-noble',
             false
           );
@@ -434,8 +442,17 @@ export default function WorkspacesPage() {
     return date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
   };
 
-  const formatWorkspaceType = (type: Workspace['workspace_type']) =>
-    type === 'host' ? 'host' : 'isolated';
+  const formatWorkspaceType = (type: Workspace['workspace_type']) => {
+    switch (type) {
+      case 'host':
+        return 'host';
+      case 'k8s_pod':
+        return 'isolated (pod)';
+      case 'container':
+      default:
+        return 'isolated';
+    }
+  };
 
   // Extract the first meaningful line from error messages (ignores build output noise)
   const extractErrorSummary = (errorMessage: string): string => {
@@ -1218,7 +1235,9 @@ export default function WorkspacesPage() {
                 <label className="text-xs text-white/40 mb-2 block">Type</label>
                 <select
                   value={newWorkspaceType}
-                  onChange={(e) => setNewWorkspaceType(e.target.value as 'host' | 'container')}
+                  onChange={(e) =>
+                    setNewWorkspaceType(e.target.value as 'host' | 'container' | 'k8s_pod')
+                  }
                   disabled={Boolean(newWorkspaceTemplate)}
                   className="w-full px-3 py-2.5 rounded-lg bg-black/20 border border-white/[0.06] text-sm text-white focus:outline-none focus:border-indigo-500/50 appearance-none cursor-pointer disabled:opacity-50"
                   style={{
@@ -1230,14 +1249,17 @@ export default function WorkspacesPage() {
                   }}
                 >
                   <option value="host" className="bg-[#161618]">Host (main filesystem)</option>
-                  <option value="container" className="bg-[#161618]">Isolated (container)</option>
+                  <option value="container" className="bg-[#161618]">Isolated (container) — nspawn</option>
+                  <option value="k8s_pod" className="bg-[#161618]">Isolated (k8s Pod) — nested docker</option>
                 </select>
                 <p className="text-xs text-white/35 mt-2">
                   {newWorkspaceTemplate
-                    ? 'Templates always create isolated workspaces'
+                    ? 'Templates always create isolated container workspaces'
                     : newWorkspaceType === 'host'
                     ? 'Runs directly on host machine'
-                    : 'Creates isolated Linux filesystem'}
+                    : newWorkspaceType === 'k8s_pod'
+                    ? 'Each workspace is its own privileged k8s Pod — supports docker / compose stacks with full bridge networking'
+                    : 'Creates isolated Linux filesystem (nspawn). Lightweight, but nested docker is limited.'}
                 </p>
               </div>
 

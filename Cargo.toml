@@ -86,6 +86,13 @@ ureq = { version = "2", features = ["json"] }
 # feature gate visible and lets `cargo update` move it deliberately.
 flate2 = "1"
 
+# Kubernetes client for the `k8s_pod` workspace backend. The control
+# plane uses these to create/exec/delete workspace pods + their PVCs +
+# ConfigMaps via the in-cluster ServiceAccount. See
+# `src/workspace_backend_k8s_pod.rs`.
+kube = { version = "0.96", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "ws"] }
+k8s-openapi = { version = "0.23", default-features = false, features = ["latest"] }
+
 [[bin]]
 name = "sandboxed-sh"
 path = "src/main.rs"

@@ -409,6 +409,19 @@ async fn create_workspace(
                     .join(".sandboxed-sh/containers")
                     .join(&req.name)
             }
+            WorkspaceType::K8sPod => {
+                // K8sPod workspaces don't have a host-side rootfs —
+                // the workspace lives entirely inside the workspace
+                // pod's PVCs. We still record a synthetic host path
+                // for the dashboard's "where does this live?"
+                // affordances and for staging files before
+                // `WorkspaceBackend::upload` ships them into the pod.
+                state
+                    .config
+                    .working_dir
+                    .join(".sandboxed-sh/k8s-pods")
+                    .join(&req.name)
+            }
         },
     };
 
@@ -534,6 +547,27 @@ async fn create_workspace(
             ws.mcps_replace_defaults = mcps_replace_defaults;
             ws.config_profile = config_profile;
             ws.privileged = req.privileged;
+            ws
+        }
+        WorkspaceType::K8sPod => {
+            // Reuse `new_container` for the base shape (Pending status,
+            // env_vars HashMap, etc.) then flip the type. The control
+            // plane creates the actual Pod when `build_workspace` runs.
+            let mut ws = Workspace::new_container(req.name, path);
+            ws.workspace_type = WorkspaceType::K8sPod;
+            ws.skills = skills;
+            ws.plugins = req.plugins;
+            ws.template = req.template.clone();
+            ws.distro = None; // baked-image only in phase 1
+            ws.env_vars = env_vars;
+            ws.init_scripts = init_scripts;
+            ws.init_script = init_script;
+            ws.shared_network = Some(false); // K8sPod always has its own netns
+            ws.tailscale_mode = None;
+            ws.mcps = mcps;
+            ws.mcps_replace_defaults = mcps_replace_defaults;
+            ws.config_profile = config_profile;
+            ws.privileged = true; // K8sPod is always privileged by design
             ws
         }
     };
@@ -803,19 +837,41 @@ async fn delete_workspace(
         ));
     }
 
-    // If it's a container workspace, destroy the container first
+    // If it's a container workspace, destroy the container first.
+    // K8sPod workspaces have their Pod + PVCs + ConfigMap cleaned up
+    // via the kube API.
     if let Some(ws) = state.workspaces.get(id).await {
-        if ws.workspace_type == WorkspaceType::Container {
-            if let Err(e) = crate::workspace::destroy_container_workspace(&ws).await {
-                tracing::error!("Failed to destroy container for workspace {}: {}", id, e);
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "Failed to destroy container: {}. Workspace not deleted to prevent orphaned state.",
-                        e
-                    ),
-                ));
+        match ws.workspace_type {
+            WorkspaceType::Container => {
+                if let Err(e) = crate::workspace::destroy_container_workspace(&ws).await {
+                    tracing::error!("Failed to destroy container for workspace {}: {}", id, e);
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "Failed to destroy container: {}. Workspace not deleted to prevent orphaned state.",
+                            e
+                        ),
+                    ));
+                }
             }
+            WorkspaceType::K8sPod => {
+                if let Some(k8s) = state.k8s_pod.as_ref() {
+                    if let Err(e) = k8s.destroy_workspace_pod(id).await {
+                        tracing::error!("Failed to destroy k8s_pod workspace {}: {}", id, e);
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!(
+                                "Failed to destroy workspace pod / PVCs: {}. Workspace not deleted to prevent orphaned cluster resources.",
+                                e
+                            ),
+                        ));
+                    }
+                }
+                // If k8s_pod backend isn't configured anymore but a
+                // stale k8s_pod workspace is in the store, fall
+                // through and delete the local record anyway.
+            }
+            WorkspaceType::Host => {}
         }
     }
 
@@ -1001,6 +1057,23 @@ pub fn build_nspawn_command(
             nspawn_args.extend(["/bin/bash".to_string(), "-c".to_string(), final_command]);
             ("systemd-nspawn".to_string(), nspawn_args)
         }
+        WorkspaceType::K8sPod => {
+            // K8sPod commands go through the kube API via
+            // `WorkspaceBackend::exec`; this nspawn-shaped helper
+            // doesn't apply. Callers checking `workspace_type` first
+            // is the right pattern. Return a bash command that just
+            // errors so it's loud if anyone bypasses the trait.
+            (
+                "/bin/sh".to_string(),
+                vec![
+                    "-c".to_string(),
+                    format!(
+                        "echo 'K8sPod workspace {} requires kube-API exec, not nspawn' >&2; exit 99",
+                        workspace.id
+                    ),
+                ],
+            )
+        }
     }
 }
 
@@ -1011,6 +1084,13 @@ async fn build_workspace(
     body: Option<Json<BuildWorkspaceRequest>>,
 ) -> Result<Json<WorkspaceResponse>, (StatusCode, String)> {
     let mut workspace = require_workspace(&state.workspaces, id).await?;
+
+    // K8sPod workspaces don't go through debootstrap/nspawn build —
+    // their "build" is the Pod create + image pull + first-boot init.
+    // The work is async and the status sync watches Pod events.
+    if workspace.workspace_type == WorkspaceType::K8sPod {
+        return build_k8s_pod_workspace(state, workspace).await;
+    }
 
     if workspace.workspace_type != WorkspaceType::Container {
         return Err((
@@ -1085,6 +1165,78 @@ async fn build_workspace(
         }
 
         merge_build_result(&workspaces_store, workspace_for_build).await;
+    });
+
+    Ok(Json(workspace.into()))
+}
+
+/// Build flow for `workspace_type: k8s_pod`. Creates the Pod + PVCs +
+/// optional ConfigMap via the kube API. Status is sync'd from Pod
+/// phase in a background task; the HTTP request returns as soon as
+/// the Pod manifest is accepted.
+async fn build_k8s_pod_workspace(
+    state: Arc<super::routes::AppState>,
+    mut workspace: Workspace,
+) -> Result<Json<WorkspaceResponse>, (StatusCode, String)> {
+    let k8s = state.k8s_pod.clone().ok_or((
+        StatusCode::BAD_REQUEST,
+        "k8s_pod backend not configured on this control plane (set SANDBOXED_SH_K8S_WORKSPACE_IMAGE + SANDBOXED_SH_K8S_WORKSPACE_NAMESPACE)".to_string(),
+    ))?;
+
+    if workspace.status == WorkspaceStatus::Building {
+        return Err((
+            StatusCode::CONFLICT,
+            "Workspace build already in progress".to_string(),
+        ));
+    }
+
+    workspace.status = WorkspaceStatus::Building;
+    workspace.error_message = None;
+    state.workspaces.update(workspace.clone()).await;
+
+    let workspaces_store = Arc::clone(&state.workspaces);
+    let workspace_for_build = workspace.clone();
+    let k8s_for_build = Arc::clone(&k8s);
+
+    tokio::spawn(async move {
+        let workspace_id = workspace_for_build.id;
+        let init_script = workspace_for_build.init_script.as_deref();
+        let env_vars = workspace_for_build.env_vars.clone();
+
+        let mut updated = workspace_for_build.clone();
+        let outcome = async {
+            k8s_for_build
+                .create_workspace_pod(workspace_id, init_script, &env_vars)
+                .await?;
+            k8s_for_build
+                .wait_for_ready(workspace_id, std::time::Duration::from_secs(180))
+                .await?;
+            anyhow::Ok(())
+        }
+        .await;
+
+        match outcome {
+            Ok(()) => {
+                updated.status = WorkspaceStatus::Ready;
+                updated.error_message = None;
+                tracing::info!(
+                    workspace = %updated.name,
+                    workspace_id = %workspace_id,
+                    "k8s_pod workspace Ready"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    workspace = %updated.name,
+                    workspace_id = %workspace_id,
+                    error = %e,
+                    "k8s_pod workspace build failed"
+                );
+                updated.status = WorkspaceStatus::Error;
+                updated.error_message = Some(e.to_string());
+            }
+        }
+        workspaces_store.update(updated).await;
     });
 
     Ok(Json(workspace.into()))
@@ -1433,6 +1585,28 @@ async fn get_init_log(
 ) -> Result<Json<InitLogResponse>, (StatusCode, String)> {
     let workspace = require_workspace(&state.workspaces, id).await?;
 
+    // K8sPod workspaces write init output to /workspaces/.init.log
+    // on the workspace PVC. We exec into the pod to cat it.
+    if workspace.workspace_type == WorkspaceType::K8sPod {
+        let k8s = state.k8s_pod.clone().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "k8s_pod backend not configured".to_string(),
+        ))?;
+        let content = k8s.read_init_log(workspace.id).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read k8s_pod init log: {}", e),
+            )
+        })?;
+        let total_lines = Some(content.lines().count() as u32);
+        return Ok(Json(InitLogResponse {
+            exists: !content.trim().is_empty(),
+            content,
+            total_lines,
+            log_path: "/workspaces/.init.log".to_string(),
+        }));
+    }
+
     let log_path = "/var/log/sandboxed-init.log";
     let host_log_path = workspace.path.join("var/log/sandboxed-init.log");
 
@@ -1493,6 +1667,52 @@ async fn rerun_init_script(
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<RerunInitResponse>, (StatusCode, String)> {
     let mut workspace = require_workspace(&state.workspaces, id).await?;
+
+    // K8sPod workspaces: update the ConfigMap (so the next pod
+    // restart picks up edits) AND run the script inline via kube exec
+    // for immediate effect. The pod's entrypoint sentinel
+    // (/workspaces/.init.done) is cleared inside the rerun script so
+    // a future pod restart re-runs it too.
+    if workspace.workspace_type == WorkspaceType::K8sPod {
+        let k8s = state.k8s_pod.clone().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "k8s_pod backend not configured".to_string(),
+        ))?;
+        let init_script = workspace.init_script.clone().unwrap_or_default();
+        if init_script.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "No init script configured for this workspace".to_string(),
+            ));
+        }
+        // Update the ConfigMap so the next pod boot uses the new
+        // script content too.
+        k8s.ensure_init_configmap_public(workspace.id, &init_script)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to update init ConfigMap: {}", e),
+                )
+            })?;
+        let output = k8s.rerun_init(workspace.id).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to rerun init: {}", e),
+            )
+        })?;
+        let success = output.status.success();
+        let exit_code = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Ok(Json(RerunInitResponse {
+            success,
+            exit_code,
+            stdout,
+            stderr,
+            duration_secs: 0.0,
+        }));
+    }
 
     // Only works for container workspaces
     if workspace.workspace_type != WorkspaceType::Container {
@@ -1676,9 +1896,12 @@ async fn get_container_memory_stats(workspace: &Workspace) -> WorkspaceMemorySta
     let workspace_type_str = match workspace.workspace_type {
         WorkspaceType::Host => "host",
         WorkspaceType::Container => "container",
+        WorkspaceType::K8sPod => "k8s_pod",
     };
 
-    // For host workspaces, return N/A
+    // For host workspaces, return N/A. K8sPod memory stats come from
+    // the kube metrics API in a future phase; today we just report
+    // N/A for it as well so existing code paths don't break.
     if workspace.workspace_type != WorkspaceType::Container {
         return WorkspaceMemoryStats {
             workspace_id: workspace.id,
