@@ -1935,7 +1935,10 @@ impl SqliteMissionStore {
                 .exists([])
                 .map_err(|e| format!("Failed to query table info: {}", e))?;
             if !exists {
-                tracing::info!("Running migration: adding '{}' column to missions table", col);
+                tracing::info!(
+                    "Running migration: adding '{}' column to missions table",
+                    col
+                );
                 conn.execute(&format!("ALTER TABLE missions ADD COLUMN {} TEXT", col), [])
                     .map_err(|e| format!("Failed to add {} column: {}", col, e))?;
             }

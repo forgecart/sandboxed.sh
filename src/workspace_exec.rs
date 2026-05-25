@@ -53,9 +53,7 @@ fn map_host_cwd_to_pod(workspace_path: &Path, cwd: &Path) -> PathBuf {
     // meaningless inside a per-mission pod whose entire /workspaces
     // PVC corresponds to that one mission).
     let after_mission = match after_ws.components().next() {
-        Some(std::path::Component::Normal(c))
-            if c.to_string_lossy().starts_with("mission-") =>
-        {
+        Some(std::path::Component::Normal(c)) if c.to_string_lossy().starts_with("mission-") => {
             after_ws.strip_prefix(c).unwrap_or(after_ws)
         }
         _ => after_ws,
@@ -1086,13 +1084,7 @@ impl WorkspaceExec {
             let env_for_attempt = self.build_env(env);
             let pod_cwd = map_host_cwd_to_pod(&self.workspace.path, cwd);
             return k8s
-                .exec_command(
-                    mission_id,
-                    Some(&pod_cwd),
-                    program,
-                    args,
-                    &env_for_attempt,
-                )
+                .exec_command(mission_id, Some(&pod_cwd), program, args, &env_for_attempt)
                 .await;
         }
 

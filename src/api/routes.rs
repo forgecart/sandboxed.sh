@@ -498,7 +498,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         tokio::spawn(async move {
             match client.gc_orphaned_workspace_pods().await {
                 Ok(0) => {}
-                Ok(n) => tracing::info!(removed = n, "boot GC: removed orphaned per-workspace pods"),
+                Ok(n) => {
+                    tracing::info!(removed = n, "boot GC: removed orphaned per-workspace pods")
+                }
                 Err(e) => tracing::warn!(error = %e, "boot GC: gc_orphaned_workspace_pods failed"),
             }
         });

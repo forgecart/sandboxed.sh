@@ -269,12 +269,7 @@ impl K8sPodClient {
         }
 
         // 3. Pod
-        let pod = self.build_pod_spec(
-            mission_id,
-            workspace_id,
-            init_script.is_some(),
-            env_vars,
-        );
+        let pod = self.build_pod_spec(mission_id, workspace_id, init_script.is_some(), env_vars);
         self.pods()
             .create(&PostParams::default(), &pod)
             .await
@@ -321,11 +316,7 @@ impl K8sPodClient {
     /// Public alias of `ensure_init_configmap` so the rerun-init
     /// handler can refresh a mission's stored init.sh without
     /// going through full create_mission_pod.
-    pub async fn ensure_init_configmap_public(
-        &self,
-        mission_id: Uuid,
-        script: &str,
-    ) -> Result<()> {
+    pub async fn ensure_init_configmap_public(&self, mission_id: Uuid, script: &str) -> Result<()> {
         self.ensure_init_configmap(mission_id, script).await
     }
 
@@ -696,10 +687,7 @@ impl K8sPodClient {
                 errs.push(format!("delete configmap: {}", e));
             }
         }
-        for pvc in [
-            workspaces_pvc_name(mission_id),
-            docker_pvc_name(mission_id),
-        ] {
+        for pvc in [workspaces_pvc_name(mission_id), docker_pvc_name(mission_id)] {
             if let Err(e) = self.pvcs().delete(&pvc, &DeleteParams::default()).await {
                 if !is_404(&e) {
                     errs.push(format!("delete pvc {}: {}", pvc, e));
@@ -1018,9 +1006,7 @@ impl K8sPodClient {
                                 },
                                 _ => PodStartupEvent::ContainerStarting,
                             }
-                        } else if !scheduled {
-                            PodStartupEvent::PodScheduled
-                        } else if phase == "Pending" {
+                        } else if !scheduled || phase == "Pending" {
                             PodStartupEvent::PodScheduled
                         } else {
                             PodStartupEvent::ContainerStarting
@@ -1046,8 +1032,7 @@ impl K8sPodClient {
     /// missing resources are no-ops.
     pub async fn gc_orphaned_workspace_pods(&self) -> Result<usize> {
         use kube::api::ListParams;
-        let lp = ListParams::default()
-            .labels("app.kubernetes.io/managed-by=sandboxed-sh");
+        let lp = ListParams::default().labels("app.kubernetes.io/managed-by=sandboxed-sh");
         let pods = self.pods().list(&lp).await?;
         let mut removed = 0usize;
         let dp = DeleteParams {
