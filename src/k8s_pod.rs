@@ -835,6 +835,61 @@ impl K8sPodClient {
         results
     }
 
+    /// Clean up a single mission's footprint inside the workspace
+    /// pod: tears down any docker compose stacks the mission's
+    /// auto-stack hook started, then deletes the per-mission
+    /// directory on the workspaces PVC. Called from the
+    /// `delete_mission` API handler and from
+    /// `mission_workspace_gc::run_once` so neither path leaks
+    /// running containers or PVC space when the mission goes away.
+    ///
+    /// Idempotent — missing dirs / dead pods are no-ops.
+    pub async fn cleanup_mission_in_pod(&self, workspace_id: Uuid, mission_id: Uuid) -> Result<()> {
+        let mission_dir = format!("/workspaces/mission-{}", mission_id);
+        // Confirm the pod is reachable before issuing exec. If it's
+        // gone (workspace destroyed already), there's nothing to do.
+        if self
+            .pods()
+            .get_opt(&pod_name(workspace_id))
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
+        // Single bash to: stop every compose stack the mission
+        // started, then rm -rf the mission dir. `2>&1 | head` keeps
+        // output bounded; failures inside the loop don't stop the
+        // rm.
+        let cmd = format!(
+            r#"set +e; \
+               for d in {mdir}/repos/*/; do \
+                 [ -f "$d/docker-compose.yml" ] || [ -f "$d/compose.yml" ] || continue; \
+                 echo "[cleanup] compose down: $d" >&2; \
+                 (cd "$d" && docker compose down -v --remove-orphans --timeout 10 2>&1 | head -40) >&2; \
+               done; \
+               rm -rf {mdir}; \
+               echo "[cleanup] removed {mdir}" >&2"#,
+            mdir = mission_dir
+        );
+        let out = self
+            .exec_command(
+                workspace_id,
+                None,
+                "/bin/bash",
+                &["-lc".to_string(), cmd],
+                &HashMap::new(),
+            )
+            .await?;
+        tracing::info!(
+            workspace_id = %workspace_id,
+            mission_id = %mission_id,
+            exit = ?out.status.code(),
+            stderr_sample = %String::from_utf8_lossy(&out.stderr[..out.stderr.len().min(400)]),
+            "k8s_pod cleanup_mission_in_pod done"
+        );
+        Ok(())
+    }
+
     /// Re-run the workspace's init.sh (after the operator edits the
     /// ConfigMap or wants to retry a failed init).
     pub async fn rerun_init(&self, workspace_id: Uuid) -> Result<Output> {

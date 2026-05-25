@@ -124,6 +124,36 @@ pub async fn run_once(state: &Arc<AppState>, cutoff: DateTime<Utc>) -> SweepRepo
                     Some(ws) => ws,
                     None => continue,
                 };
+                // K8sPod workspaces: mission dirs live on the
+                // workspace pod's PVC, not the control plane's
+                // filesystem. Route the cleanup through the pod
+                // (also tears down any compose stacks the mission
+                // started so the pod doesn't leak running
+                // containers).
+                if ws.workspace_type == workspace::WorkspaceType::K8sPod {
+                    if let Some(k8s) = crate::k8s_pod::global_client() {
+                        match k8s.cleanup_mission_in_pod(workspace_id, mission.id).await {
+                            Ok(()) => {
+                                report.removed += 1;
+                                tracing::info!(
+                                    mission_id = %mission.id,
+                                    workspace_id = %workspace_id,
+                                    "mission GC: removed in-pod mission dir + stopped compose stacks",
+                                );
+                            }
+                            Err(err) => {
+                                report.errors += 1;
+                                tracing::warn!(
+                                    mission_id = %mission.id,
+                                    workspace_id = %workspace_id,
+                                    ?err,
+                                    "mission GC: in-pod cleanup failed",
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let dir = workspace::mission_workspace_dir_for_root(&ws.path, mission.id);
                 if !dir.exists() {
                     continue;

@@ -5153,13 +5153,49 @@ pub async fn delete_mission(
         ));
     }
 
+    // Look up the workspace BEFORE deleting the mission record so we
+    // can find its k8s pod (if K8sPod) and clean the in-pod artifacts.
+    let mission = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?;
+    let workspace_for_cleanup = if let Some(m) = mission.as_ref() {
+        state.workspaces.get(m.workspace_id).await
+    } else {
+        None
+    };
+
     let deleted = control
         .mission_store
         .delete_mission(mission_id)
         .await
         .map_err(internal_error)?;
 
+    // Best-effort cleanup of the in-pod artifacts (compose stacks
+    // the mission started + the mission's directory on the
+    // workspaces PVC). nspawn / Host workspaces are left to the
+    // existing mission_workspace_gc sweep — those paths live on the
+    // control-plane filesystem and the sweep removes them on the
+    // GC interval.
     if deleted {
+        if let Some(ws) = workspace_for_cleanup.as_ref() {
+            if ws.workspace_type == workspace::WorkspaceType::K8sPod {
+                if let Some(k8s) = crate::k8s_pod::global_client() {
+                    let workspace_id = ws.id;
+                    tokio::spawn(async move {
+                        if let Err(e) = k8s.cleanup_mission_in_pod(workspace_id, mission_id).await {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                workspace_id = %workspace_id,
+                                error = %e,
+                                "K8sPod mission cleanup failed (leaving for GC sweep)"
+                            );
+                        }
+                    });
+                }
+            }
+        }
         clear_mission_metadata_refresh_state(mission_id);
         Ok(Json(serde_json::json!({
             "ok": true,
