@@ -26,6 +26,34 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Translate a host-side workspace cwd to its equivalent inside a
+/// K8sPod workspace. The control-plane pod's `<workspace.path>` is
+/// synthetic (the workspace doesn't actually live on the control
+/// plane's filesystem). Mission dirs are at
+/// `<workspace.path>/workspaces/mission-<id>/...` on the host; the
+/// pod mounts the workspaces PVC at `/workspaces`, so the mission
+/// dir maps to `/workspaces/mission-<id>/...`.
+///
+/// The leading `workspaces/` segment is stripped after the prefix
+/// strip to avoid the double-`/workspaces/workspaces/...` path bug.
+fn map_host_cwd_to_pod(workspace_path: &Path, cwd: &Path) -> PathBuf {
+    if cwd.starts_with("/workspaces") {
+        return cwd.to_path_buf();
+    }
+    match cwd.strip_prefix(workspace_path) {
+        Ok(rel) if rel.as_os_str().is_empty() => PathBuf::from("/workspaces"),
+        Ok(rel) => {
+            let trimmed = rel.strip_prefix("workspaces").unwrap_or(rel);
+            if trimmed.as_os_str().is_empty() {
+                PathBuf::from("/workspaces")
+            } else {
+                PathBuf::from("/workspaces").join(trimmed)
+            }
+        }
+        Err(_) => PathBuf::from("/workspaces"),
+    }
+}
+
 const CONTAINER_KEEPALIVE_ENV_KEY: &str = "SANDBOXED_SH_CONTAINER_KEEPALIVE";
 const CONTAINER_KEEPALIVE_ENV_VALUE: &str = "1";
 const ALLOW_TRANSIENT_CONTAINER_NSENTER_ENV: &str =
@@ -936,20 +964,7 @@ impl WorkspaceExec {
                 // server in our cluster — see the kubectl shellout
                 // commit in k8s_pod.rs for details.
                 let pod = format!("ws-{}", self.workspace.id);
-
-                let pod_cwd = match cwd.strip_prefix(&self.workspace.path) {
-                    Ok(rel) if rel.as_os_str().is_empty() => {
-                        std::path::PathBuf::from("/workspaces")
-                    }
-                    Ok(rel) => std::path::PathBuf::from("/workspaces").join(rel),
-                    Err(_) => {
-                        if cwd.starts_with("/workspaces") {
-                            cwd.to_path_buf()
-                        } else {
-                            std::path::PathBuf::from("/workspaces")
-                        }
-                    }
-                };
+                let pod_cwd = map_host_cwd_to_pod(&self.workspace.path, cwd);
 
                 let mut shell_cmd = String::new();
                 shell_cmd.push_str(&format!(
@@ -1024,26 +1039,7 @@ impl WorkspaceExec {
                 )
             })?;
             let env_for_attempt = self.build_env(env);
-            // The caller's `cwd` is a host-side path (the workspace's
-            // synthetic /root/.sandboxed-sh/k8s-pods/<name> dir).
-            // Strip that prefix and map the remainder onto the pod's
-            // /workspaces tree, falling back to /workspaces if the
-            // caller passed a path outside the workspace root.
-            let pod_cwd = match cwd.strip_prefix(&self.workspace.path) {
-                Ok(rel) if rel.as_os_str().is_empty() => std::path::PathBuf::from("/workspaces"),
-                Ok(rel) => std::path::PathBuf::from("/workspaces").join(rel),
-                Err(_) => {
-                    // cwd already looks pod-internal (e.g.
-                    // /workspaces/mission-*/repos/...), so use it
-                    // verbatim. Anything completely outside the pod's
-                    // tree falls back to /workspaces.
-                    if cwd.starts_with("/workspaces") {
-                        cwd.to_path_buf()
-                    } else {
-                        std::path::PathBuf::from("/workspaces")
-                    }
-                }
-            };
+            let pod_cwd = map_host_cwd_to_pod(&self.workspace.path, cwd);
             return k8s
                 .exec_command(
                     self.workspace.id,
@@ -1194,18 +1190,7 @@ impl WorkspaceExec {
             // (claude / opencode / grok) gets a real PTY. Returns a
             // PtyChild wrapping the host-side openpty pair.
             let pod = format!("ws-{}", self.workspace.id);
-
-            let pod_cwd = match cwd.strip_prefix(&self.workspace.path) {
-                Ok(rel) if rel.as_os_str().is_empty() => std::path::PathBuf::from("/workspaces"),
-                Ok(rel) => std::path::PathBuf::from("/workspaces").join(rel),
-                Err(_) => {
-                    if cwd.starts_with("/workspaces") {
-                        cwd.to_path_buf()
-                    } else {
-                        std::path::PathBuf::from("/workspaces")
-                    }
-                }
-            };
+            let pod_cwd = map_host_cwd_to_pod(&self.workspace.path, cwd);
 
             let mut shell_cmd = String::new();
             shell_cmd.push_str(&format!(
