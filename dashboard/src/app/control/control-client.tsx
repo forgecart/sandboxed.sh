@@ -1782,15 +1782,18 @@ function ThinkingGroupItem({
         />
       </button>
 
-      {/* Expandable content with animation */}
+      {/* Expandable content — no max-height cap and no inner
+          scroll container, so the full thought text flows in the
+          main chat instead of being clipped into a small box. The
+          fade transition stays so collapse/expand still animates. */}
       <div
         className={cn(
-          "overflow-hidden transition-all duration-200 ease-out",
-          expanded ? "max-h-[50vh] opacity-100 mt-2" : "max-h-0 opacity-0",
+          "transition-opacity duration-200 ease-out",
+          expanded ? "opacity-100 mt-2" : "hidden opacity-0",
         )}
       >
         <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
-          <div className="overflow-y-auto max-h-[45vh] leading-relaxed space-y-2">
+          <div className="leading-relaxed space-y-2">
             {nonEmptyItems.map((item, idx) => (
               <div key={item.id}>
                 {idx > 0 && (
