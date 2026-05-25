@@ -655,6 +655,153 @@ impl K8sPodClient {
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
 
+    /// Clone the picked GitHub repositories INSIDE the workspace pod
+    /// (instead of on the control-plane filesystem, where the host-side
+    /// `clone_repos` would land them). Used by the mission-spawn path
+    /// when the workspace is a K8sPod — the pod's `/workspaces` PVC is
+    /// the only filesystem the agent ever sees, so anything cloned
+    /// host-side is invisible.
+    ///
+    /// Returns the same `RepoCloneResult` shape `clone_repos` uses so
+    /// the caller's downstream logic (`pick_working_directory`,
+    /// `repos.json` write) keeps working unchanged.
+    pub async fn clone_repos_in_pod(
+        &self,
+        workspace_id: Uuid,
+        selections: &[crate::api::github_app::RepoSelection],
+        token: &str,
+        pod_dest_root: &Path,
+    ) -> Vec<crate::api::github_app::RepoCloneResult> {
+        let mut results = Vec::with_capacity(selections.len());
+        if selections.is_empty() {
+            return results;
+        }
+        // Best-effort `mkdir -p` for the repos/ directory; this also
+        // lets the BASH_ENV auto-stack hook's `[ -d "$__mdir/repos" ]`
+        // gate match before any specific repo is cloned.
+        let repos_root = pod_dest_root.join("repos");
+        let mkdir_cmd = format!("mkdir -p {}", shell_quote(&repos_root.to_string_lossy()));
+        let _ = self
+            .exec_command(
+                workspace_id,
+                None,
+                "/bin/sh",
+                &["-lc".to_string(), mkdir_cmd],
+                &HashMap::new(),
+            )
+            .await;
+
+        for sel in selections {
+            let repo_name = sel
+                .full_name
+                .rsplit('/')
+                .next()
+                .unwrap_or(&sel.full_name)
+                .to_string();
+            let target = repos_root.join(&repo_name);
+            let target_str = target.to_string_lossy().to_string();
+
+            // Probe for an existing checkout. Same semantics as the
+            // host-side clone_repos: don't clobber, treat as success.
+            let probe = self
+                .exec_command(
+                    workspace_id,
+                    None,
+                    "/bin/sh",
+                    &[
+                        "-lc".to_string(),
+                        format!("test -d {}/.git", shell_quote(&target_str)),
+                    ],
+                    &HashMap::new(),
+                )
+                .await;
+            if probe.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+                results.push(crate::api::github_app::RepoCloneResult {
+                    full_name: sel.full_name.clone(),
+                    branch: sel.branch.clone(),
+                    path: target_str.clone(),
+                    success: true,
+                    error: None,
+                });
+                continue;
+            }
+
+            let url = format!(
+                "https://x-access-token:{token}@github.com/{}.git",
+                sel.full_name
+            );
+            let mut clone_cmd = String::from("git clone --depth=1 ");
+            if let Some(branch) = sel.branch.as_deref().filter(|b| !b.trim().is_empty()) {
+                clone_cmd.push_str(&format!("--branch {} ", shell_quote(branch)));
+            }
+            clone_cmd.push_str(&shell_quote(&url));
+            clone_cmd.push(' ');
+            clone_cmd.push_str(&shell_quote(&target_str));
+
+            match self
+                .exec_command(
+                    workspace_id,
+                    None,
+                    "/bin/sh",
+                    &["-lc".to_string(), clone_cmd],
+                    &HashMap::new(),
+                )
+                .await
+            {
+                Ok(out) if out.status.success() => {
+                    tracing::info!(
+                        workspace_id = %workspace_id,
+                        repo = %sel.full_name,
+                        path = %target_str,
+                        "GitHub App clone OK (in-pod)"
+                    );
+                    results.push(crate::api::github_app::RepoCloneResult {
+                        full_name: sel.full_name.clone(),
+                        branch: sel.branch.clone(),
+                        path: target_str,
+                        success: true,
+                        error: None,
+                    });
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    let redacted = stderr.replace(token, "***");
+                    tracing::warn!(
+                        workspace_id = %workspace_id,
+                        repo = %sel.full_name,
+                        status = ?out.status,
+                        stderr = %redacted,
+                        "GitHub App clone FAILED (in-pod)"
+                    );
+                    results.push(crate::api::github_app::RepoCloneResult {
+                        full_name: sel.full_name.clone(),
+                        branch: sel.branch.clone(),
+                        path: target_str,
+                        success: false,
+                        error: Some(redacted),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        workspace_id = %workspace_id,
+                        repo = %sel.full_name,
+                        error = %e,
+                        "GitHub App clone errored (in-pod kubectl exec)"
+                    );
+                    results.push(crate::api::github_app::RepoCloneResult {
+                        full_name: sel.full_name.clone(),
+                        branch: sel.branch.clone(),
+                        path: target_str,
+                        success: false,
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+
+        results
+    }
+
     /// Re-run the workspace's init.sh (after the operator edits the
     /// ConfigMap or wants to retry a failed init).
     pub async fn rerun_init(&self, workspace_id: Uuid) -> Result<Output> {

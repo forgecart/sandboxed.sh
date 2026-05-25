@@ -3039,7 +3039,43 @@ async fn run_mission_turn(
     // start working without an explicit `cd`.
     let mission_work_dir = if !initial_repos.is_empty() {
         if let Some(client) = github_app.as_ref() {
-            let results = client.clone_repos(&initial_repos, &mission_work_dir).await;
+            // K8sPod workspaces clone INSIDE the workspace pod via
+            // kubectl exec — the workspace's PVC is the only filesystem
+            // the agent can see. nspawn/host workspaces clone on the
+            // host fs as before.
+            let is_k8s_pod = workspace.workspace_type == crate::workspace::WorkspaceType::K8sPod;
+            let results = if is_k8s_pod {
+                if let Some(k8s) = crate::k8s_pod::global_client() {
+                    match client.installation_token().await {
+                        Ok(token) => {
+                            let pod_dir = match mission_work_dir.strip_prefix(&workspace.path) {
+                                Ok(rel) => {
+                                    let trimmed = rel.strip_prefix("workspaces").unwrap_or(rel);
+                                    if trimmed.as_os_str().is_empty() {
+                                        std::path::PathBuf::from("/workspaces")
+                                    } else {
+                                        std::path::PathBuf::from("/workspaces").join(trimmed)
+                                    }
+                                }
+                                Err(_) => std::path::PathBuf::from("/workspaces"),
+                            };
+                            k8s.clone_repos_in_pod(workspace.id, &initial_repos, &token, &pod_dir)
+                                .await
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "could not mint installation token; skipping in-pod clone");
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "k8s_pod workspace has initial_repos but K8sPodClient is unavailable; skipping clone"
+                    );
+                    Vec::new()
+                }
+            } else {
+                client.clone_repos(&initial_repos, &mission_work_dir).await
+            };
             let succeeded = results.iter().filter(|r| r.success).count();
             let failed = results.len().saturating_sub(succeeded);
             tracing::info!(

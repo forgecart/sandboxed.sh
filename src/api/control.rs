@@ -11335,9 +11335,60 @@ async fn run_single_control_turn(
     // when the App isn't configured or no repos were picked — agent then runs
     // in the empty mission dir like before. Mirrors the hook in
     // mission_runner::run_mission_turn for the parallel-mission path.
+    //
+    // K8sPod workspaces route through `K8sPodClient::clone_repos_in_pod`
+    // (kubectl-exec git clone INSIDE the workspace pod) because the
+    // host-side filesystem isn't reachable from the workspace pod's
+    // /workspaces PVC. nspawn/host workspaces keep using the host-side
+    // `clone_repos` since their host dir IS the workspace rootfs.
     let working_dir_path = if !initial_repos.is_empty() {
         if let Some(client) = github_app.as_ref() {
-            let results = client.clone_repos(&initial_repos, &working_dir_path).await;
+            let is_k8s_pod = runtime_workspace
+                .as_ref()
+                .map(|w| w.workspace_type == workspace::WorkspaceType::K8sPod)
+                .unwrap_or(false);
+            let results = if is_k8s_pod {
+                if let Some(k8s) = crate::k8s_pod::global_client() {
+                    match client.installation_token().await {
+                        Ok(token) => {
+                            let ws_id = runtime_workspace
+                                .as_ref()
+                                .map(|w| w.id)
+                                .expect("k8s_pod path requires a workspace");
+                            // Translate host mission dir to the pod's
+                            // /workspaces/mission-<id> path. Strip the
+                            // workspace.path prefix and the leading
+                            // `workspaces/` segment (same logic as the
+                            // exec dispatcher in workspace_exec.rs).
+                            let pod_dir = runtime_workspace
+                                .as_ref()
+                                .and_then(|w| working_dir_path.strip_prefix(&w.path).ok())
+                                .map(|rel| {
+                                    let trimmed = rel.strip_prefix("workspaces").unwrap_or(rel);
+                                    if trimmed.as_os_str().is_empty() {
+                                        std::path::PathBuf::from("/workspaces")
+                                    } else {
+                                        std::path::PathBuf::from("/workspaces").join(trimmed)
+                                    }
+                                })
+                                .unwrap_or_else(|| std::path::PathBuf::from("/workspaces"));
+                            k8s.clone_repos_in_pod(ws_id, &initial_repos, &token, &pod_dir)
+                                .await
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "could not mint installation token; skipping in-pod clone");
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "k8s_pod workspace has initial_repos but K8sPodClient is unavailable; skipping clone"
+                    );
+                    Vec::new()
+                }
+            } else {
+                client.clone_repos(&initial_repos, &working_dir_path).await
+            };
             let succeeded = results.iter().filter(|r| r.success).count();
             let failed = results.len().saturating_sub(succeeded);
             tracing::info!(
