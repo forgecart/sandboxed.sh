@@ -1094,7 +1094,115 @@ done
             }
         }
 
+        // After cloning, drop a per-mission `CLAUDE.md` at the
+        // pod's `/workspaces` root that orients the agent: it
+        // enumerates the cloned project directories and tells it
+        // to read each repo's own CLAUDE.md / claude.md / agents.md
+        // for project-specific instructions. Without this, Claude
+        // Code starts in `/workspaces` with no project context and
+        // wastes turns rediscovering the project layout.
+        let _ = self
+            .write_mission_claude_md(mission_id, &results, pod_dest_root)
+            .await;
+
         results
+    }
+
+    /// Generate a root `/workspaces/CLAUDE.md` listing every
+    /// successfully-cloned repo as a project root so Claude Code
+    /// (or whichever agent the boss uses) picks up the multi-repo
+    /// layout immediately. Pointed at each repo's own CLAUDE.md
+    /// (or fallbacks) so per-project instructions still apply.
+    async fn write_mission_claude_md(
+        &self,
+        mission_id: Uuid,
+        results: &[crate::api::github_app::RepoCloneResult],
+        pod_dest_root: &Path,
+    ) -> Result<()> {
+        let cloned: Vec<&crate::api::github_app::RepoCloneResult> =
+            results.iter().filter(|r| r.success).collect();
+        if cloned.is_empty() {
+            return Ok(());
+        }
+        let mut md = String::new();
+        md.push_str("# Mission workspace\n\n");
+        md.push_str(
+            "This per-mission Kubernetes pod has the cloned project repositories listed below. \
+             Each one is its own git repo with its own conventions; treat them as separate \
+             projects, not subfolders of a monorepo.\n\n",
+        );
+        md.push_str("## Project roots\n\n");
+        for r in &cloned {
+            md.push_str(&format!("- `{}` — `{}`\n", r.full_name, r.path));
+        }
+        md.push_str(
+            "\n## Read each project's own instructions first\n\n\
+             Before doing any work in a project, recursively check that project's directory \
+             for any of these files and read them — they encode the project's own conventions, \
+             commands, and house rules:\n\n\
+             - `CLAUDE.md`\n\
+             - `claude.md`\n\
+             - `AGENTS.md`\n\
+             - `agents.md`\n\
+             - `.claude/CLAUDE.md`\n\
+             - Subdirectory `CLAUDE.md` files (e.g. `package/core/CLAUDE.md`)\n\n\
+             Use `find` or `Glob` to enumerate them up front:\n\n",
+        );
+        md.push_str("```sh\n");
+        for r in &cloned {
+            md.push_str(&format!(
+                "find {} -maxdepth 4 -type f \\( -iname CLAUDE.md -o -iname agents.md \\) -not -path '*/node_modules/*' -not -path '*/.git/*'\n",
+                r.path
+            ));
+        }
+        md.push_str("```\n\n");
+        md.push_str(
+            "## Mission pod environment\n\n\
+             - **Docker** daemon runs inside this pod; if a project has `docker-compose.yml` \
+               (or `compose.yml`) it has already been brought up automatically by the \
+               BASH_ENV auto-stack hook. Inspect with `docker compose ps` from the repo dir.\n\
+             - **Kubeconfig** (workload cluster) is at `~/.kube/config`.\n\
+             - **Pre-installed**: `bash`, `git`, `gh`, `kubectl`, `terraform`, `node`, `pnpm`, \
+               `docker`, `docker compose`, plus `claude` and `opencode` CLIs.\n\
+             - **`/workspaces`** (this directory) is scratch — write per-project work into the \
+               correct `/workspaces/repos/<name>/` subdir, not at `/workspaces` root.\n",
+        );
+
+        // Write the file via a small heredoc-style exec to avoid
+        // dealing with quoting in `echo`. Base64 keeps embedded
+        // backticks / `$` / quotes intact through bash.
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(md.as_bytes());
+        let path = pod_dest_root.join("CLAUDE.md");
+        let script = format!(
+            "echo {} | base64 -d > {}",
+            shell_quote(&b64),
+            shell_quote(&path.to_string_lossy())
+        );
+        let out = self
+            .exec_command(
+                mission_id,
+                None,
+                "/bin/bash",
+                &["-lc".to_string(), script],
+                &HashMap::new(),
+            )
+            .await?;
+        if !out.status.success() {
+            tracing::warn!(
+                mission_id = %mission_id,
+                stderr = %String::from_utf8_lossy(&out.stderr),
+                "writing /workspaces/CLAUDE.md failed (non-fatal)"
+            );
+        } else {
+            tracing::info!(
+                mission_id = %mission_id,
+                path = %path.display(),
+                repos = cloned.len(),
+                "Wrote mission-root CLAUDE.md with project map"
+            );
+        }
+        Ok(())
     }
 
     /// Stream pod-startup phase events for a mission. Polls the
