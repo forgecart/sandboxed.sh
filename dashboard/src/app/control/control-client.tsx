@@ -10336,7 +10336,10 @@ export default function ControlClient() {
 
   return (
     <NowTickProvider>
-      <div className="flex h-screen flex-col p-6">
+      {/* Responsive page padding: tight on phones, breathing room
+          from `sm:` up. Prevents the 24px-on-all-sides crunch on
+          narrow viewports where every pixel counts. */}
+      <div className="flex h-screen flex-col p-2 sm:p-4 lg:p-6">
         {/* Always-on debug overlay so any OOM-style crash leaves a trail
           we can reconstruct from sessionStorage after reload. Cheap:
           a polling tick every 2s that reads performance.memory and
@@ -10389,7 +10392,7 @@ export default function ControlClient() {
         />
 
         {/* Header */}
-        <div className="relative z-10 mb-6 flex items-center justify-between gap-2 lg:gap-4">
+        <div className="relative z-10 mb-3 sm:mb-6 flex items-center justify-between gap-2 lg:gap-4">
           <div className="flex items-center gap-3 min-w-0 overflow-hidden">
             {/* Unified Mission Selector */}
             <div className="relative">
@@ -11134,8 +11137,11 @@ export default function ControlClient() {
           </div>
         </div>
 
-        {/* Main content area - Chat and Desktop stream side by side */}
-        <div className="flex-1 min-h-0 flex gap-4">
+        {/* Main content area - Chat and Desktop stream side by side
+            on `md:` and up. On phones we stack vertically so the
+            320px-wide right column doesn't squeeze the chat to
+            illegible width. */}
+        <div className="flex-1 min-h-0 flex flex-col md:flex-row gap-2 md:gap-4">
           {/* Chat container. We intentionally do NOT animate flex-grow when
           side panels (Workers / Workbench / Thinking) open: animating layout
           properties like `flex-grow` re-flows the entire (potentially huge)
@@ -11205,7 +11211,7 @@ export default function ControlClient() {
             <div
               ref={containerRef}
               data-testid="chat-scroll-container"
-              className="flex-1 overflow-y-auto p-6"
+              className="flex-1 overflow-y-auto p-3 sm:p-4 md:p-6"
             >
               {/* Sub-agent tab is active → render the scoped chat
                   view for that sub-agent instead of the main thread.
@@ -11775,8 +11781,12 @@ export default function ControlClient() {
                 // `transition-all duration-300` that was animating width on
                 // mount (the width change is what caused the chat-side reflow
                 // freeze when toggling the Workers panel).
-                "min-h-0 flex flex-col gap-4 animate-fade-in shrink-0",
-                showDesktopStream ? "flex-1 max-w-md" : "w-80",
+                // On phones: full-width and stacks below the chat.
+                // On md+: fixed 320px sidecar (or wider for desktop stream).
+                "min-h-0 flex flex-col gap-2 md:gap-4 animate-fade-in md:shrink-0",
+                showDesktopStream
+                  ? "w-full md:flex-1 md:max-w-md"
+                  : "w-full md:w-80",
               )}
             >
               {showWorkbenchPanel && (
