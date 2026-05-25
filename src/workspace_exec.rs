@@ -20,6 +20,12 @@ use crate::nspawn;
 use crate::util::env_var_bool;
 use crate::workspace::{use_nspawn_for_workspace, TailscaleMode, Workspace, WorkspaceType};
 
+fn sh_quote(s: &str) -> String {
+    // Single-quote shell quoting compatible with `bash -lc`. Embedded
+    // single quotes are escaped via the standard `'\''` pattern.
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 const CONTAINER_KEEPALIVE_ENV_KEY: &str = "SANDBOXED_SH_CONTAINER_KEEPALIVE";
 const CONTAINER_KEEPALIVE_ENV_VALUE: &str = "1";
 const ALLOW_TRANSIENT_CONTAINER_NSENTER_ENV: &str =
@@ -922,17 +928,79 @@ impl WorkspaceExec {
                 )
             }
             WorkspaceType::K8sPod => {
-                // K8sPod execs go through the kube API in
-                // `workspace_backend_k8s_pod::K8sPodBackend`, not
-                // through `Command`. Reaching `build_command()` for a
-                // K8sPod is a programming error — the trait dispatch
-                // in `output()` / `pty_attach()` should have routed
-                // around it. Bail loudly.
-                anyhow::bail!(
-                    "K8sPod workspaces don't use std::process::Command for exec — \
-                     route through WorkspaceBackend::exec instead. workspace_id={}",
-                    self.workspace.id
-                );
+                // K8sPod: shell out to kubectl. Same pattern as
+                // `K8sPodClient::exec_command`, but here we return a
+                // `tokio::process::Command` because the caller wants
+                // a streaming `Child` (via `spawn_streaming`). The
+                // kube-rs WS exec path 403s on the RKE2 1.34 API
+                // server in our cluster — see the kubectl shellout
+                // commit in k8s_pod.rs for details.
+                let pod = format!("ws-{}", self.workspace.id);
+
+                let pod_cwd = match cwd.strip_prefix(&self.workspace.path) {
+                    Ok(rel) if rel.as_os_str().is_empty() => {
+                        std::path::PathBuf::from("/workspaces")
+                    }
+                    Ok(rel) => std::path::PathBuf::from("/workspaces").join(rel),
+                    Err(_) => {
+                        if cwd.starts_with("/workspaces") {
+                            cwd.to_path_buf()
+                        } else {
+                            std::path::PathBuf::from("/workspaces")
+                        }
+                    }
+                };
+
+                let mut shell_cmd = String::new();
+                shell_cmd.push_str(&format!(
+                    "mkdir -p {cwd} && cd {cwd} && ",
+                    cwd = sh_quote(&pod_cwd.to_string_lossy())
+                ));
+                for (k, v) in &env {
+                    if k.trim().is_empty() {
+                        continue;
+                    }
+                    shell_cmd.push_str(&format!("export {}={}; ", sh_quote(k), sh_quote(v)));
+                }
+                shell_cmd.push_str(&sh_quote(program));
+                for arg in args {
+                    shell_cmd.push(' ');
+                    shell_cmd.push_str(&sh_quote(arg));
+                }
+
+                let api_server = std::env::var("KUBERNETES_SERVICE_HOST")
+                    .ok()
+                    .map(|host| {
+                        let port = std::env::var("KUBERNETES_SERVICE_PORT")
+                            .unwrap_or_else(|_| "443".to_string());
+                        format!("https://{}:{}", host, port)
+                    })
+                    .unwrap_or_else(|| "https://kubernetes.default.svc".to_string());
+                let namespace = std::env::var("SANDBOXED_SH_K8S_WORKSPACE_NAMESPACE")
+                    .unwrap_or_else(|_| "sandboxed-sh".to_string());
+                let token =
+                    std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/token")
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
+
+                let mut cmd = Command::new("kubectl");
+                cmd.arg("--token")
+                    .arg(token)
+                    .arg("--certificate-authority")
+                    .arg("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+                    .arg("--server")
+                    .arg(&api_server)
+                    .arg("--namespace")
+                    .arg(&namespace)
+                    .arg("exec")
+                    .arg("-i")
+                    .arg(&pod)
+                    .arg("--")
+                    .arg("/bin/bash")
+                    .arg("-lc")
+                    .arg(&shell_cmd);
+                cmd.stdin(stdin).stdout(stdout).stderr(stderr);
+                Ok(cmd)
             }
         }
     }
@@ -1117,6 +1185,81 @@ impl WorkspaceExec {
             return self.spawn_unix_pty(cwd, &nsenter_program, &nsenter_args, &env);
         }
 
+        #[cfg(unix)]
+        if matches!(self.workspace.workspace_type, WorkspaceType::K8sPod) {
+            // PTY for K8sPod = `kubectl exec -it <pod> -- /bin/bash -lc
+            // "cd <cwd> && <env...> <program> <args...>"`. Same kubectl
+            // shellout pattern that `K8sPodClient::exec_command` uses for
+            // one-shot exec, but with `-it` so the workspace's CLI
+            // (claude / opencode / grok) gets a real PTY. Returns a
+            // PtyChild wrapping the host-side openpty pair.
+            let pod = format!("ws-{}", self.workspace.id);
+
+            let pod_cwd = match cwd.strip_prefix(&self.workspace.path) {
+                Ok(rel) if rel.as_os_str().is_empty() => std::path::PathBuf::from("/workspaces"),
+                Ok(rel) => std::path::PathBuf::from("/workspaces").join(rel),
+                Err(_) => {
+                    if cwd.starts_with("/workspaces") {
+                        cwd.to_path_buf()
+                    } else {
+                        std::path::PathBuf::from("/workspaces")
+                    }
+                }
+            };
+
+            let mut shell_cmd = String::new();
+            shell_cmd.push_str(&format!(
+                "mkdir -p {cwd} && cd {cwd} && ",
+                cwd = sh_quote(&pod_cwd.to_string_lossy())
+            ));
+            for (k, v) in &env {
+                if k.trim().is_empty() {
+                    continue;
+                }
+                shell_cmd.push_str(&format!("export {}={}; ", sh_quote(k), sh_quote(v)));
+            }
+            shell_cmd.push_str(&sh_quote(program));
+            for arg in args {
+                shell_cmd.push(' ');
+                shell_cmd.push_str(&sh_quote(arg));
+            }
+
+            let api_server = std::env::var("KUBERNETES_SERVICE_HOST")
+                .ok()
+                .map(|host| {
+                    let port = std::env::var("KUBERNETES_SERVICE_PORT")
+                        .unwrap_or_else(|_| "443".to_string());
+                    format!("https://{}:{}", host, port)
+                })
+                .unwrap_or_else(|| "https://kubernetes.default.svc".to_string());
+            let namespace = std::env::var("SANDBOXED_SH_K8S_WORKSPACE_NAMESPACE")
+                .unwrap_or_else(|_| "sandboxed-sh".to_string());
+            let token =
+                std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/token")
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+
+            let kubectl_args: Vec<String> = vec![
+                "--token".to_string(),
+                token,
+                "--certificate-authority".to_string(),
+                "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt".to_string(),
+                "--server".to_string(),
+                api_server,
+                "--namespace".to_string(),
+                namespace,
+                "exec".to_string(),
+                "-i".to_string(),
+                "-t".to_string(),
+                pod,
+                "--".to_string(),
+                "/bin/bash".to_string(),
+                "-lc".to_string(),
+                shell_cmd,
+            ];
+            return self.spawn_unix_pty(cwd, "kubectl", &kubectl_args, &env);
+        }
+
         // Portable-pty fallback (non-Unix, or non-nspawn Container).
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -1172,15 +1315,13 @@ impl WorkspaceExec {
                 }
             }
             WorkspaceType::K8sPod => {
-                // K8sPod attaches its PTY via the kube exec subresource
-                // (`tty: true`, `stdin: true`) in
-                // `workspace_backend_k8s_pod::K8sPodBackend::attach_pty`.
-                // The caller should have routed there; reaching this
-                // branch is a bug.
+                // K8sPod PTY is handled higher up via the `#[cfg(unix)]`
+                // kubectl-shellout branch that returns through
+                // `spawn_unix_pty`. The portable-pty fallback is only
+                // reached on non-Unix builds, which we don't ship for
+                // the control plane — bail loudly if we ever get here.
                 anyhow::bail!(
-                    "K8sPod workspaces don't use portable-pty CommandBuilder — \
-                     route through WorkspaceBackend::attach_pty instead. \
-                     workspace_id={}",
+                    "K8sPod workspaces require Unix PTY; portable-pty fallback unsupported. workspace_id={}",
                     self.workspace.id
                 );
             }
