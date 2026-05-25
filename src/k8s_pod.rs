@@ -845,7 +845,12 @@ impl K8sPodClient {
     ///
     /// Idempotent — missing dirs / dead pods are no-ops.
     pub async fn cleanup_mission_in_pod(&self, workspace_id: Uuid, mission_id: Uuid) -> Result<()> {
-        let mission_dir = format!("/workspaces/mission-{}", mission_id);
+        // Mission dirs use the short (first 8 chars) UUID; see
+        // `workspace::mission_workspace_dir_for_root`. The previous
+        // version used the full UUID, so `rm -rf` quietly succeeded
+        // against a path that didn't exist and left the real
+        // `mission-<short>` dir behind.
+        let mission_dir = format!("/workspaces/mission-{}", &mission_id.to_string()[..8]);
         // Confirm the pod is reachable before issuing exec. If it's
         // gone (workspace destroyed already), there's nothing to do.
         if self
