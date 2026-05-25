@@ -486,7 +486,7 @@ impl K8sPodClient {
             "k8s_pod exec_command"
         );
 
-        let mut attached = self
+        let mut attached = match self
             .pods()
             .exec(
                 &pod_name,
@@ -498,7 +498,19 @@ impl K8sPodClient {
                     .tty(false),
             )
             .await
-            .with_context(|| format!("kube exec on pod {} failed", pod_name))?;
+        {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(
+                    workspace_id = %workspace_id,
+                    pod = %pod_name,
+                    error = %e,
+                    error_debug = ?e,
+                    "kube exec API call returned error"
+                );
+                return Err(anyhow!("kube exec on pod {} failed: {}", pod_name, e));
+            }
+        };
 
         // Collect stdout / stderr in parallel.
         let mut stdout = Vec::new();
