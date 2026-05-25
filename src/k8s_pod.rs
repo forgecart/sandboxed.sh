@@ -473,7 +473,18 @@ impl K8sPodClient {
             shell_cmd.push_str(&shell_quote(arg));
         }
 
-        let argv = vec!["/bin/bash".to_string(), "-lc".to_string(), shell_cmd];
+        let argv = vec![
+            "/bin/bash".to_string(),
+            "-lc".to_string(),
+            shell_cmd.clone(),
+        ];
+
+        tracing::debug!(
+            workspace_id = %workspace_id,
+            pod = %pod_name,
+            cmd = %shell_cmd,
+            "k8s_pod exec_command"
+        );
 
         let mut attached = self
             .pods()
@@ -520,6 +531,17 @@ impl K8sPodClient {
         };
 
         let _ = attached.join().await;
+
+        tracing::debug!(
+            workspace_id = %workspace_id,
+            pod = %pod_name,
+            exit = exit_code,
+            stdout_len = stdout.len(),
+            stderr_len = stderr.len(),
+            stdout_sample = %String::from_utf8_lossy(&stdout[..stdout.len().min(200)]),
+            stderr_sample = %String::from_utf8_lossy(&stderr[..stderr.len().min(200)]),
+            "k8s_pod exec_command done"
+        );
 
         let status = ExitStatus::from_raw((exit_code as i32) << 8);
         Ok(Output {
