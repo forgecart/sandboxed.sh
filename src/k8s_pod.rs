@@ -28,6 +28,7 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::{
     api::{Api, AttachParams, DeleteParams, PostParams},
+    config::Config,
     Client,
 };
 use std::collections::{BTreeMap, HashMap};
@@ -127,12 +128,31 @@ impl K8sPodClient {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| PULL_SECRET_DEFAULT.to_string());
-        let client = Client::try_default().await.ok()?;
+        // Force in-cluster config. The control plane's `$HOME/.kube/config`
+        // points at the Rancher API proxy, which 403s on WebSocket
+        // upgrades for `pods/exec`. The in-cluster API server (resolved
+        // via $KUBERNETES_SERVICE_HOST + the mounted ServiceAccount
+        // token) is the only path that honors WebSocket upgrades for
+        // exec.
+        let config = match Config::incluster() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "K8sPod backend disabled: no in-cluster config (deployment needs a ServiceAccount)");
+                return None;
+            }
+        };
+        let client = match Client::try_from(config) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "K8sPod backend disabled: failed to construct kube Client from in-cluster config");
+                return None;
+            }
+        };
         tracing::info!(
             namespace = %namespace,
             image = %image,
             pull_secret = %pull_secret,
-            "K8sPod backend enabled"
+            "K8sPod backend enabled (in-cluster config)"
         );
         let me = Self {
             client,
