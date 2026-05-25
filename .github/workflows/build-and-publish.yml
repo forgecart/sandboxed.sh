@@ -81,6 +81,28 @@ jobs:
           nexus-username: ${{ secrets.NEXUS_USERNAME }}
           nexus-password: ${{ secrets.NEXUS_PASSWORD }}
 
+  # Workspace-base image. Every `workspace_type: k8s_pod` workspace pod
+  # uses this image as its rootfs. Pulled at workspace-creation time by
+  # the control plane; not rolled to any deployment (workspaces are
+  # ephemeral). Built in parallel to the main image — both share the
+  # same BuildKit cache layer in Nexus :buildcache.
+  build-workspace-base:
+    name: Build & Publish Workspace Base
+    runs-on: arc-runner-set
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - uses: ./.github/actions/docker-build
+        with:
+          image-name: forgecart/sandboxed-workspace-base
+          dockerfile: docker/workspace-base/Dockerfile
+          context: .
+          push: "true"
+          cache-write: ${{ inputs.cache-write == false && 'false' || 'true' }}
+          nexus-registry: ${{ env.NEXUS_REGISTRY }}
+          nexus-username: ${{ secrets.NEXUS_USERNAME }}
+          nexus-password: ${{ secrets.NEXUS_PASSWORD }}
+
   # Roll the freshly-built image to the live deployment. Mirrors the
   # `deploy-test-server` / `deploy-dev` stages from shop-beta's dev-deploy.yml.
   # The ARC runner pod's service account talks to the cluster via the
