@@ -3,8 +3,11 @@
 #
 # Per-mission convenience: kicks off `docker login` for each
 # forwarded-creds registry, then walks any cloned repo under
-# /workspaces/mission-*/repos/ and `docker compose up -d` each
-# compose file. Marker files block re-runs.
+# /workspaces/repos/ and `docker compose up -d` each compose
+# file. Marker files block re-runs. /workspaces is the per-mission
+# pod's mission root (the whole pod = one mission), so the scan
+# is rooted directly at /workspaces — no /workspaces/mission-*
+# wrapper anymore.
 #
 # Key constraint: this script gets re-sourced on EVERY `kubectl exec`
 # into the workspace pod (each exec spawns a fresh bash). The login
@@ -50,30 +53,30 @@ if [ -z "${SANDBOXED_BASHENV_DONE:-}" ] && command -v dockerd >/dev/null 2>&1; t
         fi
       fi
 
-      for __mdir in /workspaces/mission-*; do
-        [ -d "$__mdir/repos" ] || continue
-        __marker="$__mdir/.sandboxed-autostack-done"
-        [ -f "$__marker" ] && continue
-        # Per-mission lock so two parallel bashes don't both compose-up
-        # the same repo set.
-        if mkdir "$__mdir/.sandboxed-autostack-lock" 2>/dev/null; then
-          trap 'rmdir "$__mdir/.sandboxed-autostack-lock" 2>/dev/null || true' EXIT
-          __upped=0
-          for __cf in "$__mdir/repos"/*/docker-compose.yml "$__mdir/repos"/*/compose.yml; do
-            [ -f "$__cf" ] || continue
-            __repo_dir="$(dirname "$__cf")"
-            echo "[sandboxed] compose up: $__repo_dir" >>"$__runlog"
-            if (set -o pipefail; cd "$__repo_dir" && docker compose up -d >>"$__runlog" 2>&1); then
-              __upped=$((__upped + 1))
-            else
-              echo "[sandboxed] compose up FAILED in $__repo_dir (continuing)" >>"$__runlog"
+      if [ -d /workspaces/repos ]; then
+        __marker=/workspaces/.sandboxed-autostack-done
+        if [ ! -f "$__marker" ]; then
+          # Lock so two parallel bashes don't both compose-up the
+          # same repo set.
+          if mkdir /workspaces/.sandboxed-autostack-lock 2>/dev/null; then
+            trap 'rmdir /workspaces/.sandboxed-autostack-lock 2>/dev/null || true' EXIT
+            __upped=0
+            for __cf in /workspaces/repos/*/docker-compose.yml /workspaces/repos/*/compose.yml; do
+              [ -f "$__cf" ] || continue
+              __repo_dir="$(dirname "$__cf")"
+              echo "[sandboxed] compose up: $__repo_dir" >>"$__runlog"
+              if (set -o pipefail; cd "$__repo_dir" && docker compose up -d >>"$__runlog" 2>&1); then
+                __upped=$((__upped + 1))
+              else
+                echo "[sandboxed] compose up FAILED in $__repo_dir (continuing)" >>"$__runlog"
+              fi
+            done
+            if [ "$__upped" -gt 0 ]; then
+              touch "$__marker" 2>/dev/null || true
             fi
-          done
-          if [ "$__upped" -gt 0 ]; then
-            touch "$__marker" 2>/dev/null || true
           fi
         fi
-      done
+      fi
     ) >/dev/null 2>&1 </dev/null &
     disown 2>/dev/null || true
     unset __runlog
