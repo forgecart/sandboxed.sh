@@ -11209,7 +11209,7 @@ export default function ControlClient() {
                   </div>
                 </div>
               ) : (
-                <div className="mx-auto max-w-5xl space-y-6">
+                <div className="w-full space-y-6">
                   <div
                     className="relative w-full"
                     style={{ height: `${chatVirtualizer.getTotalSize()}px` }}
