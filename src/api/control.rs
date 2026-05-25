@@ -8608,8 +8608,7 @@ async fn control_actor_loop(
             let docker_events_tx = events_tx.clone();
             tokio::spawn(async move {
                 let stop = tokio_util::sync::CancellationToken::new();
-                let stream =
-                    docker_k8s.stream_docker_compose_status(mission_id, stop.clone());
+                let stream = docker_k8s.stream_docker_compose_status(mission_id, stop.clone());
                 futures::pin_mut!(stream);
                 use futures::StreamExt;
                 let mut last: Option<Vec<crate::k8s_pod::DockerServiceStatus>> = None;
