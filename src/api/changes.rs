@@ -33,6 +33,12 @@ pub struct MissionChangedFile {
     /// "added" diff) for untracked files. Truncated to 256KB to
     /// protect the dashboard from multi-MB pathological cases.
     pub diff: String,
+    /// File content at `HEAD` (the "before" side of the side-by-side
+    /// diff). `None` for untracked files. Truncated to MAX_DIFF_BYTES.
+    pub head_content: Option<String>,
+    /// File content in the worktree (the "after" side). `None` for
+    /// fully-deleted files. Truncated to MAX_DIFF_BYTES.
+    pub worktree_content: Option<String>,
     /// `true` when the diff was truncated. Bytes are then a head
     /// slice; full diff is still available via the agent's
     /// in-pod tools if needed.
@@ -167,19 +173,100 @@ async fn collect_changed_files(
         }
         let status = xy.trim().to_string();
         let path = rest.to_string();
-        let (diff, truncated) = if xy == "??" {
+        let untracked = xy == "??";
+        let deleted = xy.contains('D');
+        let (diff, truncated) = if untracked {
             fetch_untracked_as_diff(k8s, mission_id, &repo_dir, &path).await
         } else {
             fetch_tracked_diff(k8s, mission_id, &repo_dir, &path).await
+        };
+        // Side-by-side content. `head_content` = `git show HEAD:<path>`
+        // for tracked files (None for untracked). `worktree_content`
+        // = current file content (None for fully-deleted files).
+        let head_content = if untracked {
+            None
+        } else {
+            fetch_head_content(k8s, mission_id, &repo_dir, &path).await
+        };
+        let worktree_content = if deleted {
+            None
+        } else {
+            fetch_worktree_content(k8s, mission_id, &repo_dir, &path).await
         };
         files.push(MissionChangedFile {
             path,
             status,
             diff,
+            head_content,
+            worktree_content,
             truncated,
         });
     }
     files
+}
+
+async fn fetch_head_content(
+    k8s: &Arc<crate::k8s_pod::K8sPodClient>,
+    mission_id: Uuid,
+    repo_dir: &str,
+    path: &str,
+) -> Option<String> {
+    let script = format!(
+        "cd {} && git show HEAD:{} 2>/dev/null",
+        shell_quote(repo_dir),
+        shell_quote(path)
+    );
+    let out = k8s
+        .exec_command(
+            mission_id,
+            None,
+            "/bin/bash",
+            &["-lc".to_string(), script],
+            &HashMap::new(),
+        )
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut s = String::from_utf8_lossy(&out.stdout).to_string();
+    if s.len() > MAX_DIFF_BYTES {
+        s.truncate(MAX_DIFF_BYTES);
+        s.push_str("\n\n[... truncated ...]\n");
+    }
+    Some(s)
+}
+
+async fn fetch_worktree_content(
+    k8s: &Arc<crate::k8s_pod::K8sPodClient>,
+    mission_id: Uuid,
+    repo_dir: &str,
+    path: &str,
+) -> Option<String> {
+    let script = format!(
+        "cd {} && cat -- {} 2>/dev/null",
+        shell_quote(repo_dir),
+        shell_quote(path)
+    );
+    let out = k8s
+        .exec_command(
+            mission_id,
+            None,
+            "/bin/bash",
+            &["-lc".to_string(), script],
+            &HashMap::new(),
+        )
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut s = String::from_utf8_lossy(&out.stdout).to_string();
+    if s.len() > MAX_DIFF_BYTES {
+        s.truncate(MAX_DIFF_BYTES);
+        s.push_str("\n\n[... truncated ...]\n");
+    }
+    Some(s)
 }
 
 async fn fetch_tracked_diff(

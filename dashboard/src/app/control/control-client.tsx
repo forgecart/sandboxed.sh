@@ -1803,7 +1803,7 @@ function ThinkingGroupItem({
                 <StreamingMarkdown
                   content={item.content}
                   isStreaming={!item.done}
-                  className="text-xs text-white/60 [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1"
+                  className="text-sm leading-relaxed text-white/70 [&_p]:my-1.5 [&_ul]:my-1.5 [&_ol]:my-1.5"
                   basePath={basePath}
                   workspaceId={workspaceId}
                   missionId={missionId}
@@ -4104,7 +4104,7 @@ const ChatItemRow = memo(function ChatItemRow({
         )}
       >
         <CopyButton text={item.content} className="self-start mt-2" />
-        <div className="max-w-[80%]">
+        <div className="max-w-[90%]">
           <div
             className={cn(
               "rounded-2xl rounded-tr-md px-4 py-3 text-white selection-light",
@@ -4113,7 +4113,7 @@ const ChatItemRow = memo(function ChatItemRow({
                 : "bg-indigo-500",
             )}
           >
-            <p className="whitespace-pre-wrap text-sm break-words">
+            <p className="whitespace-pre-wrap text-base leading-relaxed break-words">
               {item.content}
             </p>
           </div>
@@ -4156,7 +4156,7 @@ const ChatItemRow = memo(function ChatItemRow({
         <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
           <Bot className="h-4 w-4 text-indigo-400" />
         </div>
-        <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+        <div className="max-w-[90%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3 text-base leading-relaxed">
           <div className="mb-2 flex items-center gap-2 text-xs text-white/40">
             <MessageStatusIcon
               className={cn("h-3 w-3", turnStatus.iconClass)}
@@ -4307,7 +4307,7 @@ const ChatItemRow = memo(function ChatItemRow({
             <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
               <Bot className="h-4 w-4 text-indigo-400" />
             </div>
-            <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+            <div className="max-w-[90%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3 text-base leading-relaxed">
               <div className="mb-2 text-xs text-white/40">
                 Tool:{" "}
                 <span className="font-mono text-indigo-400">{item.name}</span>

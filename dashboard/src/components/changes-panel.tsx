@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { RefreshCw, GitBranch, FileText, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { apiGet } from "@/lib/api/core";
@@ -9,6 +9,8 @@ interface MissionChangedFile {
   path: string;
   status: string;
   diff: string;
+  head_content: string | null;
+  worktree_content: string | null;
   truncated: boolean;
 }
 
@@ -24,14 +26,18 @@ interface MissionChangesResponse {
 }
 
 /**
- * Per-mission code-changes drawer. Lists every modified / added /
- * deleted file across all cloned repos inside the per-mission pod
- * with a unified-diff viewer. Lazily fetched the first time the
- * user opens the tab; manual refresh available.
+ * Per-mission code-changes drawer styled like a PR-review pane.
  *
- * Layout: file tree on the left, unified diff on the right. A diff
- * is rendered with simple JSX (no library) — color the line prefix
- * (`+` green, `-` red, ` ` muted, `@@` hunk header indigo).
+ * Layout (left → right):
+ *   1. File tree (grouped by repo, with status badges)
+ *   2. Side-by-side code editor: HEAD content (left) | worktree
+ *      content (right), both monospace + line numbers, with
+ *      added/removed lines highlighted per a Myers line diff
+ *      computed client-side from the two contents.
+ *   3. Synchronized vertical scroll across the two panes.
+ *
+ * For untracked files we render only the right pane (full content
+ * as "added"). For deleted files only the left pane (as "removed").
  */
 export function ChangesPanel({
   missionId,
@@ -54,9 +60,10 @@ export function ChangesPanel({
         "Failed to load changes",
       );
       setData(res);
-      // Auto-select first file when none selected.
       const first = res.repos[0]?.files[0];
-      setSelectedPath((cur) => cur ?? (first ? `${res.repos[0].name}/${first.path}` : null));
+      setSelectedPath(
+        (cur) => cur ?? (first ? `${res.repos[0].name}/${first.path}` : null),
+      );
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -104,7 +111,9 @@ export function ChangesPanel({
             className="p-1 rounded hover:bg-white/[0.06] text-white/40 hover:text-white/70 transition-colors disabled:opacity-50"
             title="Refresh"
           >
-            <RefreshCw className={cn("h-3.5 w-3.5", loading && "animate-spin")} />
+            <RefreshCw
+              className={cn("h-3.5 w-3.5", loading && "animate-spin")}
+            />
           </button>
           <button
             type="button"
@@ -133,18 +142,20 @@ export function ChangesPanel({
         {/* File tree */}
         <div className="w-72 shrink-0 border-r border-white/[0.06] overflow-y-auto">
           {!data && loading && (
-            <div className="p-3 text-xs text-white/40">Loading…</div>
+            <div className="p-3 text-sm text-white/40">Loading…</div>
           )}
           {data && totalFiles === 0 && !data.unavailable && (
-            <div className="p-3 text-xs text-white/40">
+            <div className="p-3 text-sm text-white/40">
               No uncommitted changes in any cloned repo.
             </div>
           )}
           {data?.repos.map((repo) => (
             <div key={repo.name} className="py-1">
-              <div className="px-3 py-1 text-[10px] uppercase tracking-wide text-white/40 font-mono">
+              <div className="px-3 py-1 text-[11px] uppercase tracking-wide text-white/40 font-mono">
                 {repo.name}
-                <span className="ml-1 text-white/30">({repo.files.length})</span>
+                <span className="ml-1 text-white/30">
+                  ({repo.files.length})
+                </span>
               </div>
               <ul>
                 {repo.files.map((f) => {
@@ -156,7 +167,7 @@ export function ChangesPanel({
                         type="button"
                         onClick={() => setSelectedPath(key)}
                         className={cn(
-                          "w-full flex items-center gap-1.5 px-3 py-1 text-xs text-left hover:bg-white/[0.04]",
+                          "w-full flex items-center gap-1.5 px-3 py-1 text-sm text-left hover:bg-white/[0.04]",
                           isActive && "bg-indigo-500/15 text-indigo-200",
                         )}
                         title={f.path}
@@ -172,12 +183,12 @@ export function ChangesPanel({
           ))}
         </div>
 
-        {/* Diff viewer */}
-        <div className="flex-1 min-w-0 overflow-y-auto">
+        {/* Code editor / diff viewer */}
+        <div className="flex-1 min-w-0 flex flex-col">
           {selectedFile ? (
-            <div>
-              <div className="sticky top-0 z-10 flex items-center gap-2 px-4 py-2 bg-[#0d0d0d]/95 border-b border-white/[0.06] text-xs">
-                <FileText className="h-3.5 w-3.5 text-white/40" />
+            <>
+              <div className="flex items-center gap-2 px-4 py-2 border-b border-white/[0.06] text-sm bg-[#0d0d0d]/80">
+                <FileText className="h-4 w-4 text-white/40" />
                 <span className="font-mono text-white/80 truncate">
                   {selectedFile.repo}/{selectedFile.path}
                 </span>
@@ -188,10 +199,13 @@ export function ChangesPanel({
                   </span>
                 )}
               </div>
-              <DiffView diff={selectedFile.diff} />
-            </div>
+              <SideBySideDiff
+                head={selectedFile.head_content}
+                worktree={selectedFile.worktree_content}
+              />
+            </>
           ) : (
-            <div className="flex h-full items-center justify-center text-xs text-white/40">
+            <div className="flex h-full items-center justify-center text-sm text-white/40">
               {data && totalFiles > 0 ? "Select a file" : ""}
             </div>
           )}
@@ -232,45 +246,239 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
-/**
- * Unified diff renderer. Splits on `\n` and colours each line by
- * leading char:
- *   `+` → emerald   (added line)
- *   `-` → red       (removed)
- *   `@@` → indigo   (hunk header)
- *   `diff --git`, `index`, `---`, `+++`, `new file`, `deleted file`,
- *   `Binary` → muted (file header)
- *   anything else → text-white/70 (context line)
- */
-function DiffView({ diff }: { diff: string }) {
-  const lines = useMemo(() => diff.split("\n"), [diff]);
+// Tiny LCS-based line diff. Returns one Op per OUTPUT row.
+// `kind` semantics:
+//   "same"  → context (both panes show the line)
+//   "del"   → removed from head (left pane shows it red, right blank)
+//   "add"   → added to worktree (left blank, right shows green)
+// We render both panes by aligning del/add into the same row index
+// so vertical scrolling stays in lockstep.
+type DiffRow =
+  | { kind: "same"; left: string; right: string; leftNo: number; rightNo: number }
+  | { kind: "del"; left: string; leftNo: number }
+  | { kind: "add"; right: string; rightNo: number };
+
+function lineDiff(a: string[], b: string[]): DiffRow[] {
+  // Build LCS table — O(n*m). Files are capped at 256KB so worst
+  // case ~8k * 8k = 64M cells which is too slow; cap the diff
+  // calculation at 5k lines per side and treat overflow as
+  // unaligned (alternating add/del at the end).
+  const N = a.length;
+  const M = b.length;
+  const cap = 5000;
+  if (N > cap || M > cap) {
+    // Bail out of LCS: just stack head as "del" then worktree as
+    // "add". User can still read both files but loses alignment.
+    const rows: DiffRow[] = [];
+    for (let i = 0; i < N; i++) {
+      rows.push({ kind: "del", left: a[i], leftNo: i + 1 });
+    }
+    for (let j = 0; j < M; j++) {
+      rows.push({ kind: "add", right: b[j], rightNo: j + 1 });
+    }
+    return rows;
+  }
+  // Use Uint32Array for the table — far less GC pressure than Array<number>.
+  const stride = M + 1;
+  const lcs = new Uint32Array((N + 1) * stride);
+  for (let i = 1; i <= N; i++) {
+    const baseI = i * stride;
+    const baseIm1 = (i - 1) * stride;
+    for (let j = 1; j <= M; j++) {
+      if (a[i - 1] === b[j - 1]) {
+        lcs[baseI + j] = lcs[baseIm1 + j - 1] + 1;
+      } else {
+        const top = lcs[baseIm1 + j];
+        const left = lcs[baseI + j - 1];
+        lcs[baseI + j] = top >= left ? top : left;
+      }
+    }
+  }
+  // Backtrack to produce DiffRow[].
+  const rows: DiffRow[] = [];
+  let i = N;
+  let j = M;
+  while (i > 0 && j > 0) {
+    if (a[i - 1] === b[j - 1]) {
+      rows.push({
+        kind: "same",
+        left: a[i - 1],
+        right: b[j - 1],
+        leftNo: i,
+        rightNo: j,
+      });
+      i--;
+      j--;
+    } else if (lcs[(i - 1) * stride + j] >= lcs[i * stride + j - 1]) {
+      rows.push({ kind: "del", left: a[i - 1], leftNo: i });
+      i--;
+    } else {
+      rows.push({ kind: "add", right: b[j - 1], rightNo: j });
+      j--;
+    }
+  }
+  while (i > 0) {
+    rows.push({ kind: "del", left: a[i - 1], leftNo: i });
+    i--;
+  }
+  while (j > 0) {
+    rows.push({ kind: "add", right: b[j - 1], rightNo: j });
+    j--;
+  }
+  rows.reverse();
+  return rows;
+}
+
+function SideBySideDiff({
+  head,
+  worktree,
+}: {
+  head: string | null;
+  worktree: string | null;
+}) {
+  const headLines = useMemo(() => (head ?? "").split("\n"), [head]);
+  const wtLines = useMemo(() => (worktree ?? "").split("\n"), [worktree]);
+  // Trim trailing empty line that `split("\n")` introduces when the
+  // string ends in `\n` — otherwise every file shows an extra blank
+  // "same" row at the bottom.
+  const trim = (arr: string[]) =>
+    arr.length > 0 && arr[arr.length - 1] === ""
+      ? arr.slice(0, -1)
+      : arr;
+  const rows = useMemo(
+    () => lineDiff(trim(headLines), trim(wtLines)),
+    [headLines, wtLines],
+  );
+
+  // Sync scrolling between left and right panes.
+  const leftRef = useRef<HTMLDivElement | null>(null);
+  const rightRef = useRef<HTMLDivElement | null>(null);
+  const syncing = useRef(false);
+  useEffect(() => {
+    const onLeft = () => {
+      if (syncing.current || !leftRef.current || !rightRef.current) return;
+      syncing.current = true;
+      rightRef.current.scrollTop = leftRef.current.scrollTop;
+      requestAnimationFrame(() => (syncing.current = false));
+    };
+    const onRight = () => {
+      if (syncing.current || !leftRef.current || !rightRef.current) return;
+      syncing.current = true;
+      leftRef.current.scrollTop = rightRef.current.scrollTop;
+      requestAnimationFrame(() => (syncing.current = false));
+    };
+    const l = leftRef.current;
+    const r = rightRef.current;
+    l?.addEventListener("scroll", onLeft, { passive: true });
+    r?.addEventListener("scroll", onRight, { passive: true });
+    return () => {
+      l?.removeEventListener("scroll", onLeft);
+      r?.removeEventListener("scroll", onRight);
+    };
+  }, []);
+
   return (
-    <pre className="font-mono text-[11px] leading-tight text-white/70 px-4 py-2 whitespace-pre">
-      {lines.map((line, i) => {
-        let cls = "text-white/70";
-        if (line.startsWith("+++") || line.startsWith("---")) {
-          cls = "text-white/40";
-        } else if (line.startsWith("+")) {
-          cls = "text-emerald-400 bg-emerald-500/5";
-        } else if (line.startsWith("-")) {
-          cls = "text-red-400 bg-red-500/5";
-        } else if (line.startsWith("@@")) {
-          cls = "text-indigo-300 bg-indigo-500/10";
-        } else if (
-          line.startsWith("diff --git") ||
-          line.startsWith("index ") ||
-          line.startsWith("new file") ||
-          line.startsWith("deleted file") ||
-          line.startsWith("Binary ")
-        ) {
-          cls = "text-white/30";
-        }
-        return (
-          <div key={i} className={cls}>
-            {line || " "}
-          </div>
-        );
-      })}
-    </pre>
+    <div className="flex-1 min-h-0 grid grid-cols-2 divide-x divide-white/[0.06]">
+      <DiffPane
+        side="left"
+        rows={rows}
+        scrollRef={leftRef}
+        empty={head === null}
+        emptyLabel="(file was added — no HEAD version)"
+      />
+      <DiffPane
+        side="right"
+        rows={rows}
+        scrollRef={rightRef}
+        empty={worktree === null}
+        emptyLabel="(file was deleted — no worktree version)"
+      />
+    </div>
+  );
+}
+
+function DiffPane({
+  side,
+  rows,
+  scrollRef,
+  empty,
+  emptyLabel,
+}: {
+  side: "left" | "right";
+  rows: DiffRow[];
+  scrollRef: React.RefObject<HTMLDivElement | null>;
+  empty: boolean;
+  emptyLabel: string;
+}) {
+  if (empty) {
+    return (
+      <div className="flex items-center justify-center text-sm text-white/40 italic">
+        {emptyLabel}
+      </div>
+    );
+  }
+  return (
+    <div ref={scrollRef} className="overflow-auto">
+      <pre className="font-mono text-sm leading-snug">
+        {rows.map((row, i) => {
+          if (side === "left") {
+            if (row.kind === "add") {
+              // Empty row to keep alignment with the right pane's
+              // added line.
+              return (
+                <Row key={i} no="" cls="bg-white/[0.01]">
+                  {" "}
+                </Row>
+              );
+            }
+            const cls =
+              row.kind === "del"
+                ? "bg-red-500/10 text-red-200"
+                : "text-white/75";
+            return (
+              <Row key={i} no={String(row.leftNo)} cls={cls}>
+                {row.kind === "del" ? `-${row.left}` : ` ${row.left}`}
+              </Row>
+            );
+          } else {
+            if (row.kind === "del") {
+              return (
+                <Row key={i} no="" cls="bg-white/[0.01]">
+                  {" "}
+                </Row>
+              );
+            }
+            const cls =
+              row.kind === "add"
+                ? "bg-emerald-500/10 text-emerald-200"
+                : "text-white/75";
+            return (
+              <Row key={i} no={String(row.rightNo)} cls={cls}>
+                {row.kind === "add" ? `+${row.right}` : ` ${row.right}`}
+              </Row>
+            );
+          }
+        })}
+      </pre>
+    </div>
+  );
+}
+
+function Row({
+  no,
+  cls,
+  children,
+}: {
+  no: string;
+  cls: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className={cn("flex", cls)}>
+      <span className="select-none w-12 shrink-0 text-right pr-2 text-white/30 border-r border-white/[0.04]">
+        {no}
+      </span>
+      <span className="flex-1 px-2 whitespace-pre">{children}</span>
+    </div>
   );
 }
