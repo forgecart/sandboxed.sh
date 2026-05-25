@@ -1,7 +1,6 @@
 'use client';
 
-import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'react';
-import type { CSSProperties } from 'react';
+import { useEffect, useRef, useState, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { useRouter } from 'next/navigation';
 import { Plus, X, ExternalLink, RefreshCw, SlidersHorizontal } from 'lucide-react';
@@ -11,6 +10,13 @@ import type { Workspace } from '@/lib/api';
 import { isBackendAvailable, useBackendConfigs } from '@/lib/use-backend-configs';
 
 const KNOWN_BACKEND_IDS = ['opencode', 'claudecode', 'codex', 'gemini', 'grok'] as const;
+
+// Default "New Mission" picks: Claude Code backend, max reasoning, latest
+// Opus model. Edit mode bypasses these in favour of the mission's existing
+// settings via `initialValues`.
+const DEFAULT_NEW_MISSION_BACKEND = 'claudecode' as const;
+const DEFAULT_NEW_MISSION_MODEL_EFFORT: ModelEffort = 'max';
+const DEFAULT_NEW_MISSION_MODEL_OVERRIDE = 'claude-opus-4-7' as const;
 
 // Kept in sync with src/api/control.rs `normalize_model_effort_for_backend`.
 // Codex only accepts the three baseline levels; claudecode also accepts
@@ -150,9 +156,8 @@ export function NewMissionDialog({
   const [submitting, setSubmitting] = useState(false);
   const [defaultSet, setDefaultSet] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
-  const popoverRef = useRef<HTMLDivElement>(null);
+  const modalRef = useRef<HTMLDivElement>(null);
   const [mounted, setMounted] = useState(false);
-  const [popoverStyle, setPopoverStyle] = useState<CSSProperties | null>(null);
   const prevBackendRef = useRef<string | null>(null);
   const isEditMode = mode === 'edit';
 
@@ -418,46 +423,11 @@ export function NewMissionDialog({
   const formatWorkspaceType = (type: Workspace['workspace_type']) =>
     type === 'host' ? 'host' : 'isolated';
 
-  const updatePopoverPosition = useCallback(() => {
-    const trigger = dialogRef.current;
-    if (!trigger || typeof window === 'undefined') return;
-
-    const rect = trigger.getBoundingClientRect();
-    const margin = 12;
-    const width = Math.min(384, window.innerWidth - margin * 2);
-    const left = Math.min(
-      Math.max(margin, rect.right - width),
-      Math.max(margin, window.innerWidth - width - margin)
-    );
-    const estimatedHeight = popoverRef.current?.offsetHeight ?? 620;
-    const spaceBelow = window.innerHeight - rect.bottom - margin;
-    const top = spaceBelow >= Math.min(estimatedHeight, 420)
-      ? rect.bottom + 4
-      : Math.max(margin, rect.top - estimatedHeight - 4);
-
-    setPopoverStyle({
-      position: 'fixed',
-      top,
-      left,
-      width,
-      zIndex: 1000,
-    });
-  }, []);
-
-  // Click outside and Escape key handler
+  // Escape closes the modal. Clicks outside the dialog (i.e. on the backdrop)
+  // close it as well — handled inline on the backdrop element below so the
+  // modal works correctly when rendered via createPortal outside this tree.
   useEffect(() => {
     if (!open) return;
-
-    const handleClickOutside = (event: MouseEvent) => {
-      const target = event.target as Node;
-      const clickedTrigger = dialogRef.current?.contains(target);
-      const clickedPopover = popoverRef.current?.contains(target);
-      if (!clickedTrigger && !clickedPopover) {
-        setOpen(false);
-        setDefaultSet(false);
-        onClose?.();
-      }
-    };
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
@@ -467,24 +437,11 @@ export function NewMissionDialog({
       }
     };
 
-    document.addEventListener('mousedown', handleClickOutside);
     document.addEventListener('keydown', handleKeyDown);
     return () => {
-      document.removeEventListener('mousedown', handleClickOutside);
       document.removeEventListener('keydown', handleKeyDown);
     };
   }, [open, onClose]);
-
-  useLayoutEffect(() => {
-    if (!open) return;
-    updatePopoverPosition();
-    window.addEventListener('resize', updatePopoverPosition);
-    window.addEventListener('scroll', updatePopoverPosition, true);
-    return () => {
-      window.removeEventListener('resize', updatePopoverPosition);
-      window.removeEventListener('scroll', updatePopoverPosition, true);
-    };
-  }, [open, updatePopoverPosition]);
 
   // Revalidate backend model options when dialog opens to pick up chain configuration changes
   useEffect(() => {
@@ -506,12 +463,20 @@ export function NewMissionDialog({
       setNewMissionWorkspace(initialValues.workspaceId);
     }
 
-    // Set model override from initialValues if provided
+    // Model override / effort: prefer `initialValues` (edit mode or current-
+    // mission carry-over). In create mode without explicit values, prime with
+    // the New-Mission defaults (claude-opus-4-7 / max). The
+    // backend-switch effect downstream will clear these if the user picks a
+    // different backend that doesn't support them.
     if (initialValues?.modelOverride) {
       setModelOverride(initialValues.modelOverride);
+    } else if (!isEditMode) {
+      setModelOverride(DEFAULT_NEW_MISSION_MODEL_OVERRIDE);
     }
     if (initialValues?.modelEffort) {
       setModelEffort(initialValues.modelEffort);
+    } else if (!isEditMode) {
+      setModelEffort(DEFAULT_NEW_MISSION_MODEL_EFFORT);
     }
 
     // Try to use initialValues for agent/backend (from current mission)
@@ -535,7 +500,21 @@ export function NewMissionDialog({
       return;
     }
 
-    // Fallback: try to find the default agent from config
+    // Create mode default: Claude Code backend with its default agent. We
+    // intentionally skip `config?.default_agent` here so the New Mission
+    // flow always lands on Claude Code unless the user changes it. (Edit
+    // mode always supplies `initialValues.backend` and never reaches here.)
+    if (!isEditMode) {
+      const claudecodeEnabled = enabledBackends.some(b => b.id === DEFAULT_NEW_MISSION_BACKEND);
+      if (claudecodeEnabled) {
+        setSelectedAgentValue(`${DEFAULT_NEW_MISSION_BACKEND}:`);
+        setDefaultSet(true);
+        return;
+      }
+    }
+
+    // Fallback: try to find the default agent from config (used when Claude
+    // Code isn't enabled in this install, or for edit-mode safety).
     if (config?.default_agent) {
       const defaultAgent = allAgents.find(a => a.agent === config.default_agent);
       if (defaultAgent) {
@@ -582,7 +561,7 @@ export function NewMissionDialog({
       setSelectedAgentValue(allAgents[0].value);
     }
     setDefaultSet(true);
-  }, [open, defaultSet, allAgents, config, initialValues]);
+  }, [open, defaultSet, allAgents, config, initialValues, isEditMode, enabledBackends]);
 
   useEffect(() => {
     // Clear effort if the current selection isn't valid for the selected
@@ -734,15 +713,31 @@ export function NewMissionDialog({
         {isEditMode ? <SlidersHorizontal className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
         <span className="hidden lg:inline">{isEditMode ? 'Run Settings' : 'New Mission'}</span>
       </button>
-      {open && mounted && popoverStyle && createPortal(
+      {open && mounted && createPortal(
         <div
-          ref={popoverRef}
-          style={popoverStyle}
-          className="max-h-[calc(100vh-1.5rem)] overflow-y-auto rounded-lg border border-white/[0.06] bg-[#1a1a1a] p-4 shadow-xl"
+          className="fixed inset-0 z-[60] flex items-center justify-center"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="new-mission-dialog-title"
         >
+          {/* Backdrop — click to dismiss */}
+          <div
+            className="absolute inset-0 bg-black/60 backdrop-blur-sm animate-in fade-in duration-150"
+            onClick={() => {
+              setOpen(false);
+              setDefaultSet(false);
+              onClose?.();
+            }}
+          />
+
+          {/* Modal */}
+          <div
+            ref={modalRef}
+            className="relative w-full max-w-md max-h-[calc(100vh-2rem)] overflow-y-auto rounded-xl border border-white/[0.06] bg-[#1a1a1a] p-4 shadow-2xl animate-in fade-in zoom-in-95 duration-150 mx-4"
+          >
           {/* Header with refresh and close buttons */}
           <div className="flex items-center justify-between mb-3">
-            <h3 className="text-sm font-medium text-white">
+            <h3 id="new-mission-dialog-title" className="text-sm font-medium text-white">
               {isEditMode ? 'Edit Run Settings' : 'Create New Mission'}
             </h3>
             <div className="flex items-center gap-1">
@@ -1113,6 +1108,7 @@ export function NewMissionDialog({
                 </button>
               )}
             </div>
+          </div>
           </div>
         </div>,
         document.body
