@@ -408,11 +408,43 @@ impl ResultEvent {
 // ── Event conversion ──────────────────────────────────────────────
 
 /// Convert a CLI event to backend-agnostic ExecutionEvents.
+/// Thin wrapper over [`convert_cli_event_scoped`] for callers that
+/// don't care about the originating sub-agent. New code should
+/// prefer the scoped variant so it can route sub-agent events to a
+/// dedicated tab instead of mixing them into the boss's chat.
 pub fn convert_cli_event(
     event: CliEvent,
     pending_tools: &mut HashMap<String, String>,
 ) -> Vec<ExecutionEvent> {
-    let mut results = vec![];
+    convert_cli_event_scoped(event, pending_tools)
+        .into_iter()
+        .map(|(ev, _parent)| ev)
+        .collect()
+}
+
+/// Like [`convert_cli_event`] but pairs each emitted event with the
+/// `parent_tool_use_id` of its originating sub-agent (`None` when
+/// emitted by the boss agent). Sub-agent events are flagged by the
+/// Claude Code SDK with `parent_tool_use_id` pointing at the
+/// `Agent` tool_use that spawned the sub-agent.
+pub fn convert_cli_event_scoped(
+    event: CliEvent,
+    pending_tools: &mut HashMap<String, String>,
+) -> Vec<(ExecutionEvent, Option<String>)> {
+    let mut results: Vec<(ExecutionEvent, Option<String>)> = vec![];
+    let parent_tool_use_id: Option<String> = match &event {
+        CliEvent::StreamEvent(w) => w.parent_tool_use_id.clone(),
+        CliEvent::Assistant(e) => e.parent_tool_use_id.clone(),
+        CliEvent::User(e) => e.parent_tool_use_id.clone(),
+        _ => None,
+    };
+
+    // Helper to push events with the same parent scope (most events
+    // for a given CliEvent share one parent, since the SDK emits one
+    // sidechain message at a time).
+    let push = |results: &mut Vec<(ExecutionEvent, Option<String>)>, ev: ExecutionEvent| {
+        results.push((ev, parent_tool_use_id.clone()));
+    };
 
     match event {
         CliEvent::System(sys) => {
@@ -426,12 +458,12 @@ pub fn convert_cli_event(
             StreamEvent::ContentBlockDelta { delta, .. } => {
                 if let Some(text) = delta.text {
                     if !text.is_empty() {
-                        results.push(ExecutionEvent::TextDelta { content: text });
+                        push(&mut results, ExecutionEvent::TextDelta { content: text });
                     }
                 }
                 if let Some(thinking) = delta.thinking {
                     if !thinking.is_empty() {
-                        results.push(ExecutionEvent::Thinking { content: thinking });
+                        push(&mut results, ExecutionEvent::Thinking { content: thinking });
                     }
                 }
                 if let Some(partial) = delta.partial_json {
@@ -453,20 +485,23 @@ pub fn convert_cli_event(
                 match block {
                     ContentBlock::Text { text } => {
                         if !text.is_empty() {
-                            results.push(ExecutionEvent::Thinking { content: text });
+                            push(&mut results, ExecutionEvent::Thinking { content: text });
                         }
                     }
                     ContentBlock::ToolUse { id, name, input } => {
                         pending_tools.insert(id.clone(), name.clone());
-                        results.push(ExecutionEvent::ToolCall {
-                            id,
-                            name,
-                            args: input,
-                        });
+                        push(
+                            &mut results,
+                            ExecutionEvent::ToolCall {
+                                id,
+                                name,
+                                args: input,
+                            },
+                        );
                     }
                     ContentBlock::Thinking { thinking } => {
                         if !thinking.is_empty() {
-                            results.push(ExecutionEvent::Thinking { content: thinking });
+                            push(&mut results, ExecutionEvent::Thinking { content: thinking });
                         }
                     }
                     ContentBlock::ToolResult { .. } | ContentBlock::RedactedThinking { .. } => {}
@@ -501,11 +536,14 @@ pub fn convert_cli_event(
                         Value::String(content_str)
                     };
 
-                    results.push(ExecutionEvent::ToolResult {
-                        id: tool_use_id,
-                        name,
-                        result: result_value,
-                    });
+                    push(
+                        &mut results,
+                        ExecutionEvent::ToolResult {
+                            id: tool_use_id,
+                            name,
+                            result: result_value,
+                        },
+                    );
                 }
             }
         }
@@ -519,9 +557,12 @@ pub fn convert_cli_event(
                 || result_text.contains("\"type\":\"api_error\"");
 
             if res.is_error || res.subtype == "error" || looks_like_api_error {
-                results.push(ExecutionEvent::Error {
-                    message: res.error_message(),
-                });
+                push(
+                    &mut results,
+                    ExecutionEvent::Error {
+                        message: res.error_message(),
+                    },
+                );
             } else {
                 debug!(
                     "CLI result: subtype={}, cost={:?}, duration={:?}ms, turns={:?}",

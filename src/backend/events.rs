@@ -40,4 +40,15 @@ pub enum ExecutionEvent {
     MessageComplete { session_id: String },
     /// Error occurred.
     Error { message: String },
+    /// Inner event was emitted by a Claude Code sub-agent (the
+    /// `Agent` tool's sidechain). The `parent_tool_use_id` is the
+    /// tool_call_id of the spawning `Agent` invocation. Consumers
+    /// route these to a per-sub-agent tab instead of the boss's
+    /// chat. Plain wrap so we don't have to add a field to every
+    /// other variant (which has ~25 construction sites across the
+    /// codebase).
+    Sidechain {
+        parent_tool_use_id: String,
+        inner: Box<ExecutionEvent>,
+    },
 }

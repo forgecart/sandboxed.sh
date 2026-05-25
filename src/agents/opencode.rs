@@ -122,6 +122,10 @@ impl OpenCodeAgent {
             // emit them. Catch-all silently ignores rather than panic on
             // a non-exhaustive match.
             OpenCodeEvent::GoalIteration { .. } | OpenCodeEvent::GoalStatus { .. } => return,
+            // Sidechain (Claude Code sub-agent) events shouldn't
+            // appear on the opencode path — opencode doesn't have
+            // an Agent tool. Defensive no-op.
+            OpenCodeEvent::Sidechain { .. } => return,
         };
 
         match events_tx.send(agent_event) {

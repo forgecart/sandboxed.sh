@@ -14590,6 +14590,46 @@ pub async fn run_codex_turn(
                         success = error_message.is_none();
                         break;
                     }
+                    ExecutionEvent::Sidechain {
+                        parent_tool_use_id,
+                        inner,
+                    } => {
+                        // Sub-agent activity (Claude Code `Agent` tool
+                        // sidechain). Route to dedicated SSE events so
+                        // the dashboard can render it in its own tab
+                        // instead of the boss's main thread.
+                        match *inner {
+                            ExecutionEvent::ToolCall { id, name, args } => {
+                                let _ = events_tx.send(AgentEvent::SubagentToolCall {
+                                    tool_call_id: id,
+                                    name,
+                                    args,
+                                    mission_id: Some(mission_id),
+                                    parent_tool_use_id,
+                                });
+                            }
+                            ExecutionEvent::ToolResult { id, name, result } => {
+                                let _ = events_tx.send(AgentEvent::SubagentToolResult {
+                                    tool_call_id: id,
+                                    name,
+                                    result,
+                                    mission_id: Some(mission_id),
+                                    parent_tool_use_id,
+                                });
+                            }
+                            ExecutionEvent::Thinking { content }
+                            | ExecutionEvent::TextDelta { content } => {
+                                if !content.is_empty() {
+                                    let _ = events_tx.send(AgentEvent::SubagentText {
+                                        content,
+                                        mission_id: Some(mission_id),
+                                        parent_tool_use_id,
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             else => {
@@ -15095,6 +15135,46 @@ pub async fn run_gemini_turn(
                     ExecutionEvent::MessageComplete { session_id: _ } => {
                         success = error_message.is_none();
                         break;
+                    }
+                    ExecutionEvent::Sidechain {
+                        parent_tool_use_id,
+                        inner,
+                    } => {
+                        // Sub-agent activity (Claude Code `Agent` tool
+                        // sidechain). Route to dedicated SSE events so
+                        // the dashboard can render it in its own tab
+                        // instead of the boss's main thread.
+                        match *inner {
+                            ExecutionEvent::ToolCall { id, name, args } => {
+                                let _ = events_tx.send(AgentEvent::SubagentToolCall {
+                                    tool_call_id: id,
+                                    name,
+                                    args,
+                                    mission_id: Some(mission_id),
+                                    parent_tool_use_id,
+                                });
+                            }
+                            ExecutionEvent::ToolResult { id, name, result } => {
+                                let _ = events_tx.send(AgentEvent::SubagentToolResult {
+                                    tool_call_id: id,
+                                    name,
+                                    result,
+                                    mission_id: Some(mission_id),
+                                    parent_tool_use_id,
+                                });
+                            }
+                            ExecutionEvent::Thinking { content }
+                            | ExecutionEvent::TextDelta { content } => {
+                                if !content.is_empty() {
+                                    let _ = events_tx.send(AgentEvent::SubagentText {
+                                        content,
+                                        mission_id: Some(mission_id),
+                                        parent_tool_use_id,
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }

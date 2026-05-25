@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::backend::events::ExecutionEvent;
+#[allow(unused_imports)]
 use crate::backend::shared::convert_cli_event;
 use crate::backend::{AgentInfo, Backend, Session, SessionConfig};
 
@@ -204,9 +205,23 @@ impl Backend for ClaudeCodeBackend {
                 if matches!(event, client::ClaudeEvent::Result(_)) {
                     saw_terminal_result = true;
                 }
-                let exec_events = convert_cli_event(event, &mut pending_tools);
+                // Use the scoped variant so we know which events
+                // came from a sub-agent (Claude Code's `Agent` tool /
+                // sidechain). Wrap those in `ExecutionEvent::Sidechain`
+                // so mission_runner can route them to the correct
+                // sub-agent tab via `AgentEvent::SubagentToolCall`
+                // etc.
+                let exec_events =
+                    crate::backend::shared::convert_cli_event_scoped(event, &mut pending_tools);
 
-                for exec_event in exec_events {
+                for (raw_event, parent) in exec_events {
+                    let exec_event = match parent {
+                        Some(pid) => ExecutionEvent::Sidechain {
+                            parent_tool_use_id: pid,
+                            inner: Box::new(raw_event),
+                        },
+                        None => raw_event,
+                    };
                     // Track tool completion to know when it's safe to send MessageComplete
                     if let ExecutionEvent::ToolResult { id, .. } = &exec_event {
                         pending_tools.remove(id);

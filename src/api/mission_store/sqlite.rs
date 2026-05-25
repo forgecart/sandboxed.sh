@@ -3727,6 +3727,9 @@ impl MissionStore for SqliteMissionStore {
             | AgentEvent::MissionTitleChanged { .. }
             | AgentEvent::MissionPodStartup { .. }
             | AgentEvent::MissionDockerStatus { .. }
+            | AgentEvent::SubagentToolCall { .. }
+            | AgentEvent::SubagentToolResult { .. }
+            | AgentEvent::SubagentText { .. }
             | AgentEvent::FidoSignRequest { .. } => return Ok(()),
         };
 

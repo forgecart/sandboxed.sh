@@ -4233,6 +4233,41 @@ export default function ControlClient() {
     Record<string, import("@/lib/api").DockerServiceStatus[]>
   >({});
 
+  // Sub-agent (Claude Code `Agent` tool sidechain) activity, keyed
+  // by parent_tool_use_id. Each entry is the chronological list of
+  // tool calls / results / text emitted by that sub-agent. Fed by
+  // the `subagent_tool_call` / `subagent_tool_result` /
+  // `subagent_text` SSE events. Read by the SubagentTabs strip and
+  // the per-tab chat view that replaces the main thread when a
+  // sub-agent tab is active.
+  type SubagentActivity =
+    | {
+        kind: "tool_call";
+        tool_call_id: string;
+        name: string;
+        args: unknown;
+        ts: number;
+      }
+    | {
+        kind: "tool_result";
+        tool_call_id: string;
+        name: string;
+        result: unknown;
+        ts: number;
+      }
+    | { kind: "text"; content: string; ts: number };
+  const [subagentActivityByParent, setSubagentActivityByParent] = useState<
+    Record<string, SubagentActivity[]>
+  >({});
+
+  // Which sub-agent tab is currently focused.
+  // `null` = the boss's main thread (default).
+  // A string value = parent_tool_use_id of the focused sub-agent.
+  // Reset to null whenever the viewed mission changes (see effect below).
+  const [activeSubagentTab, setActiveSubagentTab] = useState<string | null>(
+    null,
+  );
+
   // Parallel missions state
   const [runningMissions, setRunningMissions] = useState<RunningMissionInfo[]>(
     [],
@@ -8435,6 +8470,94 @@ export default function ControlClient() {
             ...prev,
             [missionId]: services,
           }));
+        }
+        return;
+      }
+
+      // Sub-agent sidechain activity. Each event carries
+      // `parent_tool_use_id` pointing at the boss's `Agent` tool
+      // call. We bucket by that id so the dashboard can render one
+      // tab per sub-agent.
+      if (event.type === "subagent_tool_call" && isRecord(data)) {
+        const parent =
+          typeof data["parent_tool_use_id"] === "string"
+            ? data["parent_tool_use_id"]
+            : undefined;
+        const tool_call_id =
+          typeof data["tool_call_id"] === "string"
+            ? data["tool_call_id"]
+            : undefined;
+        const name =
+          typeof data["name"] === "string" ? data["name"] : undefined;
+        if (parent && tool_call_id && name) {
+          const item: SubagentActivity = {
+            kind: "tool_call",
+            tool_call_id,
+            name,
+            args: data["args"],
+            ts: Date.now(),
+          };
+          setSubagentActivityByParent((prev) => ({
+            ...prev,
+            [parent]: [...(prev[parent] || []), item],
+          }));
+        }
+        return;
+      }
+      if (event.type === "subagent_tool_result" && isRecord(data)) {
+        const parent =
+          typeof data["parent_tool_use_id"] === "string"
+            ? data["parent_tool_use_id"]
+            : undefined;
+        const tool_call_id =
+          typeof data["tool_call_id"] === "string"
+            ? data["tool_call_id"]
+            : undefined;
+        const name =
+          typeof data["name"] === "string" ? data["name"] : undefined;
+        if (parent && tool_call_id && name) {
+          const item: SubagentActivity = {
+            kind: "tool_result",
+            tool_call_id,
+            name,
+            result: data["result"],
+            ts: Date.now(),
+          };
+          setSubagentActivityByParent((prev) => ({
+            ...prev,
+            [parent]: [...(prev[parent] || []), item],
+          }));
+        }
+        return;
+      }
+      if (event.type === "subagent_text" && isRecord(data)) {
+        const parent =
+          typeof data["parent_tool_use_id"] === "string"
+            ? data["parent_tool_use_id"]
+            : undefined;
+        const content =
+          typeof data["content"] === "string" ? data["content"] : undefined;
+        if (parent && content) {
+          // Coalesce consecutive text deltas from the same sub-agent
+          // into a single growing chunk so the UI doesn't render a
+          // wall of one-token spans.
+          setSubagentActivityByParent((prev) => {
+            const bucket = prev[parent] || [];
+            const last = bucket[bucket.length - 1];
+            if (last?.kind === "text") {
+              const next = bucket.slice(0, -1);
+              next.push({
+                kind: "text",
+                content: last.content + content,
+                ts: last.ts,
+              });
+              return { ...prev, [parent]: next };
+            }
+            return {
+              ...prev,
+              [parent]: [...bucket, { kind: "text", content, ts: Date.now() }],
+            };
+          });
         }
         return;
       }

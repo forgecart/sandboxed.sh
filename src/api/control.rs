@@ -2715,6 +2715,35 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         mission_id: Option<Uuid>,
     },
+    /// Tool call emitted by a Claude Code sub-agent (a sidechain
+    /// spawned via the `Agent` tool). Flows over the same SSE channel
+    /// but is scoped to the sub-agent's tab in the dashboard. The
+    /// `parent_tool_use_id` points at the boss's `Agent` tool_call
+    /// id, so the dashboard can group every sub-agent activity under
+    /// the correct tab. New variant so we don't have to touch ~25
+    /// construction sites of the boss's ToolCall.
+    SubagentToolCall {
+        tool_call_id: String,
+        name: String,
+        args: serde_json::Value,
+        mission_id: Option<Uuid>,
+        parent_tool_use_id: String,
+    },
+    SubagentToolResult {
+        tool_call_id: String,
+        name: String,
+        result: serde_json::Value,
+        mission_id: Option<Uuid>,
+        parent_tool_use_id: String,
+    },
+    /// Plain text / thinking emitted by a sub-agent (no tool call).
+    /// Used to render the sub-agent's "assistant message" inside its
+    /// dedicated tab.
+    SubagentText {
+        content: String,
+        mission_id: Option<Uuid>,
+        parent_tool_use_id: String,
+    },
     Error {
         message: String,
         /// Mission this error belongs to (for parallel execution)
@@ -2944,6 +2973,9 @@ impl AgentEvent {
             AgentEvent::MissionMetadataUpdated { .. } => "mission_metadata_updated",
             AgentEvent::MissionPodStartup { .. } => "mission_pod_startup",
             AgentEvent::MissionDockerStatus { .. } => "mission_docker_status",
+            AgentEvent::SubagentToolCall { .. } => "subagent_tool_call",
+            AgentEvent::SubagentToolResult { .. } => "subagent_tool_result",
+            AgentEvent::SubagentText { .. } => "subagent_text",
             AgentEvent::MissionSettingsUpdated { .. } => "mission_settings_updated",
             AgentEvent::FidoSignRequest { .. } => "fido_sign_request",
             AgentEvent::GoalIteration { .. } => "goal_iteration",
@@ -2972,6 +3004,9 @@ impl AgentEvent {
             AgentEvent::MissionMetadataUpdated { mission_id, .. } => Some(*mission_id),
             AgentEvent::MissionPodStartup { mission_id, .. } => Some(*mission_id),
             AgentEvent::MissionDockerStatus { mission_id, .. } => Some(*mission_id),
+            AgentEvent::SubagentToolCall { mission_id, .. } => *mission_id,
+            AgentEvent::SubagentToolResult { mission_id, .. } => *mission_id,
+            AgentEvent::SubagentText { mission_id, .. } => *mission_id,
             AgentEvent::MissionSettingsUpdated { mission_id, .. } => Some(*mission_id),
             AgentEvent::FidoSignRequest { .. } => None,
             AgentEvent::GoalIteration { mission_id, .. } => *mission_id,
