@@ -2646,10 +2646,15 @@ function truncateText(text: string, maxLength: number = 100): string {
   return text.slice(0, maxLength) + "...";
 }
 
-// Check if a tool is a subagent/background task tool
+// Check if a tool is a subagent/background task tool.
+// `"agent"` is Claude Code's parallel-task tool (the one whose call
+// args carry `subagent_type` / `description` / `prompt`); without it
+// classified as a sub-agent here, Agent calls render as generic tool
+// cards and never appear in the SubagentsPanel.
 function isSubagentTool(toolName: string): boolean {
   const name = toolName.toLowerCase();
   return (
+    name === "agent" ||
     name === "background_task" ||
     name === "task" ||
     name.includes("subagent") ||
@@ -10709,7 +10714,8 @@ export default function ControlClient() {
           {(showWorkbenchPanel ||
             showThinkingPanel ||
             showDesktopStream ||
-            (showWorkerPanel && isBossMission)) && (
+            (showWorkerPanel && isBossMission) ||
+            hasInMissionSubagents) && (
             <div
               className={cn(
                 // animate-fade-in is opacity-only and cheap; we drop the
@@ -10782,8 +10788,14 @@ export default function ControlClient() {
                 />
               )}
 
-              {/* Sub-agents Panel — in-mission Task / orchestrator workers */}
-              {showWorkerPanel && hasInMissionSubagents && (
+              {/* Sub-agents Panel — in-mission Task / orchestrator workers.
+                  Independent of the workers-panel toggle: as soon as the
+                  active mission spawns its first parallel sub-agent the
+                  panel surfaces here so the user has a live header above
+                  the thinking section listing every background agent. The
+                  per-mission dismiss tracking in `workerPanelDismissedRef`
+                  still gates auto-open and respects an explicit close. */}
+              {hasInMissionSubagents && (
                 <SubagentsPanel
                   subagents={inMissionSubagents}
                   onFocusItem={focusChatItem}
