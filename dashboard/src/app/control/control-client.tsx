@@ -1142,7 +1142,7 @@ function ChatLoadingSkeleton() {
   // max-w-[80%].
   const rows: Array<"assistant" | "user"> = ["assistant", "user", "assistant"];
   return (
-    <div className="mx-auto max-w-3xl space-y-6 animate-pulse">
+    <div className="mx-auto max-w-5xl space-y-6 animate-pulse">
       {rows.map((role, idx) => {
         const isAssistant = role === "assistant";
         return (
@@ -11209,7 +11209,7 @@ export default function ControlClient() {
                   </div>
                 </div>
               ) : (
-                <div className="mx-auto max-w-3xl space-y-6">
+                <div className="mx-auto max-w-5xl space-y-6">
                   <div
                     className="relative w-full"
                     style={{ height: `${chatVirtualizer.getTotalSize()}px` }}
@@ -11410,7 +11410,7 @@ export default function ControlClient() {
             <div className="border-t border-white/[0.06] bg-white/[0.01] p-4">
               {/* Upload progress */}
               {uploadProgress && (
-                <div className="mx-auto max-w-3xl mb-3">
+                <div className="mx-auto max-w-5xl mb-3">
                   <div className="flex items-center gap-3 rounded-lg border border-white/[0.06] bg-white/[0.02] px-4 py-3">
                     <Loader className="h-4 w-4 animate-spin text-indigo-400" />
                     <div className="flex-1 min-w-0">
@@ -11441,7 +11441,7 @@ export default function ControlClient() {
 
               {/* Upload queue (for files waiting) */}
               {uploadQueue.length > 0 && !uploadProgress && (
-                <div className="mx-auto max-w-3xl mb-3 flex flex-wrap gap-2">
+                <div className="mx-auto max-w-5xl mb-3 flex flex-wrap gap-2">
                   {uploadQueue.map((name) => (
                     <AttachmentPreview
                       key={name}
@@ -11490,7 +11490,7 @@ export default function ControlClient() {
               )}
               <div
                 className={cn(
-                  "mx-auto max-w-3xl w-full space-y-2",
+                  "mx-auto max-w-5xl w-full space-y-2",
                   showResumeUI && "hidden",
                 )}
               >
