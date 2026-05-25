@@ -11902,31 +11902,11 @@ export default function ControlClient() {
                 ) : (
                 <form
                   onSubmit={(e) => e.preventDefault()}
-                  className="flex gap-3 items-end"
+                  className="relative"
                 >
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0"
-                    title="Attach files"
-                  >
-                    <Paperclip className="h-5 w-5" />
-                  </button>
-
-                  <EnhancedInput
-                    ref={enhancedInputRef}
-                    value={input}
-                    onChange={setInput}
-                    onSubmit={handleEnhancedSubmit}
-                    onCanSubmitChange={setCanSubmitInput}
-                    onFilePaste={handleFilePaste}
-                    placeholder="Message the root agent… (paste files to upload)"
-                    backend={viewingMission?.backend ?? currentMission?.backend}
-                  />
+                  {/* Goal-mode pill — shown above the composer while a codex
+                      `/goal` continuation loop is active. */}
                   {(() => {
-                    // Goal-mode pill — shown above the composer while a codex
-                    // `/goal` continuation loop is active. Cleared automatically
-                    // by the SSE handler when status hits a terminal value.
                     const activeMissionId =
                       viewingMission?.id ?? currentMission?.id;
                     const goal = activeMissionId
@@ -11959,37 +11939,79 @@ export default function ControlClient() {
                     );
                   })()}
 
-                  {isBusy ? (
-                    <>
+                  {/* Unified composer: textarea on top, action buttons
+                      tucked inside the same rounded container at the
+                      bottom. Mimics ChatGPT / Anthropic console — saves
+                      horizontal real estate on mobile (~30% width) and
+                      keeps the buttons within thumb reach. */}
+                  <div className="rounded-2xl border border-white/[0.08] bg-white/[0.03] focus-within:border-indigo-500/40 transition-colors">
+                    <div className="px-3 pt-2 pb-1">
+                      <EnhancedInput
+                        ref={enhancedInputRef}
+                        value={input}
+                        onChange={setInput}
+                        onSubmit={handleEnhancedSubmit}
+                        onCanSubmitChange={setCanSubmitInput}
+                        onFilePaste={handleFilePaste}
+                        placeholder="Message the root agent… (paste files to upload)"
+                        backend={viewingMission?.backend ?? currentMission?.backend}
+                        // Strip EnhancedInput's own border + bg — the
+                        // outer wrapper supplies them now. Keep
+                        // padding tight so the textarea doesn't have
+                        // double-padding inside our container.
+                        className="!border-0 !bg-transparent !px-0 !py-0"
+                      />
+                    </div>
+                    <div className="flex items-center justify-between gap-2 px-2 pb-2 pt-1">
                       <button
                         type="button"
-                        onClick={() => enhancedInputRef.current?.submit()}
-                        disabled={!canSubmitComposer}
-                        className="flex items-center gap-2 rounded-xl bg-indigo-500/80 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-500/80"
+                        onClick={() => fileInputRef.current?.click()}
+                        className="p-2 rounded-lg text-white/40 hover:text-white/80 hover:bg-white/[0.06] transition-colors"
+                        title="Attach files"
+                        aria-label="Attach files"
                       >
-                        <ListPlus className="h-4 w-4" />
-                        Queue
+                        <Paperclip className="h-5 w-5" />
                       </button>
-                      <button
-                        type="button"
-                        onClick={handleStop}
-                        className="flex items-center gap-2 rounded-xl bg-red-500 hover:bg-red-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0"
-                      >
-                        <Square className="h-4 w-4" />
-                        Stop
-                      </button>
-                    </>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() => enhancedInputRef.current?.submit()}
-                      disabled={!canSubmitComposer}
-                      className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-500"
-                    >
-                      <Send className="h-4 w-4" />
-                      Send
-                    </button>
-                  )}
+
+                      {isBusy ? (
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              enhancedInputRef.current?.submit()
+                            }
+                            disabled={!canSubmitComposer}
+                            className="flex items-center gap-1.5 rounded-lg bg-indigo-500/80 hover:bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                            title="Queue message until the current turn ends"
+                          >
+                            <ListPlus className="h-4 w-4" />
+                            <span className="hidden sm:inline">Queue</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleStop}
+                            className="flex items-center gap-1.5 rounded-lg bg-red-500 hover:bg-red-600 px-3 py-2 text-sm font-medium text-white transition-colors"
+                            title="Stop the current turn"
+                          >
+                            <Square className="h-4 w-4" />
+                            <span className="hidden sm:inline">Stop</span>
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => enhancedInputRef.current?.submit()}
+                          disabled={!canSubmitComposer}
+                          className="flex items-center gap-1.5 rounded-lg bg-indigo-500 hover:bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-indigo-500"
+                          title="Send (Enter)"
+                          aria-label="Send"
+                        >
+                          <Send className="h-4 w-4" />
+                          <span className="hidden sm:inline">Send</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
                 </form>
                 )}
               </div>
