@@ -2240,7 +2240,7 @@ impl MissionStore for SqliteMissionStore {
                             config_profile, parent_mission_id, working_directory,
                             COALESCE(mission_mode, 'task') as mission_mode,
                             COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
-                            initial_repos
+                            initial_repos, pod_phase, pod_message
                      FROM missions
                      ORDER BY updated_at DESC
                      LIMIT ?1 OFFSET ?2",
@@ -2299,8 +2299,8 @@ impl MissionStore for SqliteMissionStore {
                                 .flatten()
                                 .and_then(|s| serde_json::from_str(&s).ok())
                                 .unwrap_or_default(),
-                            pod_phase: None,
-                            pod_message: None,
+                            pod_phase: row.get(29).ok().flatten(),
+                            pod_message: row.get(30).ok().flatten(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2329,7 +2329,7 @@ impl MissionStore for SqliteMissionStore {
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
                             config_profile, parent_mission_id, working_directory,
                             COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
-                            initial_repos
+                            initial_repos, pod_phase, pod_message
                      FROM missions WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
@@ -2386,8 +2386,8 @@ impl MissionStore for SqliteMissionStore {
                                 .flatten()
                                 .and_then(|s| serde_json::from_str(&s).ok())
                                 .unwrap_or_default(),
-                            pod_phase: None,
-                            pod_message: None,
+                            pod_phase: row.get(29).ok().flatten(),
+                            pod_message: row.get(30).ok().flatten(),
                     })
                 })
                 .optional()
