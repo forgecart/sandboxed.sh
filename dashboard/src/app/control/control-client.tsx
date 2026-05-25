@@ -1702,8 +1702,10 @@ function ThinkingGroupItem({
   );
 
   const hasActiveItem = items.some((item) => !item.done);
-  const [expanded, setExpanded] = useState(hasActiveItem);
-  const hasAutoCollapsedRef = useRef(false);
+  // Default-open: keep both active AND completed thinking visible.
+  // User asked for tool calls + thoughts to be open by default so
+  // they can scan a turn without having to click each row.
+  const [expanded, setExpanded] = useState(true);
 
   // Get the earliest start time and latest end time
   const startTime = Math.min(...items.map((item) => item.startTime));
@@ -1711,21 +1713,7 @@ function ThinkingGroupItem({
     ? Math.max(...items.map((item) => item.endTime || item.startTime))
     : undefined;
 
-  // Auto-collapse when all thinking is done
-  useEffect(() => {
-    if (!hasActiveItem && expanded && !hasAutoCollapsedRef.current) {
-      const duration = Math.floor((Date.now() - startTime) / 1000);
-      if (duration > 30) {
-        hasAutoCollapsedRef.current = true;
-        return;
-      }
-      const timer = setTimeout(() => {
-        setExpanded(false);
-        hasAutoCollapsedRef.current = true;
-      }, 1500);
-      return () => clearTimeout(timer);
-    }
-  }, [hasActiveItem, expanded, startTime]);
+  // (Auto-collapse on completion removed — see expanded default above.)
 
   // Only the active branch ticks once per second via `<LiveDuration>`.
   // When the group is fully done, we render a fixed string and never
@@ -2353,6 +2341,18 @@ function SubagentTabStrip({
   activeTab: string | null;
   onSelect: (tab: string | null) => void;
 }) {
+  // If the currently-focused sub-agent just completed and dropped
+  // out of the running list, snap back to Main thread so the user
+  // isn't stuck on a tab that has nothing to render.
+  useEffect(() => {
+    if (
+      activeTab &&
+      !subagents.some((s) => s.toolCallId === activeTab)
+    ) {
+      onSelect(null);
+    }
+  }, [activeTab, subagents, onSelect]);
+
   const labelOf = (args: unknown): string => {
     if (args && typeof args === "object") {
       const obj = args as Record<string, unknown>;
@@ -2619,6 +2619,7 @@ function MissionWorkbenchPanel({
   onSetStatus,
   runSettingsSlot,
   dockerServices,
+  agentTodos,
   className,
 }: {
   mission: Mission | null;
@@ -2643,6 +2644,9 @@ function MissionWorkbenchPanel({
    *  populated for K8sPod missions whose initial_repos brought up a
    *  compose stack). Empty / undefined hides the panel. */
   dockerServices?: import("@/lib/api").DockerServiceStatus[];
+  /** Latest TodoWrite snapshot for this mission — the agent's plan
+   *  rendered as a checklist. `null` hides the panel. */
+  agentTodos?: TodoItem[] | null;
   className?: string;
 }) {
   const title =
@@ -2793,6 +2797,10 @@ function MissionWorkbenchPanel({
 
             {dockerServices && dockerServices.length > 0 && (
               <DockerServicesPanel services={dockerServices} />
+            )}
+
+            {agentTodos && agentTodos.length > 0 && (
+              <AgentTasksPanel todos={agentTodos} />
             )}
 
             <section className="space-y-2">
@@ -3138,6 +3146,74 @@ function isTodoWriteTool(toolName: string): boolean {
   return toolName.toLowerCase() === "todowrite";
 }
 
+// Right-side workbench panel showing the agent's CURRENT task list.
+// Driven by `latestAgentTodos` (a memo that picks the most recent
+// TodoWrite snapshot from the mission's chat items). Each TodoWrite
+// is a full plan, not a diff — only the newest matters. Hidden when
+// no todos are present.
+function AgentTasksPanel({ todos }: { todos: TodoItem[] }) {
+  if (todos.length === 0) return null;
+  const counts = { pending: 0, in_progress: 0, completed: 0 };
+  for (const t of todos) counts[t.status] += 1;
+  return (
+    <section className="space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Flag className="h-3.5 w-3.5 text-indigo-400" />
+          <p className="text-[10px] uppercase tracking-wide text-white/30">
+            Agent tasks
+          </p>
+          <span className="text-[10px] text-white/30 font-mono">
+            {todos.length}
+          </span>
+        </div>
+        <div className="flex items-center gap-2 text-[10px]">
+          {counts.in_progress > 0 && (
+            <span className="flex items-center gap-1 text-amber-400">
+              <Loader className="h-2.5 w-2.5 animate-spin" />
+              {counts.in_progress}
+            </span>
+          )}
+          {counts.completed > 0 && (
+            <span className="text-emerald-400">{counts.completed} ✓</span>
+          )}
+          {counts.pending > 0 && (
+            <span className="text-white/40">{counts.pending} todo</span>
+          )}
+        </div>
+      </div>
+      <ul className="space-y-1 rounded-md border border-white/[0.05] bg-white/[0.02] p-2 max-h-72 overflow-y-auto text-xs">
+        {todos.map((t, i) => {
+          const label =
+            t.status === "in_progress" && t.activeForm
+              ? t.activeForm
+              : t.content;
+          return (
+            <li key={i} className="flex items-start gap-2 leading-snug">
+              {t.status === "completed" ? (
+                <CheckCircle className="h-3 w-3 mt-0.5 shrink-0 text-emerald-400" />
+              ) : t.status === "in_progress" ? (
+                <Loader className="h-3 w-3 mt-0.5 shrink-0 text-amber-400 animate-spin" />
+              ) : (
+                <span className="h-3 w-3 mt-0.5 shrink-0 rounded-sm border border-white/30" />
+              )}
+              <span
+                className={cn(
+                  "text-white/80",
+                  t.status === "completed" && "text-white/40 line-through",
+                  t.status === "in_progress" && "text-amber-100",
+                )}
+              >
+                {label}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
 // Check if a tool is a subagent/background task tool.
 // `"agent"` is Claude Code's parallel-task tool (the one whose call
 // args carry `subagent_type` / `description` / `prompt`); without it
@@ -3251,7 +3327,9 @@ const SubagentToolItem = memo(function SubagentToolItem({
   item: Extract<ChatItem, { kind: "tool" }>;
   highlighted?: boolean;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  // Default-open sub-agent card: spawn description + prompt visible
+  // immediately, click the chevron to collapse.
+  const [expanded, setExpanded] = useState(true);
   const isDone = item.result !== undefined;
 
   // Memoize subagent info extraction
@@ -3613,7 +3691,9 @@ const ToolCallItem = memo(function ToolCallItem({
   workspaceId?: string;
   missionId?: string;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  // Default-open: args + result preview visible immediately so the
+  // user can scan a turn without click-to-expand on every chip.
+  const [expanded, setExpanded] = useState(true);
   const isDone = item.result !== undefined;
 
   // Only running tools live-tick (via `<LiveDuration>` below). Done rows
@@ -3635,7 +3715,9 @@ const ToolCallItem = memo(function ToolCallItem({
     [item.result],
   );
   const resultStr = resultPreview?.preview ?? null;
-  const [resultExpanded, setResultExpanded] = useState(false);
+  // Default-show the full result; user can collapse to the preview via
+  // the existing toggle button (semantics flipped from previous default).
+  const [resultExpanded, setResultExpanded] = useState(true);
 
   // Memoize cancelled detection - check if tool was cancelled due to mission ending
   const isCancelled = useMemo(() => {
@@ -3885,8 +3967,11 @@ function CollapsedToolGroup({
     if (isSubagentTool(tool.name)) {
       return <SubagentToolItem key={tool.id} item={tool} />;
     }
+    // TodoWrite calls render in the right-side workbench panel
+    // (AgentTasksPanel) as a single always-latest checklist, NOT
+    // as one card per turn. Filtering here keeps the chat clean.
     if (isTodoWriteTool(tool.name)) {
-      return <TodoWriteItem key={tool.id} item={tool} />;
+      return null;
     }
     return (
       <ToolCallItem
@@ -4307,8 +4392,10 @@ const ChatItemRow = memo(function ChatItemRow({
       return <SubagentToolItem item={item} highlighted={highlighted} />;
     }
 
+    // TodoWrite renders in the workbench panel (see AgentTasksPanel),
+    // not as a chat card — see renderTool comment above.
     if (isTodoWriteTool(item.name)) {
-      return <TodoWriteItem item={item} highlighted={highlighted} />;
+      return null;
     }
 
     return (
@@ -9990,7 +10077,30 @@ export default function ControlClient() {
     return out;
   }, [items]);
 
-  const hasInMissionSubagents = inMissionSubagents.length > 0;
+  // Show only RUNNING sub-agents in the tab strip. Completed ones
+  // disappear so the strip reflects "what's happening right now"
+  // rather than every Agent call this mission ever made. The boss's
+  // final answer in the chat still preserves the historical record.
+  const runningSubagents = useMemo<SubagentEntry[]>(
+    () => inMissionSubagents.filter((s) => s.result === undefined),
+    [inMissionSubagents],
+  );
+
+  // Walk chat items in reverse to find the LATEST TodoWrite call —
+  // each TodoWrite is a full snapshot of the agent's plan, not a
+  // diff, so only the newest one matters for the side panel.
+  const latestAgentTodos = useMemo<TodoItem[] | null>(() => {
+    for (let i = items.length - 1; i >= 0; i--) {
+      const item = items[i];
+      if (item.kind !== "tool") continue;
+      if (!isTodoWriteTool(item.name)) continue;
+      const todos = extractTodos(item.args);
+      if (todos && todos.length > 0) return todos;
+    }
+    return null;
+  }, [items]);
+
+  const hasInMissionSubagents = runningSubagents.length > 0;
   const isBossMission =
     childMissions.length > 0 ||
     activeMissionRole === "boss" ||
@@ -10841,12 +10951,14 @@ export default function ControlClient() {
               parentMission={viewingParentMission}
               onSelectWorker={handleViewMission}
             />
-            {/* Sub-agent tab strip — one chip per Agent tool call.
-                Clicking switches the chat below to that sub-agent's
-                scoped activity. Hidden when no sub-agents exist. */}
+            {/* Sub-agent tab strip — one chip per RUNNING Agent
+                tool call (completed sub-agents drop out so the
+                strip only reflects what's live). Clicking switches
+                the chat below to that sub-agent's scoped activity.
+                Hidden when no sub-agents are running. */}
             {hasInMissionSubagents && (
               <SubagentTabStrip
-                subagents={inMissionSubagents}
+                subagents={runningSubagents}
                 activeTab={activeSubagentTab}
                 onSelect={setActiveSubagentTab}
               />
@@ -11440,6 +11552,7 @@ export default function ControlClient() {
                       ? dockerServicesByMission[activeMission.id]
                       : undefined
                   }
+                  agentTodos={latestAgentTodos}
                   runSettingsSlot={
                     activeMission && !viewingMissionIsRunning ? (
                       <NewMissionDialog

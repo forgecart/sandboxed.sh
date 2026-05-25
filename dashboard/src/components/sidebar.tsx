@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { cn } from '@/lib/utils';
@@ -95,6 +95,26 @@ export function Sidebar() {
   const [currentMission, setCurrentMission] = useState<Mission | null>(null);
   const [controlState, setControlState] = useState<ControlRunState>('idle');
   const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set());
+  // Sidebar starts hidden; slides in when the user hovers the left
+  // edge, slides out 1.5s after the mouse leaves it.
+  const [visible, setVisible] = useState(false);
+  const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const show = () => {
+    if (hideTimerRef.current) {
+      clearTimeout(hideTimerRef.current);
+      hideTimerRef.current = null;
+    }
+    setVisible(true);
+  };
+  const scheduleHide = () => {
+    if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
+    hideTimerRef.current = setTimeout(() => setVisible(false), 1500);
+  };
+  useEffect(() => {
+    return () => {
+      if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
+    };
+  }, []);
 
   // Auto-expand sections if we're on their subpages
   useEffect(() => {
@@ -158,7 +178,34 @@ export function Sidebar() {
         : 'text-white/40';
 
   return (
-    <aside className="fixed left-0 top-0 z-40 flex h-screen w-56 flex-col glass-panel border-r border-white/[0.06]">
+    <>
+      {/* Left-edge hover trigger — 6px wide always-on area that
+          reveals the sidebar when the cursor approaches the left
+          side of the viewport. */}
+      <div
+        className="fixed left-0 top-0 z-30 h-screen w-1.5"
+        onMouseEnter={show}
+        aria-hidden="true"
+      />
+      {/* Backdrop dim — only when visible, no pointer events so
+          chat stays interactive even with sidebar peeking out. */}
+      <div
+        className={cn(
+          'fixed inset-0 z-30 bg-black/20 backdrop-blur-[1px] pointer-events-none transition-opacity duration-200',
+          visible ? 'opacity-100' : 'opacity-0',
+        )}
+        aria-hidden="true"
+      />
+    <aside
+      onMouseEnter={show}
+      onMouseLeave={scheduleHide}
+      data-visible={visible || undefined}
+      className={cn(
+        'fixed left-0 top-0 z-40 flex h-screen w-56 flex-col glass-panel border-r border-white/[0.06]',
+        'transition-transform duration-200 ease-out',
+        visible ? 'translate-x-0' : '-translate-x-full',
+      )}
+    >
       {/* Header */}
       <div className="flex h-16 items-center gap-2 border-b border-white/[0.06] px-4">
         <BrainLogo size={32} />
@@ -297,5 +344,6 @@ export function Sidebar() {
         </div>
       </div>
     </aside>
+    </>
   );
 }

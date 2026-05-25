@@ -44,7 +44,10 @@ export default function RootLayout({
             <LibraryProvider>
               <MissionSwitcherProvider>
                 <Sidebar />
-                <main className="ml-56 min-h-screen">{children}</main>
+                {/* Sidebar is now an auto-hide overlay (slides in from
+                    the left on hover); main reclaims the full width
+                    so chats / tool calls get more horizontal space. */}
+                <main className="min-h-screen">{children}</main>
               </MissionSwitcherProvider>
             </LibraryProvider>
           </ToastProvider>
