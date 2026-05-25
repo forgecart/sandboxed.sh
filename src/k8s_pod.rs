@@ -27,7 +27,7 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::{
-    api::{Api, AttachParams, DeleteParams, PostParams},
+    api::{Api, DeleteParams, PostParams},
     config::Config,
     Client,
 };
@@ -36,7 +36,6 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{ExitStatus, Output};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 /// Process-wide handle to the k8s_pod backend. Populated by
@@ -493,93 +492,73 @@ impl K8sPodClient {
             shell_cmd.push_str(&shell_quote(arg));
         }
 
-        let argv = vec![
-            "/bin/bash".to_string(),
-            "-lc".to_string(),
-            shell_cmd.clone(),
-        ];
-
         tracing::debug!(
             workspace_id = %workspace_id,
             pod = %pod_name,
             cmd = %shell_cmd,
-            "k8s_pod exec_command"
+            "k8s_pod exec_command via kubectl"
         );
 
-        let mut attached = match self
-            .pods()
-            .exec(
-                &pod_name,
-                argv,
-                &AttachParams::default()
-                    .stdout(true)
-                    .stderr(true)
-                    .stdin(false)
-                    .tty(false),
-            )
+        // Shell out to kubectl. kube-rs 0.96's WebSocket exec path
+        // 403s against the RKE2 v1.34 API server in our cluster:
+        //   `failed to upgrade to a WebSocket connection:
+        //    failed to switch protocol: 403 Forbidden`
+        // Verified out-of-band that `kubectl exec` with the same SA
+        // token + ServiceAccount succeeds, so the cluster RBAC and
+        // SA mount are fine; only the kube-rs WS upgrade fails. Until
+        // we figure out which header / proto-version the WS path is
+        // missing, shelling out is the pragmatic workaround. kubectl
+        // is installed at /usr/local/bin/kubectl in the
+        // sandboxed-sh image — see Dockerfile.
+        let api_server = std::env::var("KUBERNETES_SERVICE_HOST")
+            .ok()
+            .map(|host| {
+                let port =
+                    std::env::var("KUBERNETES_SERVICE_PORT").unwrap_or_else(|_| "443".to_string());
+                format!("https://{}:{}", host, port)
+            })
+            .unwrap_or_else(|| "https://kubernetes.default.svc".to_string());
+
+        let mut kubectl = tokio::process::Command::new("kubectl");
+        kubectl
+            .arg("--token")
+            .arg(read_sa_token().unwrap_or_default())
+            .arg("--certificate-authority")
+            .arg("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+            .arg("--server")
+            .arg(&api_server)
+            .arg("--namespace")
+            .arg(&self.namespace)
+            .arg("exec")
+            .arg(&pod_name)
+            .arg("--")
+            .arg("/bin/bash")
+            .arg("-lc")
+            .arg(&shell_cmd);
+
+        let output = kubectl
+            .output()
             .await
-        {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::error!(
-                    workspace_id = %workspace_id,
-                    pod = %pod_name,
-                    error = %e,
-                    error_debug = ?e,
-                    "kube exec API call returned error"
-                );
-                return Err(anyhow!("kube exec on pod {} failed: {}", pod_name, e));
-            }
-        };
+            .with_context(|| format!("kubectl exec on pod {} failed to spawn", pod_name))?;
 
-        // Collect stdout / stderr in parallel.
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        if let Some(mut s) = attached.stdout() {
-            s.read_to_end(&mut stdout).await.ok();
-        }
-        if let Some(mut s) = attached.stderr() {
-            s.read_to_end(&mut stderr).await.ok();
-        }
-
-        // Wait for the remote command to exit + extract its code.
-        let exit_code = match attached.take_status() {
-            Some(fut) => fut
-                .await
-                .and_then(|s| {
-                    // s.status is "Success" or "Failure". Failure
-                    // statuses carry a `details.causes[].message` of
-                    // the form "command terminated with non-zero exit
-                    // code: ...exitCode=N". Parse it out.
-                    if s.status.as_deref() == Some("Success") {
-                        Some(0i32)
-                    } else {
-                        let raw = serde_json::to_string(&s).unwrap_or_default();
-                        parse_exit_code(&raw).or(Some(1))
-                    }
-                })
-                .unwrap_or(1),
-            None => 0,
-        };
-
-        let _ = attached.join().await;
+        let exit_code = output.status.code().unwrap_or(1);
 
         tracing::debug!(
             workspace_id = %workspace_id,
             pod = %pod_name,
             exit = exit_code,
-            stdout_len = stdout.len(),
-            stderr_len = stderr.len(),
-            stdout_sample = %String::from_utf8_lossy(&stdout[..stdout.len().min(200)]),
-            stderr_sample = %String::from_utf8_lossy(&stderr[..stderr.len().min(200)]),
+            stdout_len = output.stdout.len(),
+            stderr_len = output.stderr.len(),
+            stdout_sample = %String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(200)]),
+            stderr_sample = %String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(200)]),
             "k8s_pod exec_command done"
         );
 
         let status = ExitStatus::from_raw((exit_code as i32) << 8);
         Ok(Output {
             status,
-            stdout,
-            stderr,
+            stdout: output.stdout,
+            stderr: output.stderr,
         })
     }
 
@@ -693,6 +672,16 @@ impl K8sPodClient {
     }
 }
 
+/// Read the ServiceAccount token mounted by kubelet at the standard
+/// projected path. Used by `exec_command` to drive `kubectl exec`
+/// against the in-cluster API server with our pod's identity.
+fn read_sa_token() -> Option<String> {
+    std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/token")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn shell_quote(s: &str) -> String {
     // Single-quote and escape any embedded single quotes:
     //   foo'bar  ->  'foo'\''bar'
@@ -706,6 +695,7 @@ fn is_404(e: &kube::Error) -> bool {
     )
 }
 
+#[allow(dead_code)]
 fn parse_exit_code(raw: &str) -> Option<i32> {
     // Looking for `"exitCode":"42"` or `exitCode: 42`. Hand-rolled to
     // avoid pulling regex into another spot.

@@ -95,6 +95,23 @@ RUN curl -fsSL 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
     && apt-get update && apt-get install -y --no-install-recommends caddy \
     && rm -rf /var/lib/apt/lists/*
 
+# -- kubectl (workspace pod exec/log/cp shellout) ----------------------------
+# The K8sPod backend (src/k8s_pod.rs) drives workspace-pod exec by shelling
+# out to kubectl rather than going through kube-rs's WebSocket exec path —
+# kube-rs 0.96's WS upgrade hits a 403 against the RKE2 1.34 API server in
+# our cluster, while kubectl handles it cleanly with the same SA token. The
+# binary lives at /usr/local/bin/kubectl; the control plane invokes it with
+# `--token` / `--certificate-authority` / `--server` pointing at the
+# in-cluster ServiceAccount mount + KUBERNETES_SERVICE_HOST.
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key \
+       | gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/kubernetes-apt-keyring.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /" \
+       > /etc/apt/sources.list.d/kubernetes.list \
+    && apt-get update && apt-get install -y --no-install-recommends kubectl \
+    && rm -rf /var/lib/apt/lists/*
+
 # -- Copy Rust binaries from builder -----------------------------------------
 COPY --from=rust-builder /build/target/release/sandboxed-sh /usr/local/bin/sandboxed-sh
 COPY --from=rust-builder /build/target/release/desktop-mcp /usr/local/bin/desktop-mcp
