@@ -346,11 +346,44 @@ impl K8sPodClient {
             });
         }
 
-        let env_list = env_vars
-            .iter()
+        // Forward a curated set of env vars from the control plane
+        // into the workspace pod when the workspace doesn't already
+        // override them. This is what gives nested dockerd inside the
+        // pod the credentials it needs to pull from
+        // registry.forgecart.com / docker.io / ghcr.io, and the
+        // agent's `git clone`s a working GITHUB_TOKEN.
+        const FORWARDED_FROM_CONTROL_PLANE: &[&str] = &[
+            "FORGECART_REGISTRY_USERNAME",
+            "FORGECART_REGISTRY_TOKEN",
+            "DOCKERHUB_USERNAME",
+            "DOCKERHUB_TOKEN",
+            "GHCR_USERNAME",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GITHUB_USER",
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        ];
+        let mut merged: HashMap<String, String> = HashMap::new();
+        for key in FORWARDED_FROM_CONTROL_PLANE {
+            if let Ok(value) = std::env::var(key) {
+                if !value.trim().is_empty() {
+                    merged.insert((*key).to_string(), value);
+                }
+            }
+        }
+        // Workspace-supplied env_vars take precedence (override
+        // forwarded defaults).
+        for (k, v) in env_vars {
+            merged.insert(k.clone(), v.clone());
+        }
+        let env_list = merged
+            .into_iter()
             .map(|(k, v)| k8s_openapi::api::core::v1::EnvVar {
-                name: k.clone(),
-                value: Some(v.clone()),
+                name: k,
+                value: Some(v),
                 value_from: None,
             })
             .collect::<Vec<_>>();
