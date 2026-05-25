@@ -769,8 +769,13 @@ function QuestionToolItem({
   const canSubmit = useMemo(() => {
     if (questions.length === 0) return false;
     return questions.every((q, idx) => {
-      if (q.freeTextOnly) return (otherText[idx] ?? "").trim().length > 0;
-      return (answers[idx] ?? []).length > 0;
+      const typed = (otherText[idx] ?? "").trim().length > 0;
+      if (q.freeTextOnly) return typed;
+      // Non-freeTextOnly: accept EITHER a selected option OR a
+      // typed free-text answer (the modal's always-visible
+      // textarea). Previously only option-selection counted, so
+      // submitting a typed-only answer was blocked.
+      return (answers[idx] ?? []).length > 0 || typed;
     });
   }, [answers, questions, otherText]);
 
