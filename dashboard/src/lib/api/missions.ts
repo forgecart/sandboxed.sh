@@ -84,6 +84,21 @@ export interface Mission {
   pod_message?: string | null;
 }
 
+/** Live per-mission docker-compose service state pushed via the
+ *  `mission_docker_status` SSE event. One row per container under
+ *  `/workspaces/repos/<repo>/docker-compose.yml`. The dashboard maps
+ *  `state` + `health` to a colour family (running+healthy → green,
+ *  starting/restarting → orange, exited/dead/unhealthy → red,
+ *  created → gray + spinner). */
+export interface DockerServiceStatus {
+  service: string;
+  container_id: string;
+  state: string;
+  health: string;
+  status: string;
+  image: string;
+}
+
 export interface StoredEvent {
   id: number;
   mission_id: string;

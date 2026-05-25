@@ -2769,6 +2769,14 @@ pub enum AgentEvent {
         phase: String,
         message: String,
     },
+    /// K8sPod backend: per-mission docker-compose service state.
+    /// Pushed whenever dockerd fires a container lifecycle event
+    /// (start / die / health_status / restart). Dashboard renders one
+    /// row per service with a spinner / orange / red / green dot.
+    MissionDockerStatus {
+        mission_id: Uuid,
+        services: Vec<crate::k8s_pod::DockerServiceStatus>,
+    },
     /// Mission run settings changed (backend/model/agent/config profile)
     MissionSettingsUpdated {
         mission_id: Uuid,
@@ -2935,6 +2943,7 @@ impl AgentEvent {
             AgentEvent::MissionTitleChanged { .. } => "mission_title_changed",
             AgentEvent::MissionMetadataUpdated { .. } => "mission_metadata_updated",
             AgentEvent::MissionPodStartup { .. } => "mission_pod_startup",
+            AgentEvent::MissionDockerStatus { .. } => "mission_docker_status",
             AgentEvent::MissionSettingsUpdated { .. } => "mission_settings_updated",
             AgentEvent::FidoSignRequest { .. } => "fido_sign_request",
             AgentEvent::GoalIteration { .. } => "goal_iteration",
@@ -2962,6 +2971,7 @@ impl AgentEvent {
             AgentEvent::MissionTitleChanged { mission_id, .. } => Some(*mission_id),
             AgentEvent::MissionMetadataUpdated { mission_id, .. } => Some(*mission_id),
             AgentEvent::MissionPodStartup { mission_id, .. } => Some(*mission_id),
+            AgentEvent::MissionDockerStatus { mission_id, .. } => Some(*mission_id),
             AgentEvent::MissionSettingsUpdated { mission_id, .. } => Some(*mission_id),
             AgentEvent::FidoSignRequest { .. } => None,
             AgentEvent::GoalIteration { mission_id, .. } => *mission_id,
@@ -8587,6 +8597,34 @@ async fn control_actor_loop(
                 }
             }
             tracing::info!(mission_id = %mission_id, "mission pod bootstrap finished");
+
+            // After the pod is Ready, attach a docker-events tail
+            // INSIDE the pod and broadcast `MissionDockerStatus` SSE
+            // events whenever a container starts / stops / changes
+            // health. Stream stops naturally when dockerd disappears
+            // (pod delete) so we don't need explicit cleanup. Skip
+            // if the bootstrap ended in Error.
+            let docker_k8s = k8s.clone();
+            let docker_events_tx = events_tx.clone();
+            tokio::spawn(async move {
+                let stop = tokio_util::sync::CancellationToken::new();
+                let stream =
+                    docker_k8s.stream_docker_compose_status(mission_id, stop.clone());
+                futures::pin_mut!(stream);
+                use futures::StreamExt;
+                let mut last: Option<Vec<crate::k8s_pod::DockerServiceStatus>> = None;
+                while let Some(services) = stream.next().await {
+                    if last.as_ref() == Some(&services) {
+                        continue;
+                    }
+                    last = Some(services.clone());
+                    let _ = docker_events_tx.send(AgentEvent::MissionDockerStatus {
+                        mission_id,
+                        services,
+                    });
+                }
+                tracing::debug!(mission_id = %mission_id, "docker-status stream ended");
+            });
         });
     }
 

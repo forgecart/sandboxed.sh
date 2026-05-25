@@ -42,6 +42,7 @@ export {
   type CreateMissionOptions,
   type UpdateMissionSettingsOptions,
   type RepoSelection,
+  type DockerServiceStatus,
   type RunningMissionInfo,
   type MissionSearchResult,
   type MissionMomentSearchResult,

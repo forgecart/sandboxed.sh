@@ -90,6 +90,31 @@ impl PodStartupEvent {
     }
 }
 
+/// Snapshot of one docker-compose service inside the mission pod's
+/// dockerd. Lives on every `mission_docker_status` SSE event so the
+/// dashboard can render a live status row per service (spinner /
+/// orange / red / green) without polling. Names match the
+/// `docker compose ps --format json` output for easy mapping.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DockerServiceStatus {
+    /// Compose service name, e.g. `postgres`, `elasticsearch`.
+    pub service: String,
+    /// Container short id, useful for the UI as a stable key.
+    pub container_id: String,
+    /// `created` | `running` | `restarting` | `paused` | `exited` |
+    /// `dead` | `removing`. Maps to a colour family in the dashboard.
+    pub state: String,
+    /// `healthy` | `starting` | `unhealthy` | `none`. The compose JSON
+    /// reports `Health` as one of these (or empty when no healthcheck
+    /// is configured).
+    pub health: String,
+    /// Raw "Status" string from docker (e.g. "Up 5 seconds (healthy)").
+    pub status: String,
+    /// Image reference, surfaced for debugging — the dashboard hides
+    /// it under a tooltip.
+    pub image: String,
+}
+
 /// Process-wide handle to the k8s_pod backend. Populated by
 /// `K8sPodClient::try_init` at startup; queried by call sites (like
 /// `WorkspaceExec::output`) that need to dispatch on workspace_type
@@ -662,6 +687,170 @@ impl K8sPodClient {
         })
     }
 
+    /// Snapshot of every compose service currently known to the
+    /// mission pod's dockerd. Runs `docker compose ps --format json
+    /// --all` from each `/workspaces/repos/*` directory that has a
+    /// compose file. Empty Vec when no compose files exist OR the
+    /// daemon isn't up yet.
+    pub async fn query_docker_compose_status(
+        &self,
+        mission_id: Uuid,
+    ) -> Result<Vec<DockerServiceStatus>> {
+        // One shell call that:
+        //  1. walks every repo dir with a compose file
+        //  2. runs `docker compose ps --all --format json` in each
+        //  3. concatenates the (newline-delimited JSON) outputs.
+        // The dashboard tolerates duplicate service names if two repos
+        // happen to use the same name — we key on container_id.
+        let script = r#"
+set -e
+for d in /workspaces/repos/*; do
+  [ -d "$d" ] || continue
+  if [ -f "$d/docker-compose.yml" ] || [ -f "$d/compose.yml" ]; then
+    (cd "$d" && docker compose ps --all --format json 2>/dev/null) || true
+  fi
+done
+"#;
+        let out = self
+            .exec_command(
+                mission_id,
+                None,
+                "/bin/bash",
+                &["-lc".to_string(), script.to_string()],
+                &HashMap::new(),
+            )
+            .await?;
+        // docker compose v2 emits ONE json object per line. Some
+        // older daemons emit a single JSON array; handle both.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let trimmed = stdout.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut services: Vec<DockerServiceStatus> = Vec::new();
+        // Try line-per-object first.
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('[') {
+                if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(line) {
+                    for v in arr {
+                        if let Some(s) = parse_compose_service(&v) {
+                            services.push(s);
+                        }
+                    }
+                }
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(s) = parse_compose_service(&v) {
+                    services.push(s);
+                }
+            }
+        }
+        Ok(services)
+    }
+
+    /// Stream of `DockerServiceStatus` snapshots driven by
+    /// `docker events` (not polling). The stream yields the current
+    /// state on subscribe, then re-queries + re-yields on every
+    /// container lifecycle / health event from dockerd.
+    ///
+    /// Closes when:
+    ///  - the underlying `kubectl exec docker events` pipe ends
+    ///  - the optional `stop` token is cancelled (mission-level
+    ///    cancellation hook)
+    pub fn stream_docker_compose_status(
+        self: std::sync::Arc<Self>,
+        mission_id: Uuid,
+        stop: tokio_util::sync::CancellationToken,
+    ) -> impl futures::Stream<Item = Vec<DockerServiceStatus>> + Send + 'static {
+        async_stream::stream! {
+            // Initial snapshot (may be empty while compose-up is
+            // pulling images — the events stream will fill it in).
+            match self.query_docker_compose_status(mission_id).await {
+                Ok(s) => yield s,
+                Err(e) => {
+                    tracing::debug!(mission_id = %mission_id, error = %e, "initial docker ps query failed; will retry on events");
+                }
+            }
+
+            // Spawn `docker events` over kubectl exec. Each container
+            // start / die / health_status event is one line on stdout.
+            let pod = pod_name(mission_id);
+            let api_server = std::env::var("KUBERNETES_SERVICE_HOST")
+                .ok()
+                .map(|host| {
+                    let port = std::env::var("KUBERNETES_SERVICE_PORT").unwrap_or_else(|_| "443".to_string());
+                    format!("https://{}:{}", host, port)
+                })
+                .unwrap_or_else(|| "https://kubernetes.default.svc".to_string());
+            let mut cmd = tokio::process::Command::new("kubectl");
+            cmd.arg("--token").arg(read_sa_token().unwrap_or_default())
+                .arg("--certificate-authority").arg("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+                .arg("--server").arg(&api_server)
+                .arg("--namespace").arg(&self.namespace)
+                .arg("exec").arg(&pod)
+                .arg("--").arg("/bin/bash").arg("-lc")
+                .arg("docker events --filter type=container --format '{{json .}}' 2>/dev/null")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true);
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(mission_id = %mission_id, error = %e, "failed to spawn docker-events tail; falling back to one-shot");
+                    return;
+                }
+            };
+            let stdout = match child.stdout.take() {
+                Some(s) => s,
+                None => {
+                    let _ = child.kill().await;
+                    return;
+                }
+            };
+            use tokio::io::AsyncBufReadExt;
+            let reader = tokio::io::BufReader::new(stdout);
+            let mut lines = reader.lines();
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => {
+                        let _ = child.kill().await;
+                        return;
+                    }
+                    next = lines.next_line() => {
+                        match next {
+                            Ok(Some(_)) => {
+                                // Re-query state on every event. Could
+                                // be smarter (parse the event's status
+                                // and patch only the affected service)
+                                // but `docker compose ps` is cheap and
+                                // we get cross-service health updates
+                                // for free.
+                                match self.query_docker_compose_status(mission_id).await {
+                                    Ok(s) => yield s,
+                                    Err(e) => tracing::debug!(mission_id = %mission_id, error = %e, "re-query failed after docker event"),
+                                }
+                            }
+                            Ok(None) => {
+                                // Stream ended (daemon dropped or pod
+                                // restarting). Stop.
+                                return;
+                            }
+                            Err(e) => {
+                                tracing::debug!(mission_id = %mission_id, error = %e, "docker-events read error");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Delete the mission's Pod + both PVCs + the ConfigMap.
     /// Idempotent — missing resources are no-ops. Subsumes the
     /// previous `cleanup_mission_in_pod` since the pod itself is now
@@ -1089,6 +1278,39 @@ impl K8sPodClient {
 /// Read the ServiceAccount token mounted by kubelet at the standard
 /// projected path. Used by `exec_command` to drive `kubectl exec`
 /// against the in-cluster API server with our pod's identity.
+/// Map one `docker compose ps --format json` row into our
+/// `DockerServiceStatus`. Compose v2 ships these field names:
+///   Service, Name, ID, State, Health, Status, Image
+/// `Health` is "" when no healthcheck is defined; we normalize to
+/// "none" so the dashboard has a stable value.
+fn parse_compose_service(v: &serde_json::Value) -> Option<DockerServiceStatus> {
+    let obj = v.as_object()?;
+    let pick = |k: &str| -> String {
+        obj.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let service = pick("Service");
+    if service.is_empty() {
+        return None;
+    }
+    let health = pick("Health");
+    let health = if health.is_empty() {
+        "none".to_string()
+    } else {
+        health
+    };
+    Some(DockerServiceStatus {
+        service,
+        container_id: pick("ID"),
+        state: pick("State"),
+        health,
+        status: pick("Status"),
+        image: pick("Image"),
+    })
+}
+
 fn read_sa_token() -> Option<String> {
     std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/token")
         .ok()

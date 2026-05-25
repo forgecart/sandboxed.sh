@@ -2238,6 +2238,104 @@ function PodStartupBanner({
   );
 }
 
+// Color family per service state. The backend ships docker's raw
+// state ("running", "created", "exited", …) and the compose health
+// string ("healthy", "starting", "unhealthy", "none"). Map both into
+// one of four UI buckets so the row dot is unambiguous at a glance.
+type DockerServiceTone = "green" | "orange" | "red" | "gray";
+
+function dockerServiceTone(service: {
+  state: string;
+  health: string;
+}): DockerServiceTone {
+  const s = service.state.toLowerCase();
+  const h = service.health.toLowerCase();
+  if (h === "unhealthy") return "red";
+  if (s === "exited" || s === "dead") return "red";
+  if (s === "running" && (h === "healthy" || h === "none")) return "green";
+  if (s === "running" && h === "starting") return "orange";
+  if (s === "restarting" || s === "paused" || s === "removing") return "orange";
+  if (s === "created") return "gray";
+  return "gray";
+}
+
+function DockerServicesPanel({
+  services,
+}: {
+  services: import("@/lib/api").DockerServiceStatus[];
+}) {
+  if (services.length === 0) return null;
+  const sorted = [...services].sort((a, b) => a.service.localeCompare(b.service));
+  const counts = { green: 0, orange: 0, red: 0, gray: 0 } as Record<
+    DockerServiceTone,
+    number
+  >;
+  for (const s of sorted) counts[dockerServiceTone(s)] += 1;
+  return (
+    <section className="space-y-2">
+      <div className="flex items-center justify-between">
+        <p className="text-[10px] uppercase tracking-wide text-white/30">
+          Docker services
+        </p>
+        <div className="flex items-center gap-2 text-[10px]">
+          {counts.green > 0 && (
+            <span className="flex items-center gap-1 text-emerald-400">
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+              {counts.green}
+            </span>
+          )}
+          {counts.orange > 0 && (
+            <span className="flex items-center gap-1 text-amber-400">
+              <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
+              {counts.orange}
+            </span>
+          )}
+          {counts.red > 0 && (
+            <span className="flex items-center gap-1 text-red-400">
+              <span className="h-1.5 w-1.5 rounded-full bg-red-400" />
+              {counts.red}
+            </span>
+          )}
+          {counts.gray > 0 && (
+            <span className="flex items-center gap-1 text-white/40">
+              <span className="h-1.5 w-1.5 rounded-full bg-white/30 animate-pulse" />
+              {counts.gray}
+            </span>
+          )}
+        </div>
+      </div>
+      <ul className="space-y-1 rounded-md border border-white/[0.05] bg-white/[0.02] p-2 max-h-64 overflow-y-auto">
+        {sorted.map((s) => {
+          const tone = dockerServiceTone(s);
+          const toneCls =
+            tone === "green"
+              ? "bg-emerald-400"
+              : tone === "orange"
+                ? "bg-amber-400 animate-pulse"
+                : tone === "red"
+                  ? "bg-red-400"
+                  : "bg-white/40 animate-pulse";
+          return (
+            <li
+              key={s.container_id || s.service}
+              className="flex items-center gap-2 text-xs"
+              title={`${s.status}\n${s.image}`}
+            >
+              <span className={cn("h-2 w-2 rounded-full shrink-0", toneCls)} />
+              <span className="font-mono text-white/80 truncate flex-1">
+                {s.service}
+              </span>
+              <span className="text-[10px] text-white/40 truncate max-w-[100px]">
+                {s.health !== "none" ? s.health : s.state}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
 function MissionWorkbenchPanel({
   mission,
   workspaceLabel,
@@ -2252,6 +2350,7 @@ function MissionWorkbenchPanel({
   onViewMission,
   onSetStatus,
   runSettingsSlot,
+  dockerServices,
   className,
 }: {
   mission: Mission | null;
@@ -2272,6 +2371,10 @@ function MissionWorkbenchPanel({
    * so it's accessible without a separate toolbar button.
    */
   runSettingsSlot?: React.ReactNode;
+  /** Live docker-compose service state for the per-mission pod (only
+   *  populated for K8sPod missions whose initial_repos brought up a
+   *  compose stack). Empty / undefined hides the panel. */
+  dockerServices?: import("@/lib/api").DockerServiceStatus[];
   className?: string;
 }) {
   const title =
@@ -2418,6 +2521,10 @@ function MissionWorkbenchPanel({
                 phase={mission.pod_phase}
                 message={mission.pod_message ?? null}
               />
+            )}
+
+            {dockerServices && dockerServices.length > 0 && (
+              <DockerServicesPanel services={dockerServices} />
             )}
 
             <section className="space-y-2">
@@ -4117,6 +4224,14 @@ export default function ControlClient() {
     const interval = setInterval(() => setDiagTick((prev) => prev + 1), 1000);
     return () => clearInterval(interval);
   }, [streamIsActive]);
+
+  // Per-mission docker-compose service state, keyed by mission_id.
+  // Populated by the `mission_docker_status` SSE event (server pushes
+  // diffs on every dockerd container/health event). Read by the
+  // DockerServicesPanel in the workbench column.
+  const [dockerServicesByMission, setDockerServicesByMission] = useState<
+    Record<string, import("@/lib/api").DockerServiceStatus[]>
+  >({});
 
   // Parallel missions state
   const [runningMissions, setRunningMissions] = useState<RunningMissionInfo[]>(
@@ -8304,6 +8419,26 @@ export default function ControlClient() {
         return;
       }
 
+      // K8sPod backend: live docker-compose service state for the
+      // per-mission pod. Server pushes the full service list every
+      // time dockerd fires a container lifecycle / health event.
+      if (event.type === "mission_docker_status" && isRecord(data)) {
+        const missionId =
+          typeof data["mission_id"] === "string"
+            ? data["mission_id"]
+            : undefined;
+        const services = Array.isArray(data["services"])
+          ? (data["services"] as import("@/lib/api").DockerServiceStatus[])
+          : undefined;
+        if (missionId && services) {
+          setDockerServicesByMission((prev) => ({
+            ...prev,
+            [missionId]: services,
+          }));
+        }
+        return;
+      }
+
       if (event.type === "goal_iteration" && isRecord(data)) {
         const missionId =
           typeof data["mission_id"] === "string"
@@ -10740,6 +10875,11 @@ export default function ControlClient() {
                   onOpenSwitcher={() => setShowMissionSwitcher(true)}
                   onViewMission={handleViewMission}
                   onSetStatus={handleSetStatus}
+                  dockerServices={
+                    activeMission
+                      ? dockerServicesByMission[activeMission.id]
+                      : undefined
+                  }
                   runSettingsSlot={
                     activeMission && !viewingMissionIsRunning ? (
                       <NewMissionDialog
