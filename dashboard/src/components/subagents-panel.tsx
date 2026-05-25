@@ -288,7 +288,7 @@ export function SubagentsPanel({
                   >
                     <div className="flex items-center gap-2">
                       <span className={cn('shrink-0', badge.color)}>{badge.icon}</span>
-                      <span className="text-xs font-medium text-white/90 truncate">
+                      <span className="text-sm font-medium text-white/90 truncate">
                         {agentName}
                       </span>
                       <span className={cn('ml-auto text-[10px] shrink-0', badge.color)}>
@@ -296,7 +296,7 @@ export function SubagentsPanel({
                       </span>
                     </div>
                     {description && (
-                      <p className="mt-1 text-[11px] text-white/50 line-clamp-2">
+                      <p className="mt-1 text-xs text-white/55 leading-relaxed line-clamp-2">
                         {description}
                       </p>
                     )}

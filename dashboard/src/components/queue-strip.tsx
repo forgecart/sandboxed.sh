@@ -117,13 +117,13 @@ export function QueueStrip({ items, onRemove, onClearAll, className }: QueueStri
           <div
             key={item.id}
             className={cn(
-              "flex items-start gap-2 px-3 py-2 text-xs",
+              "flex items-start gap-2 px-3 py-2 text-sm leading-relaxed",
               index < items.length - 1 && "border-b border-indigo-500/10"
             )}
           >
             <span className="text-white/30 font-mono shrink-0 w-4">{index + 1}.</span>
             <div className="flex-1 min-w-0">
-              <p className="text-white/70 break-words">
+              <p className="text-white/75 break-words">
                 {item.agent && <span className="text-emerald-400">@{item.agent} </span>}
                 {item.content}
               </p>

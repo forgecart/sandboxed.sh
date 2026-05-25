@@ -1355,7 +1355,7 @@ export function MissionSwitcher({
                         {mission && (
                           <>
                             {cardTitle && (
-                              <p className="text-xs text-white/55 truncate mt-0.5">
+                              <p className="text-sm text-white/65 truncate mt-0.5">
                                 {cardTitle}
                               </p>
                             )}
