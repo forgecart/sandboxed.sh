@@ -12,6 +12,7 @@ import {
   memo,
   startTransition,
 } from "react";
+import { createPortal } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useSearchParams, useRouter } from "next/navigation";
 import { toast } from "@/components/toast";
@@ -797,23 +798,37 @@ function QuestionToolItem({
     setSubmitting(true);
     try {
       const payload = questions.map((q, idx) => {
-        // Free-text only: return the typed text directly
-        if (q.freeTextOnly) {
-          const text = (otherText[idx] ?? "").trim();
-          return text ? [text] : [];
-        }
         const selections = answers[idx] ?? [];
-        if (!selections.length) return [];
+        const typed = (otherText[idx] ?? "").trim();
+        // Free-text-only question (no real options): the typed
+        // answer is THE answer.
+        if (q.freeTextOnly) {
+          return typed ? [typed] : [];
+        }
         const otherLabel = q.options?.find((opt) =>
           opt.label.toLowerCase().includes("other"),
         )?.label;
-        return selections.map((label) => {
+        const out: string[] = [];
+        let selectedOther = false;
+        for (const label of selections) {
           if (otherLabel && label === otherLabel) {
-            const extra = otherText[idx]?.trim();
-            return extra ? `Other: ${extra}` : label;
+            // "Other" option: use the typed text as the value.
+            if (typed) out.push(typed);
+            else out.push(label);
+            selectedOther = true;
+          } else {
+            out.push(label);
           }
-          return label;
-        });
+        }
+        // If user typed a custom answer BUT didn't explicitly pick
+        // "Other", treat the typed text as an additional free-form
+        // answer — this lets the new modal's always-visible
+        // textarea work even when there's no "Other" option in
+        // the question's option list.
+        if (typed && !selectedOther && !out.includes(typed)) {
+          out.push(typed);
+        }
+        return out;
       });
       await onSubmit(item.toolCallId, payload);
     } finally {
@@ -821,184 +836,336 @@ function QuestionToolItem({
     }
   };
 
+  // Step-by-step modal state
+  const [modalOpen, setModalOpen] = useState(false);
+  const [stepIdx, setStepIdx] = useState(0);
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+  // Auto-open the modal the FIRST time a question lands so the user
+  // doesn't have to click. After they close it, they can re-open
+  // via the Answer button.
+  useEffect(() => {
+    if (questions.length > 0 && !hasResult) {
+      setModalOpen(true);
+      setStepIdx(0);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [item.toolCallId]);
+
+  // Reset wizard when modal closes (so re-opening starts fresh
+  // visually if the user had been mid-flow).
+  useEffect(() => {
+    if (!modalOpen) setStepIdx(0);
+  }, [modalOpen]);
+
+  // Esc to close
+  useEffect(() => {
+    if (!modalOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setModalOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [modalOpen]);
+
+  const currentQuestion = questions[stepIdx];
+  const isFirstStep = stepIdx === 0;
+  const isLastStep = stepIdx === questions.length - 1;
+
+  // Per-question completeness (used to gate Next + Submit + answer-pill rendering)
+  const stepHasAnswer = useCallback(
+    (idx: number) => {
+      const q = questions[idx];
+      if (!q) return false;
+      const selected = answers[idx] ?? [];
+      const typed = (otherText[idx] ?? "").trim();
+      return selected.length > 0 || typed.length > 0;
+    },
+    [answers, otherText, questions],
+  );
+
+  // Compact inline pill — replaces the previous full-form-in-chat
+  // approach. Shows N pending questions and the Answer button.
+  const headerLabel =
+    questions.length === 1
+      ? "1 question for you"
+      : `${questions.length} questions for you`;
   return (
-    <div
-      id={`chat-item-${item.id}`}
-      data-chat-item-id={item.id}
-      className="flex justify-start gap-3"
-    >
-      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
-        <Bot className="h-4 w-4 text-indigo-400" />
-      </div>
-      <div className="max-w-[85%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
-        <div className="mb-2 text-xs text-white/40">
-          Tool: <span className="font-mono text-indigo-400">question</span>
+    <>
+      <div
+        id={`chat-item-${item.id}`}
+        data-chat-item-id={item.id}
+        className="flex justify-start gap-3"
+      >
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+          <Bot className="h-4 w-4 text-indigo-400" />
         </div>
-        {questions.length === 0 ? (
-          <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3 text-sm text-red-400">
-            Failed to render question payload
-          </div>
-        ) : (
-          <div className="space-y-4">
-            {questions.map((q, idx) => {
-              const multiple = Boolean(q.multiple);
-              const selections = new Set(answers[idx] ?? []);
-              const hasOtherOption = (q.options ?? []).some((opt) =>
-                opt.label.toLowerCase().includes("other"),
-              );
-              const otherLabel = hasOtherOption
-                ? ((q.options ?? []).find((opt) =>
-                    opt.label.toLowerCase().includes("other"),
-                  )?.label ?? "")
-                : "";
-              // Non-Other options to render as buttons
-              const regularOptions = (q.options ?? []).filter(
-                (opt) => !opt.label.toLowerCase().includes("other"),
-              );
-              return (
-                <div key={`${item.toolCallId}-q-${idx}`} className="space-y-2">
-                  <div className="text-sm font-medium text-white/90">
-                    {q.header ? `${q.header}: ` : ""}
-                    {q.question}
-                  </div>
-                  {q.freeTextOnly ? (
-                    /* Free-text only: render a text input directly */
-                    <input
-                      type="text"
-                      value={otherText[idx] ?? ""}
-                      onChange={(e) =>
-                        setOtherText((prev) => ({
-                          ...prev,
-                          [idx]: e.target.value,
-                        }))
-                      }
-                      onKeyDown={(e) => {
-                        if (
-                          e.key === "Enter" &&
-                          canSubmit &&
-                          !submitting &&
-                          !hasResult
-                        ) {
-                          handleSubmit();
-                        }
-                      }}
-                      placeholder="Type your answer…"
-                      disabled={hasResult || submitting}
-                      autoFocus={idx === 0}
-                      className="w-full rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-sm text-white/80 focus:border-indigo-500/40 focus:outline-none"
-                    />
-                  ) : (
-                    /* Options mode: render option buttons + optional text input */
-                    <>
-                      <div className="space-y-2">
-                        {regularOptions.map((opt) => {
-                          const checked = selections.has(opt.label);
+        <div className="max-w-[85%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+          {questions.length === 0 ? (
+            <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3 text-sm text-red-400">
+              Failed to render question payload
+            </div>
+          ) : hasResult ? (
+            <div className="flex items-center gap-2 text-sm text-emerald-300">
+              <CheckCircle className="h-4 w-4" />
+              Answer sent.
+            </div>
+          ) : (
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <div className="text-sm">
+                <p className="font-medium text-white/90">{headerLabel}</p>
+                <p className="text-xs text-white/50 mt-0.5 line-clamp-1">
+                  {questions[0].question}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setModalOpen(true)}
+                className="shrink-0 inline-flex items-center gap-1.5 rounded-lg bg-indigo-500/20 text-indigo-200 hover:bg-indigo-500/30 transition-colors px-3 py-1.5 text-sm font-medium"
+              >
+                <MessageSquare className="h-3.5 w-3.5" />
+                Answer
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Step-by-step modal. Renders one question at a time with
+          predefined option cards PLUS an always-available "or type
+          a free-text answer" textarea — so the user can pick a
+          listed option OR write a custom reply. Tracks step state
+          locally; only `handleSubmit` actually fires the answer
+          payload back to the agent. */}
+      {modalOpen && mounted && currentQuestion && !hasResult &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-[70] flex items-center justify-center p-2 sm:p-4"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="question-modal-title"
+          >
+            <div
+              className="absolute inset-0 bg-black/60 backdrop-blur-sm animate-in fade-in duration-150"
+              onClick={() => setModalOpen(false)}
+            />
+            <div className="relative w-full max-w-2xl max-h-[calc(100vh-1rem)] sm:max-h-[calc(100vh-2rem)] overflow-y-auto rounded-xl border border-white/[0.06] bg-[#1a1a1a] p-4 sm:p-5 shadow-2xl animate-in fade-in zoom-in-95 duration-150">
+              {/* Header */}
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center gap-2">
+                  <MessageSquare className="h-4 w-4 text-indigo-400" />
+                  <h3
+                    id="question-modal-title"
+                    className="text-sm font-medium text-white"
+                  >
+                    Answer
+                  </h3>
+                  <span className="text-xs text-white/40 font-mono">
+                    {stepIdx + 1} / {questions.length}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setModalOpen(false)}
+                  className="p-1 rounded-md text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors"
+                  title="Close"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              {/* Step indicator dots */}
+              {questions.length > 1 && (
+                <div className="flex items-center gap-1.5 mb-4">
+                  {questions.map((_, i) => {
+                    const filled = stepHasAnswer(i);
+                    return (
+                      <button
+                        key={i}
+                        type="button"
+                        onClick={() => setStepIdx(i)}
+                        className={cn(
+                          "h-1.5 rounded-full transition-all",
+                          i === stepIdx
+                            ? "w-6 bg-indigo-400"
+                            : filled
+                              ? "w-1.5 bg-emerald-400"
+                              : "w-1.5 bg-white/15 hover:bg-white/30",
+                        )}
+                        title={`Step ${i + 1}${filled ? " (answered)" : ""}`}
+                      />
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Question body */}
+              <div className="space-y-3">
+                <div>
+                  {currentQuestion.header && (
+                    <p className="text-[10px] uppercase tracking-wide text-white/40 mb-1">
+                      {currentQuestion.header}
+                    </p>
+                  )}
+                  <p className="text-base font-medium text-white/90 leading-relaxed">
+                    {currentQuestion.question}
+                  </p>
+                </div>
+
+                {/* Predefined options (skip when freeTextOnly — that
+                    means the only option is "Other"). */}
+                {!currentQuestion.freeTextOnly &&
+                  (currentQuestion.options?.length ?? 0) > 0 && (
+                    <div className="space-y-1.5">
+                      {currentQuestion.options
+                        ?.filter(
+                          (opt) =>
+                            !opt.label.toLowerCase().includes("other"),
+                        )
+                        .map((opt) => {
+                          const selected = new Set(answers[stepIdx] ?? []);
+                          const checked = selected.has(opt.label);
                           return (
-                            <label
-                              key={`${item.toolCallId}-q-${idx}-${opt.label}`}
+                            <button
+                              key={opt.label}
+                              type="button"
+                              onClick={() =>
+                                handleToggle(
+                                  stepIdx,
+                                  opt.label,
+                                  Boolean(currentQuestion.multiple),
+                                )
+                              }
                               className={cn(
-                                "flex items-start gap-2 rounded-lg border px-3 py-2 text-sm transition-colors cursor-pointer",
+                                "w-full text-left rounded-lg border px-3 py-2.5 transition-colors",
                                 checked
                                   ? "border-indigo-500/40 bg-indigo-500/10"
-                                  : "border-white/10 hover:border-white/20",
+                                  : "border-white/10 hover:border-white/25 hover:bg-white/[0.03]",
                               )}
                             >
-                              <input
-                                type={multiple ? "checkbox" : "radio"}
-                                checked={checked}
-                                disabled={hasResult || submitting}
-                                onChange={() =>
-                                  handleToggle(idx, opt.label, multiple)
-                                }
-                                className="mt-0.5"
-                              />
-                              <div>
-                                <div className="text-white/90">{opt.label}</div>
-                                {opt.description && (
-                                  <div className="text-xs text-white/50">
-                                    {opt.description}
+                              <div className="flex items-start gap-2">
+                                <span
+                                  className={cn(
+                                    "mt-0.5 h-4 w-4 shrink-0 rounded-full border flex items-center justify-center transition-colors",
+                                    checked
+                                      ? "border-indigo-400 bg-indigo-500"
+                                      : "border-white/30",
+                                  )}
+                                >
+                                  {checked && (
+                                    <CheckCircle className="h-2.5 w-2.5 text-white" />
+                                  )}
+                                </span>
+                                <div className="flex-1 min-w-0">
+                                  <div className="text-sm text-white/90">
+                                    {opt.label}
                                   </div>
-                                )}
+                                  {opt.description && (
+                                    <div className="text-xs text-white/50 mt-0.5 leading-relaxed">
+                                      {opt.description}
+                                    </div>
+                                  )}
+                                </div>
                               </div>
-                            </label>
+                            </button>
                           );
                         })}
-                      </div>
-                      {hasOtherOption && (
-                        <div className="space-y-2">
-                          <label
-                            className={cn(
-                              "flex items-start gap-2 rounded-lg border px-3 py-2 text-sm transition-colors cursor-pointer",
-                              selections.has(otherLabel)
-                                ? "border-indigo-500/40 bg-indigo-500/10"
-                                : "border-white/10 hover:border-white/20",
-                            )}
-                          >
-                            <input
-                              type={multiple ? "checkbox" : "radio"}
-                              checked={selections.has(otherLabel)}
-                              disabled={hasResult || submitting}
-                              onChange={() =>
-                                handleToggle(idx, otherLabel, multiple)
-                              }
-                              className="mt-0.5"
-                            />
-                            <div className="flex-1">
-                              <div className="text-white/90">Other</div>
-                            </div>
-                          </label>
-                          {selections.has(otherLabel) && (
-                            <input
-                              type="text"
-                              value={otherText[idx] ?? ""}
-                              onChange={(e) =>
-                                setOtherText((prev) => ({
-                                  ...prev,
-                                  [idx]: e.target.value,
-                                }))
-                              }
-                              onKeyDown={(e) => {
-                                if (
-                                  e.key === "Enter" &&
-                                  canSubmit &&
-                                  !submitting &&
-                                  !hasResult
-                                ) {
-                                  handleSubmit();
-                                }
-                              }}
-                              placeholder="Type your answer…"
-                              disabled={hasResult || submitting}
-                              className="w-full rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-sm text-white/80 focus:border-indigo-500/40 focus:outline-none"
-                            />
-                          )}
-                        </div>
-                      )}
-                    </>
+                    </div>
                   )}
+
+                {/* Free-text response area — always shown so the
+                    user can type a custom reply (or override the
+                    predefined options entirely). Submitted as the
+                    answer when non-empty. */}
+                <div className="space-y-1">
+                  <label className="text-[10px] uppercase tracking-wide text-white/40">
+                    {currentQuestion.freeTextOnly
+                      ? "Your answer"
+                      : "Or type a custom answer"}
+                  </label>
+                  <textarea
+                    value={otherText[stepIdx] ?? ""}
+                    onChange={(e) =>
+                      setOtherText((prev) => ({
+                        ...prev,
+                        [stepIdx]: e.target.value,
+                      }))
+                    }
+                    onKeyDown={(e) => {
+                      // Cmd/Ctrl+Enter = submit. Plain Enter inserts
+                      // a newline (textarea behavior).
+                      if (
+                        e.key === "Enter" &&
+                        (e.metaKey || e.ctrlKey) &&
+                        canSubmit &&
+                        !submitting
+                      ) {
+                        e.preventDefault();
+                        handleSubmit();
+                      }
+                    }}
+                    placeholder="Type your answer…"
+                    disabled={submitting}
+                    rows={3}
+                    autoFocus={isFirstStep}
+                    className="w-full rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-sm text-white/85 focus:border-indigo-500/50 focus:outline-none resize-none leading-relaxed"
+                  />
                 </div>
-              );
-            })}
-            {hasResult ? (
-              <div className="text-xs text-green-400">Answer sent.</div>
-            ) : (
-              <button
-                onClick={handleSubmit}
-                disabled={!canSubmit || submitting}
-                className={cn(
-                  "inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors",
-                  !canSubmit || submitting
-                    ? "bg-white/5 text-white/30 cursor-not-allowed"
-                    : "bg-indigo-500/20 text-indigo-200 hover:bg-indigo-500/30",
+              </div>
+
+              {/* Nav footer */}
+              <div className="mt-5 flex items-center justify-between gap-3">
+                <button
+                  type="button"
+                  onClick={() => setStepIdx(Math.max(0, stepIdx - 1))}
+                  disabled={isFirstStep}
+                  className="px-3 py-1.5 rounded-lg text-sm text-white/60 hover:text-white/90 hover:bg-white/[0.04] transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                >
+                  Back
+                </button>
+                {isLastStep ? (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await handleSubmit();
+                      setModalOpen(false);
+                    }}
+                    disabled={!canSubmit || submitting}
+                    className={cn(
+                      "inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors",
+                      !canSubmit || submitting
+                        ? "bg-white/5 text-white/30 cursor-not-allowed"
+                        : "bg-indigo-500 text-white hover:bg-indigo-600",
+                    )}
+                  >
+                    {submitting ? "Sending…" : "Submit answer"}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setStepIdx(Math.min(questions.length - 1, stepIdx + 1))
+                    }
+                    disabled={!stepHasAnswer(stepIdx)}
+                    className={cn(
+                      "inline-flex items-center gap-1.5 rounded-lg px-4 py-2 text-sm font-medium transition-colors",
+                      !stepHasAnswer(stepIdx)
+                        ? "bg-white/5 text-white/30 cursor-not-allowed"
+                        : "bg-indigo-500/20 text-indigo-200 hover:bg-indigo-500/30",
+                    )}
+                  >
+                    Next
+                    <ChevronRight className="h-3.5 w-3.5" />
+                  </button>
                 )}
-              >
-                {submitting ? "Sending…" : "Submit Answer"}
-              </button>
-            )}
-          </div>
+              </div>
+            </div>
+          </div>,
+          document.body,
         )}
-      </div>
-    </div>
+    </>
   );
 }
 
