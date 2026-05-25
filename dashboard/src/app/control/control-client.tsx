@@ -2782,7 +2782,6 @@ function MissionWorkbenchPanel({
   onSetStatus,
   runSettingsSlot,
   dockerServices,
-  agentTodos,
   className,
 }: {
   mission: Mission | null;
@@ -2807,9 +2806,6 @@ function MissionWorkbenchPanel({
    *  populated for K8sPod missions whose initial_repos brought up a
    *  compose stack). Empty / undefined hides the panel. */
   dockerServices?: import("@/lib/api").DockerServiceStatus[];
-  /** Latest TodoWrite snapshot for this mission — the agent's plan
-   *  rendered as a checklist. `null` hides the panel. */
-  agentTodos?: TodoItem[] | null;
   className?: string;
 }) {
   const title =
@@ -2962,9 +2958,8 @@ function MissionWorkbenchPanel({
               <DockerServicesPanel services={dockerServices} />
             )}
 
-            {agentTodos && agentTodos.length > 0 && (
-              <AgentTasksPanel todos={agentTodos} />
-            )}
+            {/* Agent Tasks moved to its own right-column panel — see
+                AgentTasksPanel render in the right-column stack. */}
 
             <section className="space-y-2">
               <p className="text-[10px] uppercase tracking-wide text-white/30">
@@ -3454,51 +3449,71 @@ function isTodoWriteTool(toolName: string): boolean {
 // TodoWrite snapshot from the mission's chat items). Each TodoWrite
 // is a full plan, not a diff — only the newest matters. Hidden when
 // no todos are present.
-function AgentTasksPanel({ todos }: { todos: TodoItem[] }) {
+function AgentTasksPanel({
+  todos,
+  onClose,
+  className,
+}: {
+  todos: TodoItem[];
+  onClose: () => void;
+  className?: string;
+}) {
   if (todos.length === 0) return null;
   const counts = { pending: 0, in_progress: 0, completed: 0 };
   for (const t of todos) counts[t.status] += 1;
   return (
-    <section className="space-y-2">
-      <div className="flex items-center justify-between">
+    <div
+      className={cn(
+        "flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden",
+        className,
+      )}
+    >
+      <div className="flex items-center justify-between px-4 py-3 border-b border-white/[0.06]">
         <div className="flex items-center gap-2">
-          <Flag className="h-3.5 w-3.5 text-indigo-400" />
-          <p className="text-[10px] uppercase tracking-wide text-white/30">
-            Agent tasks
-          </p>
-          <span className="text-[10px] text-white/30 font-mono">
+          <Flag className="h-4 w-4 text-indigo-400" />
+          <span className="text-sm font-medium text-white/90">Agent tasks</span>
+          <span className="text-xs text-white/40 font-mono">
             {todos.length}
           </span>
         </div>
-        <div className="flex items-center gap-2 text-[10px]">
-          {counts.in_progress > 0 && (
-            <span className="flex items-center gap-1 text-amber-400">
-              <Loader className="h-2.5 w-2.5 animate-spin" />
-              {counts.in_progress}
-            </span>
-          )}
-          {counts.completed > 0 && (
-            <span className="text-emerald-400">{counts.completed} ✓</span>
-          )}
-          {counts.pending > 0 && (
-            <span className="text-white/40">{counts.pending} todo</span>
-          )}
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 text-[10px]">
+            {counts.in_progress > 0 && (
+              <span className="flex items-center gap-1 text-amber-400">
+                <Loader className="h-2.5 w-2.5 animate-spin" />
+                {counts.in_progress}
+              </span>
+            )}
+            {counts.completed > 0 && (
+              <span className="text-emerald-400">{counts.completed} ✓</span>
+            )}
+            {counts.pending > 0 && (
+              <span className="text-white/40">{counts.pending} todo</span>
+            )}
+          </div>
+          <button
+            onClick={onClose}
+            className="p-1 rounded hover:bg-white/[0.06] text-white/40 hover:text-white/70 transition-colors"
+            title="Close agent tasks"
+          >
+            <X className="h-4 w-4" />
+          </button>
         </div>
       </div>
-      <ul className="space-y-1 rounded-md border border-white/[0.05] bg-white/[0.02] p-2 max-h-72 overflow-y-auto text-xs">
+      <ul className="flex-1 overflow-y-auto px-3 py-2 space-y-1 text-sm">
         {todos.map((t, i) => {
           const label =
             t.status === "in_progress" && t.activeForm
               ? t.activeForm
               : t.content;
           return (
-            <li key={i} className="flex items-start gap-2 leading-snug">
+            <li key={i} className="flex items-start gap-2 leading-snug py-0.5">
               {t.status === "completed" ? (
-                <CheckCircle className="h-3 w-3 mt-0.5 shrink-0 text-emerald-400" />
+                <CheckCircle className="h-3.5 w-3.5 mt-0.5 shrink-0 text-emerald-400" />
               ) : t.status === "in_progress" ? (
-                <Loader className="h-3 w-3 mt-0.5 shrink-0 text-amber-400 animate-spin" />
+                <Loader className="h-3.5 w-3.5 mt-0.5 shrink-0 text-amber-400 animate-spin" />
               ) : (
-                <span className="h-3 w-3 mt-0.5 shrink-0 rounded-sm border border-white/30" />
+                <span className="h-3.5 w-3.5 mt-0.5 shrink-0 rounded-sm border border-white/30" />
               )}
               <span
                 className={cn(
@@ -3513,7 +3528,7 @@ function AgentTasksPanel({ todos }: { todos: TodoItem[] }) {
           );
         })}
       </ul>
-    </section>
+    </div>
   );
 }
 
@@ -5068,6 +5083,17 @@ export default function ControlClient() {
   );
   const [showMissionSwitcher, setShowMissionSwitcher] = useState(false);
   const [showWorkerPanel, setShowWorkerPanel] = useState(false);
+  // Sub-agents panel (in-mission Agent tool calls) has its own
+  // open/closed state — was sharing `showWorkerPanel` which made
+  // closing the Subagents drawer also kill the Workers drawer and
+  // vice versa. Per-mission dismissal so a fresh sub-agent doesn't
+  // auto-reopen after the user closed it.
+  const [showSubagentsPanel, setShowSubagentsPanel] = useState(true);
+  const subagentsPanelDismissedRef = useRef<Set<string>>(new Set());
+  // Agent-tasks panel (TodoWrite list) — separate sidebar instead
+  // of being baked into the workbench card.
+  const [showAgentTasksPanel, setShowAgentTasksPanel] = useState(true);
+  const agentTasksPanelDismissedRef = useRef<Set<string>>(new Set());
   // Per-mission record of which missions the user has explicitly dismissed
   // the worker panel for. Used so the auto-open effect doesn't keep reopening
   // the panel after the user closes it while a streaming boss keeps spawning
@@ -10476,6 +10502,35 @@ export default function ControlClient() {
     setShowWorkerPanel(false);
   }, [activeMission?.id]);
 
+  const handleCloseSubagentsPanel = useCallback(() => {
+    const missionId = activeMission?.id;
+    if (missionId) {
+      subagentsPanelDismissedRef.current.add(missionId);
+    }
+    setShowSubagentsPanel(false);
+  }, [activeMission?.id]);
+
+  const handleCloseAgentTasksPanel = useCallback(() => {
+    const missionId = activeMission?.id;
+    if (missionId) {
+      agentTasksPanelDismissedRef.current.add(missionId);
+    }
+    setShowAgentTasksPanel(false);
+  }, [activeMission?.id]);
+
+  // Re-evaluate each panel's visibility when the viewed mission
+  // changes: respect the per-mission dismissal set, otherwise
+  // default to open.
+  useEffect(() => {
+    if (!viewingMissionId) return;
+    setShowSubagentsPanel(
+      !subagentsPanelDismissedRef.current.has(viewingMissionId),
+    );
+    setShowAgentTasksPanel(
+      !agentTasksPanelDismissedRef.current.has(viewingMissionId),
+    );
+  }, [viewingMissionId]);
+
   // Determine if we should show the resume UI for interrupted/blocked/failed missions
   // Don't show resume UI if:
   // - Mission is running
@@ -11936,12 +11991,20 @@ export default function ControlClient() {
             </div>
           </div>
 
-          {/* Right column: Workbench, Desktop Stream and Changes stacked */}
+          {/* Right column: Workbench, Desktop Stream, Changes,
+              Workers, Sub-agents, Agent Tasks stacked. Renders when
+              ANY child panel wants to be visible — each child has
+              its own dismiss state so closing one collapses just
+              that panel; closing the LAST visible child collapses
+              the whole column. */}
           {(showWorkbenchPanel ||
             showDesktopStream ||
             showChangesPanel ||
             (showWorkerPanel && isBossMission) ||
-            hasInMissionSubagents) && (
+            (showSubagentsPanel && hasInMissionSubagents) ||
+            (showAgentTasksPanel &&
+              latestAgentTodos &&
+              latestAgentTodos.length > 0)) && (
             <div
               className={cn(
                 // animate-fade-in is opacity-only and cheap; we drop the
@@ -11975,7 +12038,6 @@ export default function ControlClient() {
                       ? dockerServicesByMission[activeMission.id]
                       : undefined
                   }
-                  agentTodos={latestAgentTodos}
                   runSettingsSlot={
                     activeMission && !viewingMissionIsRunning ? (
                       <NewMissionDialog
@@ -12024,17 +12086,17 @@ export default function ControlClient() {
               )}
 
               {/* Sub-agents Panel — in-mission Task / orchestrator workers.
-                  Independent of the workers-panel toggle: as soon as the
-                  active mission spawns its first parallel sub-agent the
-                  panel surfaces here so the user has a live header above
-                  the thinking section listing every background agent. The
-                  per-mission dismiss tracking in `workerPanelDismissedRef`
-                  still gates auto-open and respects an explicit close. */}
-              {hasInMissionSubagents && (
+                  Has its own `showSubagentsPanel` state so the user
+                  can close just this panel (was sharing the
+                  Workers-panel state which made the X button kill
+                  the wrong sidebar). Per-mission dismiss tracking
+                  via `subagentsPanelDismissedRef` so re-opening
+                  the same mission respects an explicit close. */}
+              {showSubagentsPanel && hasInMissionSubagents && (
                 <SubagentsPanel
                   subagents={inMissionSubagents}
                   onFocusItem={focusChatItem}
-                  onClose={handleCloseWorkerPanel}
+                  onClose={handleCloseSubagentsPanel}
                   className={cn(
                     showWorkbenchPanel ||
                       showDesktopStream ||
@@ -12044,6 +12106,28 @@ export default function ControlClient() {
                   )}
                 />
               )}
+
+              {/* Agent Tasks panel — TodoWrite snapshot as its own
+                  sidebar (was previously inlined inside the
+                  workbench card). Has its own dismiss state +
+                  close button. */}
+              {showAgentTasksPanel &&
+                latestAgentTodos &&
+                latestAgentTodos.length > 0 && (
+                  <AgentTasksPanel
+                    todos={latestAgentTodos}
+                    onClose={handleCloseAgentTasksPanel}
+                    className={cn(
+                      showWorkbenchPanel ||
+                        showDesktopStream ||
+                        showChangesPanel ||
+                        (showWorkerPanel && isBossMission) ||
+                        (showSubagentsPanel && hasInMissionSubagents)
+                        ? "flex-1 min-h-0"
+                        : "flex-1",
+                    )}
+                  />
+                )}
 
               {/* (Thinking Panel removed — thoughts now render
                   inline in the main chat thread.) */}
