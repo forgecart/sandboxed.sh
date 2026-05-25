@@ -458,9 +458,19 @@ export function NewMissionDialog({
     // Wait for agents to load
     if (allAgents.length === 0) return;
 
-    // Set workspace from initialValues if provided
+    // Set workspace from initialValues if provided.
+    // In create mode without an explicit workspace, prefer the first
+    // ready K8sPod workspace — those give per-mission docker/netns
+    // isolation, which is what the user wants by default.
     if (initialValues?.workspaceId) {
       setNewMissionWorkspace(initialValues.workspaceId);
+    } else if (!isEditMode) {
+      const defaultK8sPod = workspaces.find(
+        (w) => w.workspace_type === 'k8s_pod' && w.status === 'ready',
+      );
+      if (defaultK8sPod) {
+        setNewMissionWorkspace(defaultK8sPod.id);
+      }
     }
 
     // Model override / effort: prefer `initialValues` (edit mode or current-
@@ -730,10 +740,14 @@ export function NewMissionDialog({
             }}
           />
 
-          {/* Modal */}
+          {/* Modal — widen when the repo picker is rendered so we can
+              switch to a two-column grid; keep the compact width in
+              edit mode and when no repo picker shows. */}
           <div
             ref={modalRef}
-            className="relative w-full max-w-md max-h-[calc(100vh-2rem)] overflow-y-auto rounded-xl border border-white/[0.06] bg-[#1a1a1a] p-4 shadow-2xl animate-in fade-in zoom-in-95 duration-150 mx-4"
+            className={`relative w-full max-h-[calc(100vh-2rem)] overflow-y-auto rounded-xl border border-white/[0.06] bg-[#1a1a1a] p-4 shadow-2xl animate-in fade-in zoom-in-95 duration-150 mx-4 ${
+              !isEditMode && githubReposAvailable ? 'max-w-4xl' : 'max-w-md'
+            }`}
           >
           {/* Header with refresh and close buttons */}
           <div className="flex items-center justify-between mb-3">
@@ -759,7 +773,18 @@ export function NewMissionDialog({
             </div>
           </div>
 
-          <div className="space-y-3">
+          {/* Body grid: two columns on lg when the repo picker is
+              rendered (form fields on the left, repositories panel on
+              the right); single column otherwise. Action buttons span
+              both columns at the bottom (see col-span-2 wrapper). */}
+          <div
+            className={
+              !isEditMode && githubReposAvailable
+                ? 'grid grid-cols-1 lg:grid-cols-2 gap-x-4 gap-y-3'
+                : 'space-y-3'
+            }
+          >
+            <div className="space-y-3">
             {/* Workspace selection */}
             <div>
               <label className="block text-xs text-white/50 mb-1.5">Workspace</label>
@@ -798,145 +823,6 @@ export function NewMissionDialog({
               </select>
               <p className="text-xs text-white/30 mt-1.5">Where the mission will run</p>
             </div>
-
-            {/* GitHub repos picker (hidden when App not configured or in edit mode) */}
-            {!isEditMode && githubReposAvailable && (
-              <div>
-                <div className="flex items-center justify-between mb-1.5">
-                  <label className="block text-xs text-white/50">
-                    Repositories ({selectedRepos.size} picked)
-                  </label>
-                  <button
-                    type="button"
-                    onClick={() => mutateGithubRepos()}
-                    title="Refresh repo list"
-                    className="p-1 rounded text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors"
-                  >
-                    <RefreshCw className={`h-3 w-3 ${githubReposLoading ? 'animate-spin' : ''}`} />
-                  </button>
-                </div>
-
-                {/* Selected repos as chips */}
-                {selectedRepos.size > 0 && (
-                  <div className="flex flex-wrap gap-1.5 mb-2">
-                    {Array.from(selectedRepos.values()).map((sel) => {
-                      const repo = githubRepos?.find((r) => r.full_name === sel.full_name);
-                      const branchLabel = sel.branch?.trim() || repo?.default_branch || 'default';
-                      return (
-                        <span
-                          key={sel.full_name}
-                          className="inline-flex items-center gap-1.5 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-1 text-xs text-white/90"
-                        >
-                          <span className="font-mono">{sel.full_name}</span>
-                          <span className="text-white/50">@</span>
-                          <input
-                            type="text"
-                            value={sel.branch ?? ''}
-                            placeholder={repo?.default_branch || 'branch'}
-                            onChange={(e) => {
-                              setSelectedRepos((prev) => {
-                                const next = new Map(prev);
-                                next.set(sel.full_name, {
-                                  full_name: sel.full_name,
-                                  branch: e.target.value || undefined,
-                                });
-                                return next;
-                              });
-                            }}
-                            className="w-20 bg-transparent border-b border-white/10 focus:border-indigo-500/50 focus:outline-none text-xs text-white/80"
-                            title={`Default branch: ${branchLabel}`}
-                          />
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setSelectedRepos((prev) => {
-                                const next = new Map(prev);
-                                next.delete(sel.full_name);
-                                return next;
-                              });
-                            }}
-                            className="text-white/40 hover:text-white/80"
-                          >
-                            <X className="h-3 w-3" />
-                          </button>
-                        </span>
-                      );
-                    })}
-                  </div>
-                )}
-
-                {/* Filter + checkbox list */}
-                <input
-                  type="text"
-                  value={repoFilter}
-                  onChange={(e) => setRepoFilter(e.target.value)}
-                  placeholder="Filter forgecart/* repos…"
-                  className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white placeholder:text-white/30 focus:border-indigo-500/50 focus:outline-none"
-                />
-                <div className="mt-1.5 max-h-40 overflow-y-auto rounded-lg border border-white/[0.04] bg-white/[0.01]">
-                  {githubReposLoading && (
-                    <div className="p-2 text-xs text-white/40">Loading repos…</div>
-                  )}
-                  {!githubReposLoading && githubRepos && githubRepos.length === 0 && (
-                    <div className="p-2 text-xs text-white/40">
-                      The GitHub App installation can&apos;t see any repos.
-                    </div>
-                  )}
-                  {githubRepos
-                    ?.filter((r) => {
-                      if (!repoFilter.trim()) return true;
-                      return r.full_name
-                        .toLowerCase()
-                        .includes(repoFilter.trim().toLowerCase());
-                    })
-                    .slice(0, 50)
-                    .map((repo) => {
-                      const checked = selectedRepos.has(repo.full_name);
-                      return (
-                        <label
-                          key={repo.id}
-                          className="flex items-center gap-2 px-2 py-1.5 hover:bg-white/[0.03] cursor-pointer"
-                        >
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={(e) => {
-                              setSelectedRepos((prev) => {
-                                const next = new Map(prev);
-                                if (e.target.checked) {
-                                  next.set(repo.full_name, {
-                                    full_name: repo.full_name,
-                                    branch: undefined,
-                                  });
-                                } else {
-                                  next.delete(repo.full_name);
-                                }
-                                return next;
-                              });
-                            }}
-                            className="h-3.5 w-3.5"
-                          />
-                          <span className="font-mono text-xs text-white/80">{repo.full_name}</span>
-                          <span className="text-xs text-white/30">
-                            default: {repo.default_branch}
-                          </span>
-                          {repo.private && (
-                            <span className="text-[10px] uppercase text-white/30 px-1 border border-white/10 rounded">
-                              private
-                            </span>
-                          )}
-                        </label>
-                      );
-                    })}
-                </div>
-                {githubReposError && (
-                  <p className="text-xs text-red-400 mt-1">{githubReposError.message}</p>
-                )}
-                <p className="text-xs text-white/30 mt-1.5">
-                  Cloned into <code>{'<mission_workspace>/repos/<name>/'}</code> before the agent starts.
-                </p>
-              </div>
-            )}
 
             {/* Agent selection (includes backend) */}
             <div>
@@ -1076,9 +962,152 @@ export function NewMissionDialog({
                 </p>
               </div>
             )}
+            </div>{/* /left column */}
 
-            {/* Action buttons */}
-            <div className="flex gap-2 pt-1">
+            {/* GitHub repos picker — right column on lg, full row on sm.
+                Hidden in edit mode and when the GitHub App isn't
+                installed. Has its own internal scroll so it doesn't
+                push the action row off-screen. */}
+            {!isEditMode && githubReposAvailable && (
+              <div className="flex flex-col min-w-0">
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="block text-xs text-white/50">
+                    Repositories ({selectedRepos.size} picked)
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => mutateGithubRepos()}
+                    title="Refresh repo list"
+                    className="p-1 rounded text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors"
+                  >
+                    <RefreshCw className={`h-3 w-3 ${githubReposLoading ? 'animate-spin' : ''}`} />
+                  </button>
+                </div>
+
+                {/* Selected repos as chips */}
+                {selectedRepos.size > 0 && (
+                  <div className="flex flex-wrap gap-1.5 mb-2 max-h-28 overflow-y-auto pr-1">
+                    {Array.from(selectedRepos.values()).map((sel) => {
+                      const repo = githubRepos?.find((r) => r.full_name === sel.full_name);
+                      const branchLabel = sel.branch?.trim() || repo?.default_branch || 'default';
+                      return (
+                        <span
+                          key={sel.full_name}
+                          className="inline-flex items-center gap-1.5 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-1 text-xs text-white/90 max-w-full"
+                        >
+                          <span className="font-mono truncate max-w-[180px]" title={sel.full_name}>{sel.full_name}</span>
+                          <span className="text-white/50">@</span>
+                          <input
+                            type="text"
+                            value={sel.branch ?? ''}
+                            placeholder={repo?.default_branch || 'branch'}
+                            onChange={(e) => {
+                              setSelectedRepos((prev) => {
+                                const next = new Map(prev);
+                                next.set(sel.full_name, {
+                                  full_name: sel.full_name,
+                                  branch: e.target.value || undefined,
+                                });
+                                return next;
+                              });
+                            }}
+                            className="w-20 bg-transparent border-b border-white/10 focus:border-indigo-500/50 focus:outline-none text-xs text-white/80"
+                            title={`Default branch: ${branchLabel}`}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSelectedRepos((prev) => {
+                                const next = new Map(prev);
+                                next.delete(sel.full_name);
+                                return next;
+                              });
+                            }}
+                            className="text-white/40 hover:text-white/80"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Filter + checkbox list */}
+                <input
+                  type="text"
+                  value={repoFilter}
+                  onChange={(e) => setRepoFilter(e.target.value)}
+                  placeholder="Filter forgecart/* repos…"
+                  className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white placeholder:text-white/30 focus:border-indigo-500/50 focus:outline-none"
+                />
+                <div className="mt-1.5 flex-1 min-h-[10rem] max-h-72 lg:max-h-[28rem] overflow-y-auto rounded-lg border border-white/[0.04] bg-white/[0.01]">
+                  {githubReposLoading && (
+                    <div className="p-2 text-xs text-white/40">Loading repos…</div>
+                  )}
+                  {!githubReposLoading && githubRepos && githubRepos.length === 0 && (
+                    <div className="p-2 text-xs text-white/40">
+                      The GitHub App installation can&apos;t see any repos.
+                    </div>
+                  )}
+                  {githubRepos
+                    ?.filter((r) => {
+                      if (!repoFilter.trim()) return true;
+                      return r.full_name
+                        .toLowerCase()
+                        .includes(repoFilter.trim().toLowerCase());
+                    })
+                    .slice(0, 50)
+                    .map((repo) => {
+                      const checked = selectedRepos.has(repo.full_name);
+                      return (
+                        <label
+                          key={repo.id}
+                          className="flex items-center gap-2 px-2 py-1.5 hover:bg-white/[0.03] cursor-pointer"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) => {
+                              setSelectedRepos((prev) => {
+                                const next = new Map(prev);
+                                if (e.target.checked) {
+                                  next.set(repo.full_name, {
+                                    full_name: repo.full_name,
+                                    branch: undefined,
+                                  });
+                                } else {
+                                  next.delete(repo.full_name);
+                                }
+                                return next;
+                              });
+                            }}
+                            className="h-3.5 w-3.5"
+                          />
+                          <span className="font-mono text-xs text-white/80 truncate">{repo.full_name}</span>
+                          <span className="text-xs text-white/30 shrink-0">
+                            default: {repo.default_branch}
+                          </span>
+                          {repo.private && (
+                            <span className="text-[10px] uppercase text-white/30 px-1 border border-white/10 rounded shrink-0">
+                              private
+                            </span>
+                          )}
+                        </label>
+                      );
+                    })}
+                </div>
+                {githubReposError && (
+                  <p className="text-xs text-red-400 mt-1">{githubReposError.message}</p>
+                )}
+                <p className="text-xs text-white/30 mt-1.5">
+                  Cloned into <code>{'<mission_workspace>/repos/<name>/'}</code> before the agent starts.
+                </p>
+              </div>
+            )}
+
+            {/* Action buttons — span both columns on lg */}
+            <div className={`flex gap-2 pt-1 ${!isEditMode && githubReposAvailable ? 'lg:col-span-2 lg:border-t lg:border-white/[0.04] lg:pt-3 lg:mt-1' : ''}`}>
               <button
                 type="button"
                 onClick={isEditMode ? handleClose : () => handleCreate(false)}
@@ -1108,7 +1137,7 @@ export function NewMissionDialog({
                 </button>
               )}
             </div>
-          </div>
+          </div>{/* /body grid */}
           </div>
         </div>,
         document.body
