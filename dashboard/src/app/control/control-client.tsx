@@ -2538,9 +2538,7 @@ function SubagentChatView({
         const pair = entry as Pair;
         const callArgs = pair.call.args;
         const resultStr = pair.result
-          ? typeof pair.result.result === "string"
-            ? pair.result.result
-            : JSON.stringify(pair.result.result).slice(0, 800)
+          ? formatToolResultForDisplay(pair.result.result).slice(0, 1200)
           : null;
         return (
           <div
@@ -2993,6 +2991,139 @@ function formatToolArgs(args: unknown): string {
 }
 
 /**
+ * Render an `args` payload as a human-friendly preview, mimicking
+ * how Claude Code's terminal renders tool calls. For Bash / Read /
+ * Write / Edit / Grep / Glob / Agent / WebFetch / WebSearch we
+ * extract the meaningful field(s) and format like a real CLI
+ * invocation; for anything else we fall back to pretty-printed
+ * JSON so we don't drop information. The result is plain text
+ * with real newlines — NOT JSON-escaped — so a `<pre>` displays
+ * it like a terminal.
+ */
+function formatToolArgsForDisplay(name: string, args: unknown): string {
+  if (args === null || args === undefined) return "";
+  if (typeof args === "string") return args;
+  if (typeof args !== "object") return String(args);
+  const obj = args as Record<string, unknown>;
+  const str = (k: string): string | null =>
+    typeof obj[k] === "string" ? (obj[k] as string) : null;
+  const lower = name.toLowerCase();
+  switch (lower) {
+    case "bash": {
+      const cmd = str("command");
+      const desc = str("description");
+      if (cmd) {
+        return desc ? `# ${desc}\n$ ${cmd}` : `$ ${cmd}`;
+      }
+      break;
+    }
+    case "read": {
+      const fp = str("file_path");
+      const offset = obj["offset"];
+      const limit = obj["limit"];
+      if (fp) {
+        const tail =
+          offset || limit
+            ? ` (lines ${offset ?? 1}${limit ? `..${Number(offset ?? 0) + Number(limit)}` : "+"})`
+            : "";
+        return `${fp}${tail}`;
+      }
+      break;
+    }
+    case "write": {
+      const fp = str("file_path");
+      const content = str("content");
+      if (fp && content !== null) {
+        return `${fp}\n\n${content}`;
+      }
+      break;
+    }
+    case "edit": {
+      const fp = str("file_path");
+      const oldS = str("old_string");
+      const newS = str("new_string");
+      if (fp) {
+        const parts = [`${fp}`];
+        if (oldS) parts.push(`- ${oldS.split("\n").join("\n- ")}`);
+        if (newS) parts.push(`+ ${newS.split("\n").join("\n+ ")}`);
+        return parts.join("\n");
+      }
+      break;
+    }
+    case "grep": {
+      const pattern = str("pattern");
+      const path = str("path");
+      const glob = str("glob");
+      if (pattern) {
+        return `grep ${JSON.stringify(pattern)}${path ? ` in ${path}` : ""}${glob ? ` (${glob})` : ""}`;
+      }
+      break;
+    }
+    case "glob": {
+      const pattern = str("pattern");
+      const path = str("path");
+      if (pattern) return `${pattern}${path ? ` in ${path}` : ""}`;
+      break;
+    }
+    case "agent": {
+      const desc = str("description");
+      const subType = str("subagent_type");
+      const prompt = str("prompt");
+      const header = subType ? `[${subType}] ${desc ?? ""}` : (desc ?? "");
+      return prompt ? `${header}\n\n${prompt}` : header;
+    }
+    case "webfetch": {
+      const url = str("url");
+      const prompt = str("prompt");
+      if (url) return prompt ? `${url}\n# ${prompt}` : url;
+      break;
+    }
+    case "websearch": {
+      const query = str("query");
+      if (query) return query;
+      break;
+    }
+    case "todowrite":
+      // Rendered by the dedicated TodoWriteItem; no preview text needed.
+      return "";
+  }
+  return formatToolArgs(args);
+}
+
+/**
+ * Render a tool result payload as plain terminal-style text. The
+ * Bash backend wraps results as
+ *   { content, stdout, stderr, is_error, interrupted }
+ * — the user wants to see the stdout / content directly, not the
+ * JSON envelope. Fall back to JSON for tools whose result shape we
+ * don't recognise.
+ */
+function formatToolResultForDisplay(result: unknown): string {
+  if (result === null || result === undefined) return "";
+  if (typeof result === "string") return result;
+  if (typeof result !== "object") return String(result);
+  const obj = result as Record<string, unknown>;
+  const str = (k: string): string | null =>
+    typeof obj[k] === "string" ? (obj[k] as string) : null;
+  // Prefer `content` (Claude Code's normalized field), then stdout.
+  // Append stderr below if present and non-empty.
+  const content = str("content") ?? str("stdout") ?? str("output") ?? null;
+  const stderr = str("stderr");
+  const isError = obj["is_error"] === true || obj["success"] === false;
+  if (content !== null || stderr) {
+    const parts: string[] = [];
+    if (content) parts.push(content);
+    if (stderr && stderr.trim()) parts.push(`[stderr]\n${stderr}`);
+    let out = parts.join("\n\n");
+    if (isError && !out.toLowerCase().includes("error")) {
+      out = `[error]\n${out}`;
+    }
+    return out;
+  }
+  return formatToolArgs(result);
+}
+
+/**
  * P4-#24: tool-output preview cap. Bash and similar tools can return
  * multi-MB result strings; rendering them inline freezes the page even
  * with the markdown cap. This helper splits the full string into a
@@ -3011,6 +3142,13 @@ type ToolResultPreview = {
 
 function formatToolResultPreview(result: unknown): ToolResultPreview {
   const full = formatToolArgs(result);
+  return formatToolResultPreviewFromString(full);
+}
+
+/** Same head-truncation contract as `formatToolResultPreview` but
+ *  starts from an already-stringified value (used after we render
+ *  a tool result via the tool-aware formatter). */
+function formatToolResultPreviewFromString(full: string): ToolResultPreview {
   if (full.length <= TOOL_RESULT_PREVIEW_BYTES) {
     return { preview: full, truncated: false, fullLength: full.length };
   }
@@ -3353,9 +3491,12 @@ const SubagentToolItem = memo(function SubagentToolItem({
       ? formatDuration(Math.floor((item.endTime - item.startTime) / 1000))
       : null;
 
-  // Memoize result string formatting
+  // Memoize result string formatting — use the tool-aware
+  // formatter so Bash / Read / Grep stdout shows as raw terminal
+  // text instead of `{"content":"...","stdout":"..."}` JSON.
   const resultStr = useMemo(
-    () => (item.result !== undefined ? formatToolArgs(item.result) : null),
+    () =>
+      item.result !== undefined ? formatToolResultForDisplay(item.result) : null,
     [item.result],
   );
 
@@ -3703,15 +3844,23 @@ const ToolCallItem = memo(function ToolCallItem({
       : null;
 
   // Memoize expensive string formatting - only recompute when item.args changes
-  const argsStr = useMemo(() => formatToolArgs(item.args), [item.args]);
+  // Use the tool-aware formatter so Bash shows `$ <cmd>` not the raw
+  // `{"command": "...", "description": "..."}` JSON envelope.
+  const argsStr = useMemo(
+    () => formatToolArgsForDisplay(item.name, item.args),
+    [item.name, item.args],
+  );
 
   // P4-#24 preview cap: split into 10KB head + truncated flag so we
   // don't feed multi-MB bash outputs into the syntax highlighter.
-  const resultPreview = useMemo(
-    () =>
-      item.result !== undefined ? formatToolResultPreview(item.result) : null,
-    [item.result],
-  );
+  // Use the tool-aware result formatter so Bash / Read / Grep show
+  // their stdout / file content as plain text (with real newlines)
+  // instead of the JSON `{"content":"...","stdout":"..."}` envelope.
+  const resultPreview = useMemo(() => {
+    if (item.result === undefined) return null;
+    const rendered = formatToolResultForDisplay(item.result);
+    return formatToolResultPreviewFromString(rendered);
+  }, [item.result]);
   const resultStr = resultPreview?.preview ?? null;
   // Default-show the full result; user can collapse to the preview via
   // the existing toggle button (semantics flipped from previous default).
@@ -3874,8 +4023,8 @@ const ToolCallItem = memo(function ToolCallItem({
                     textColor={isError ? "rgb(248, 113, 113)" : undefined}
                   >
                     {resultExpanded && item.result !== undefined
-                      ? formatToolArgs(item.result)
-                      : resultStr}
+                      ? formatToolResultForDisplay(item.result)
+                      : (resultStr ?? "")}
                   </LazyJsonHighlighter>
                 </div>
                 {resultPreview?.truncated && (
