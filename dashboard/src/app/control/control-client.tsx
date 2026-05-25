@@ -5209,13 +5209,44 @@ export default function ControlClient() {
             return `${key}:${item.thoughts.length}:${tailThoughts.map((thought) => `${thought.id}:${thought.done ? "done" : "active"}:${thought.content.length}`).join(",")}`;
           }
           if (item.kind === "tool_group") {
-            return `${key}:${item.tools.length}`;
+            // Include each tool's running/done state AND a short
+            // hash of the result content length so the anchor key
+            // changes when tools finish or their stdout grows.
+            // Without this, completed tools and live tool_results
+            // wouldn't trigger the auto-scroll-to-bottom layout
+            // effect and the user has to scroll manually.
+            const tailTools = item.tools.slice(-6);
+            const fp = tailTools
+              .map((t) => {
+                const r = t.result;
+                const rLen =
+                  typeof r === "string"
+                    ? r.length
+                    : r === undefined
+                      ? 0
+                      : JSON.stringify(r).length;
+                return `${t.id}:${r === undefined ? "running" : "done"}:${rLen}`;
+              })
+              .join(",");
+            return `${key}:${item.tools.length}:${fp}`;
           }
           if (item.kind === "thinking" || item.kind === "stream") {
             return `${key}:${item.done ? "done" : "active"}:${item.content.length}`;
           }
           if (item.kind === "assistant" || item.kind === "user") {
             return `${key}:${item.content.length}`;
+          }
+          if (item.kind === "tool") {
+            // Single-tool item (not grouped) — same idea as
+            // tool_group but for one entry.
+            const r = item.result;
+            const rLen =
+              typeof r === "string"
+                ? r.length
+                : r === undefined
+                  ? 0
+                  : JSON.stringify(r).length;
+            return `${key}:${r === undefined ? "running" : "done"}:${rLen}`;
           }
           return key;
         })
