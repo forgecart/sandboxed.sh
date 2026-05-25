@@ -3021,6 +3021,123 @@ function truncateText(text: string, maxLength: number = 100): string {
   return text.slice(0, maxLength) + "...";
 }
 
+// `TodoWrite` carries an `args.todos` array, where each item is
+// `{ content, activeForm?, status: "pending" | "in_progress" | "completed" }`.
+// Each TodoWrite call is a full snapshot of the agent's task list,
+// not a diff — only the latest one for a given turn matters.
+type TodoItem = {
+  content: string;
+  activeForm?: string | null;
+  status: "pending" | "in_progress" | "completed";
+};
+function extractTodos(args: unknown): TodoItem[] | null {
+  if (!args || typeof args !== "object") return null;
+  const todos = (args as Record<string, unknown>)["todos"];
+  if (!Array.isArray(todos)) return null;
+  const out: TodoItem[] = [];
+  for (const raw of todos) {
+    if (!raw || typeof raw !== "object") continue;
+    const r = raw as Record<string, unknown>;
+    const status = r["status"];
+    if (
+      typeof r["content"] !== "string" ||
+      (status !== "pending" &&
+        status !== "in_progress" &&
+        status !== "completed")
+    ) {
+      continue;
+    }
+    out.push({
+      content: r["content"],
+      activeForm:
+        typeof r["activeForm"] === "string" ? r["activeForm"] : null,
+      status,
+    });
+  }
+  return out;
+}
+
+// Compact agent-task list view for Claude Code's `TodoWrite` tool.
+// Renders the agent's plan as a checklist: ☐ pending, ◐ in-progress
+// (uses `activeForm` when provided), ☒ completed (strikethrough).
+const TodoWriteItem = memo(function TodoWriteItem({
+  item,
+  highlighted = false,
+}: {
+  item: Extract<ChatItem, { kind: "tool" }>;
+  highlighted?: boolean;
+}) {
+  const todos = useMemo(() => extractTodos(item.args), [item.args]);
+  if (!todos || todos.length === 0) {
+    // Fallback to the generic chip if the args shape is unexpected.
+    return <ToolCallItem item={item} highlighted={highlighted} />;
+  }
+  const counts = { pending: 0, in_progress: 0, completed: 0 };
+  for (const t of todos) counts[t.status] += 1;
+  return (
+    <div
+      id={`chat-item-${item.id}`}
+      data-chat-item-id={item.id}
+      className={cn(
+        "my-2 rounded-lg border border-white/[0.06] bg-white/[0.02] overflow-hidden",
+        highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10",
+      )}
+    >
+      <div className="flex items-center justify-between px-3 py-1.5 border-b border-white/[0.04]">
+        <div className="flex items-center gap-2 text-xs">
+          <Flag className="h-3.5 w-3.5 text-indigo-400" />
+          <span className="font-medium text-white/80">Agent tasks</span>
+          <span className="text-white/30">{todos.length}</span>
+        </div>
+        <div className="flex items-center gap-2 text-[10px]">
+          {counts.in_progress > 0 && (
+            <span className="flex items-center gap-1 text-amber-400">
+              <Loader className="h-2.5 w-2.5 animate-spin" />
+              {counts.in_progress}
+            </span>
+          )}
+          {counts.completed > 0 && (
+            <span className="text-emerald-400">{counts.completed} ✓</span>
+          )}
+          {counts.pending > 0 && (
+            <span className="text-white/40">{counts.pending} todo</span>
+          )}
+        </div>
+      </div>
+      <ul className="px-3 py-2 space-y-1 text-xs">
+        {todos.map((t, i) => {
+          const label =
+            t.status === "in_progress" && t.activeForm ? t.activeForm : t.content;
+          return (
+            <li key={i} className="flex items-start gap-2 leading-snug">
+              {t.status === "completed" ? (
+                <CheckCircle className="h-3 w-3 mt-0.5 shrink-0 text-emerald-400" />
+              ) : t.status === "in_progress" ? (
+                <Loader className="h-3 w-3 mt-0.5 shrink-0 text-amber-400 animate-spin" />
+              ) : (
+                <span className="h-3 w-3 mt-0.5 shrink-0 rounded-sm border border-white/30" />
+              )}
+              <span
+                className={cn(
+                  "text-white/80",
+                  t.status === "completed" && "text-white/40 line-through",
+                  t.status === "in_progress" && "text-amber-100",
+                )}
+              >
+                {label}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+});
+
+function isTodoWriteTool(toolName: string): boolean {
+  return toolName.toLowerCase() === "todowrite";
+}
+
 // Check if a tool is a subagent/background task tool.
 // `"agent"` is Claude Code's parallel-task tool (the one whose call
 // args carry `subagent_type` / `description` / `prompt`); without it
@@ -3768,6 +3885,9 @@ function CollapsedToolGroup({
     if (isSubagentTool(tool.name)) {
       return <SubagentToolItem key={tool.id} item={tool} />;
     }
+    if (isTodoWriteTool(tool.name)) {
+      return <TodoWriteItem key={tool.id} item={tool} />;
+    }
     return (
       <ToolCallItem
         key={tool.id}
@@ -4185,6 +4305,10 @@ const ChatItemRow = memo(function ChatItemRow({
 
     if (isSubagentTool(item.name)) {
       return <SubagentToolItem item={item} highlighted={highlighted} />;
+    }
+
+    if (isTodoWriteTool(item.name)) {
+      return <TodoWriteItem item={item} highlighted={highlighted} />;
     }
 
     return (
