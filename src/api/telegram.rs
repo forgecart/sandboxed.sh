@@ -6009,6 +6009,8 @@ mod tests {
             goal_objective: None,
             first_viewed_at: None,
             initial_repos: Vec::new(),
+            pod_phase: None,
+            pod_message: None,
         }
     }
 

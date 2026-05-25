@@ -855,21 +855,12 @@ async fn delete_workspace(
                 }
             }
             WorkspaceType::K8sPod => {
-                if let Some(k8s) = state.k8s_pod.as_ref() {
-                    if let Err(e) = k8s.destroy_workspace_pod(id).await {
-                        tracing::error!("Failed to destroy k8s_pod workspace {}: {}", id, e);
-                        return Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!(
-                                "Failed to destroy workspace pod / PVCs: {}. Workspace not deleted to prevent orphaned cluster resources.",
-                                e
-                            ),
-                        ));
-                    }
-                }
-                // If k8s_pod backend isn't configured anymore but a
-                // stale k8s_pod workspace is in the store, fall
-                // through and delete the local record anyway.
+                // K8sPod is mission-per-pod since the cutover, so the
+                // workspace itself never has a pod to delete. The
+                // mission GC (and explicit `delete_mission`) handles
+                // each mission's pod individually. This branch is
+                // intentionally a no-op; the workspace record is
+                // deleted below.
             }
             WorkspaceType::Host => {}
         }
@@ -1170,75 +1161,24 @@ async fn build_workspace(
     Ok(Json(workspace.into()))
 }
 
-/// Build flow for `workspace_type: k8s_pod`. Creates the Pod + PVCs +
-/// optional ConfigMap via the kube API. Status is sync'd from Pod
-/// phase in a background task; the HTTP request returns as soon as
-/// the Pod manifest is accepted.
+/// Build flow for `workspace_type: k8s_pod`. **No-op since the
+/// mission-per-pod cutover** — workspaces no longer have a pod of
+/// their own. Each mission creates + destroys its own pod under the
+/// workspace's `env_vars` / `init_script` settings. We just mark the
+/// workspace `Ready` immediately so the dashboard's "Build" button
+/// completes instantly.
 async fn build_k8s_pod_workspace(
     state: Arc<super::routes::AppState>,
     mut workspace: Workspace,
 ) -> Result<Json<WorkspaceResponse>, (StatusCode, String)> {
-    let k8s = state.k8s_pod.clone().ok_or((
-        StatusCode::BAD_REQUEST,
-        "k8s_pod backend not configured on this control plane (set SANDBOXED_SH_K8S_WORKSPACE_IMAGE + SANDBOXED_SH_K8S_WORKSPACE_NAMESPACE)".to_string(),
-    ))?;
-
-    if workspace.status == WorkspaceStatus::Building {
-        return Err((
-            StatusCode::CONFLICT,
-            "Workspace build already in progress".to_string(),
-        ));
-    }
-
-    workspace.status = WorkspaceStatus::Building;
+    workspace.status = WorkspaceStatus::Ready;
     workspace.error_message = None;
     state.workspaces.update(workspace.clone()).await;
-
-    let workspaces_store = Arc::clone(&state.workspaces);
-    let workspace_for_build = workspace.clone();
-    let k8s_for_build = Arc::clone(&k8s);
-
-    tokio::spawn(async move {
-        let workspace_id = workspace_for_build.id;
-        let init_script = workspace_for_build.init_script.as_deref();
-        let env_vars = workspace_for_build.env_vars.clone();
-
-        let mut updated = workspace_for_build.clone();
-        let outcome = async {
-            k8s_for_build
-                .create_workspace_pod(workspace_id, init_script, &env_vars)
-                .await?;
-            k8s_for_build
-                .wait_for_ready(workspace_id, std::time::Duration::from_secs(180))
-                .await?;
-            anyhow::Ok(())
-        }
-        .await;
-
-        match outcome {
-            Ok(()) => {
-                updated.status = WorkspaceStatus::Ready;
-                updated.error_message = None;
-                tracing::info!(
-                    workspace = %updated.name,
-                    workspace_id = %workspace_id,
-                    "k8s_pod workspace Ready"
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    workspace = %updated.name,
-                    workspace_id = %workspace_id,
-                    error = %e,
-                    "k8s_pod workspace build failed"
-                );
-                updated.status = WorkspaceStatus::Error;
-                updated.error_message = Some(e.to_string());
-            }
-        }
-        workspaces_store.update(updated).await;
-    });
-
+    tracing::info!(
+        workspace = %workspace.name,
+        workspace_id = %workspace.id,
+        "k8s_pod workspace marked Ready (mission-per-pod: no workspace-level pod to create)"
+    );
     Ok(Json(workspace.into()))
 }
 

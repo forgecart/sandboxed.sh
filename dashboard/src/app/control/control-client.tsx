@@ -2176,6 +2176,68 @@ const ThinkingPanel = memo(function ThinkingPanel({
   );
 });
 
+// Live pod-boot progress for the K8sPod backend. The control plane
+// emits a `mission_pod_startup` event for every phase transition while
+// the mission's per-mission Pod boots (PVC bind -> image pull ->
+// container start -> init -> ready). The banner stays visible until
+// the mission flips out of `pending`.
+const POD_PHASE_LABELS: Record<string, string> = {
+  pvc_binding: "Binding storage",
+  pod_scheduled: "Scheduled",
+  pulling: "Pulling image",
+  pulled: "Image pulled",
+  container_starting: "Starting container",
+  container_ready: "Container ready",
+  init_script_running: "Running init script",
+  ready: "Ready",
+  error: "Error",
+};
+
+function PodStartupBanner({
+  phase,
+  message,
+}: {
+  phase: string;
+  message: string | null;
+}) {
+  const isError = phase === "error";
+  const label = POD_PHASE_LABELS[phase] ?? phase;
+  return (
+    <section className="space-y-2">
+      <p className="text-[10px] uppercase tracking-wide text-white/30">
+        Workspace pod
+      </p>
+      <div
+        className={cn(
+          "flex items-start gap-2 rounded-md border p-2 text-xs",
+          isError
+            ? "border-red-500/30 bg-red-500/10 text-red-200"
+            : "border-indigo-500/20 bg-indigo-500/10 text-indigo-100",
+        )}
+      >
+        {isError ? (
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+        ) : (
+          <Loader className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin" />
+        )}
+        <div className="min-w-0 flex-1">
+          <p className="font-medium leading-snug">{label}</p>
+          {message && (
+            <p
+              className={cn(
+                "mt-0.5 break-words leading-snug",
+                isError ? "text-red-200/80" : "text-white/60",
+              )}
+            >
+              {message}
+            </p>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function MissionWorkbenchPanel({
   mission,
   workspaceLabel,
@@ -2350,6 +2412,13 @@ function MissionWorkbenchPanel({
                 </p>
               )}
             </section>
+
+            {mission.status === "pending" && mission.pod_phase && (
+              <PodStartupBanner
+                phase={mission.pod_phase}
+                message={mission.pod_message ?? null}
+              />
+            )}
 
             <section className="space-y-2">
               <p className="text-[10px] uppercase tracking-wide text-white/30">
@@ -8194,6 +8263,40 @@ export default function ControlClient() {
             phase: "idle",
           }));
         }
+      }
+
+      // K8sPod backend: a per-mission pod is booting. Patch the
+      // matching mission record so the card / detail view can render
+      // a spinner with the latest phase + message until the pod is
+      // Ready (at which point the agent spawns and normal events flow).
+      if (event.type === "mission_pod_startup" && isRecord(data)) {
+        const missionId =
+          typeof data["mission_id"] === "string"
+            ? data["mission_id"]
+            : undefined;
+        const phase =
+          typeof data["phase"] === "string" ? data["phase"] : undefined;
+        const message =
+          typeof data["message"] === "string" ? data["message"] : undefined;
+        if (missionId && phase) {
+          const patch = { pod_phase: phase, pod_message: message ?? null };
+          setRecentMissions((prev) => {
+            let changed = false;
+            const next = prev.map((mission) => {
+              if (mission.id !== missionId) return mission;
+              changed = true;
+              return { ...mission, ...patch };
+            });
+            return changed ? next : prev;
+          });
+          if (currentMissionRef.current?.id === missionId) {
+            setCurrentMission((prev) => (prev ? { ...prev, ...patch } : prev));
+          }
+          if (viewingMissionRef.current?.id === missionId) {
+            setViewingMission((prev) => (prev ? { ...prev, ...patch } : prev));
+          }
+        }
+        return;
       }
 
       if (event.type === "goal_iteration" && isRecord(data)) {

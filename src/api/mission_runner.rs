@@ -2999,6 +2999,38 @@ async fn run_mission_turn(
             "Failed to sync MCP binaries into workspace"
         );
     }
+
+    // For K8sPod missions, gate the agent spawn on the mission's
+    // pod being Ready. `spawn_mission_pod_bootstrap` (control.rs)
+    // started the pod eagerly when the mission was created; this
+    // wait is a backstop for the case where the user's first
+    // message arrives before the pod has finished booting (cold
+    // image pull on a fresh node can take 60-90s). If we don't
+    // wait here, the agent's first kubectl exec fires too early
+    // and the resolver bails with "claude not found".
+    if workspace.workspace_type == crate::workspace::WorkspaceType::K8sPod {
+        if let Some(k8s) = crate::k8s_pod::global_client() {
+            tracing::info!(
+                mission_id = %mission_id,
+                workspace = %workspace.name,
+                "wait_for_ready: waiting for mission pod (up to 180s)"
+            );
+            if let Err(e) = k8s
+                .wait_for_ready(mission_id, std::time::Duration::from_secs(180))
+                .await
+            {
+                tracing::error!(
+                    mission_id = %mission_id,
+                    error = %e,
+                    "wait_for_ready timed out / failed; agent spawn will likely fail"
+                );
+                // Don't return early — surface the failure
+                // through the normal agent error path. The user
+                // sees the kube error rather than a silent hang.
+            }
+        }
+    }
+
     let workspace_root = workspace.path.clone();
     let mission_work_dir_result = {
         let lib_guard = library.read().await;
@@ -3046,20 +3078,24 @@ async fn run_mission_turn(
             let is_k8s_pod = workspace.workspace_type == crate::workspace::WorkspaceType::K8sPod;
             let results = if is_k8s_pod {
                 if let Some(k8s) = crate::k8s_pod::global_client() {
+                    // Pod is created eagerly at mission create; ensure
+                    // it's actually Ready before exec-ing git inside.
+                    if let Err(e) = k8s
+                        .wait_for_ready(mission_id, std::time::Duration::from_secs(180))
+                        .await
+                    {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            error = %e,
+                            "wait_for_ready before clone failed; clone may error"
+                        );
+                    }
                     match client.installation_token().await {
                         Ok(token) => {
-                            let pod_dir = match mission_work_dir.strip_prefix(&workspace.path) {
-                                Ok(rel) => {
-                                    let trimmed = rel.strip_prefix("workspaces").unwrap_or(rel);
-                                    if trimmed.as_os_str().is_empty() {
-                                        std::path::PathBuf::from("/workspaces")
-                                    } else {
-                                        std::path::PathBuf::from("/workspaces").join(trimmed)
-                                    }
-                                }
-                                Err(_) => std::path::PathBuf::from("/workspaces"),
-                            };
-                            k8s.clone_repos_in_pod(workspace.id, &initial_repos, &token, &pod_dir)
+                            // Per-mission pod: `/workspaces` IS the
+                            // mission root — no `mission-<id>` subdir.
+                            let pod_dir = std::path::PathBuf::from("/workspaces");
+                            k8s.clone_repos_in_pod(mission_id, &initial_repos, &token, &pod_dir)
                                 .await
                         }
                         Err(e) => {
@@ -4603,7 +4639,7 @@ pub fn run_claudecode_turn<'a>(
             }
         };
 
-        let workspace_exec = WorkspaceExec::new(workspace.clone());
+        let workspace_exec = WorkspaceExec::for_mission(workspace.clone(), mission_id);
         let cli_path =
             match ensure_claudecode_cli_available(&workspace_exec, work_dir, &cli_path).await {
                 Ok(path) => path,
@@ -11049,7 +11085,7 @@ pub async fn run_opencode_turn(
 
     // Determine CLI runner: prefer backend config, then env var, then try bunx/npx
     // We use 'bunx oh-my-opencode run' or 'npx oh-my-opencode run' for per-workspace execution.
-    let workspace_exec = WorkspaceExec::new(workspace.clone());
+    let workspace_exec = WorkspaceExec::for_mission(workspace.clone(), mission_id);
     if let Err(err) = ensure_opencode_cli_available(&workspace_exec, work_dir).await {
         tracing::error!("{}", err);
         let _ = events_tx.send(AgentEvent::Error {
@@ -13511,7 +13547,7 @@ pub async fn run_grok_turn(
 ) -> AgentResult {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let workspace_exec = WorkspaceExec::new(workspace.clone());
+    let workspace_exec = WorkspaceExec::for_mission(workspace.clone(), mission_id);
     let cli_path =
         get_backend_string_setting("grok", "cli_path").unwrap_or_else(|| "grok".to_string());
     let cli_path = match ensure_grok_cli_available(&workspace_exec, work_dir, &cli_path).await {
@@ -14302,7 +14338,7 @@ pub async fn run_codex_turn(
         .with_terminal_reason(TerminalReason::LlmError);
     }
 
-    let workspace_exec = WorkspaceExec::new(workspace.clone());
+    let workspace_exec = WorkspaceExec::for_mission(workspace.clone(), mission_id);
     let cli_path = get_backend_string_setting("codex", "cli_path")
         .or_else(|| std::env::var("CODEX_CLI_PATH").ok())
         .unwrap_or_else(|| "codex".to_string());
@@ -14795,7 +14831,7 @@ pub async fn run_gemini_turn(
         }
     }
 
-    let workspace_exec = WorkspaceExec::new(workspace.clone());
+    let workspace_exec = WorkspaceExec::for_mission(workspace.clone(), mission_id);
     let cli_path = get_backend_string_setting("gemini", "cli_path")
         .or_else(|| std::env::var("GEMINI_CLI_PATH").ok())
         .unwrap_or_else(|| "gemini".to_string());

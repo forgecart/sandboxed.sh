@@ -489,7 +489,20 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // ServiceAccount token is mounted, k8s_pod is None and creating a
     // k8s_pod workspace returns a 400 with a hint.
     let k8s_pod = crate::k8s_pod::K8sPodClient::try_init().await.map(Arc::new);
-    if k8s_pod.is_none() {
+    if let Some(client) = k8s_pod.as_ref() {
+        // One-shot boot cleanup: nuke any leftover `ws-*` pods from
+        // the old workspace-per-pod model. Mission-per-pod doesn't
+        // create pods at workspace build time, so anything matching
+        // `ws-*` in the namespace is orphaned and safe to delete.
+        let client = Arc::clone(client);
+        tokio::spawn(async move {
+            match client.gc_orphaned_workspace_pods().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(removed = n, "boot GC: removed orphaned per-workspace pods"),
+                Err(e) => tracing::warn!(error = %e, "boot GC: gc_orphaned_workspace_pods failed"),
+            }
+        });
+    } else {
         tracing::info!(
             "k8s_pod workspace backend not configured (set SANDBOXED_SH_K8S_WORKSPACE_IMAGE + SANDBOXED_SH_K8S_WORKSPACE_NAMESPACE); k8s_pod workspace type disabled"
         );

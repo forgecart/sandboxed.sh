@@ -27,30 +27,43 @@ fn sh_quote(s: &str) -> String {
 }
 
 /// Translate a host-side workspace cwd to its equivalent inside a
-/// K8sPod workspace. The control-plane pod's `<workspace.path>` is
-/// synthetic (the workspace doesn't actually live on the control
-/// plane's filesystem). Mission dirs are at
-/// `<workspace.path>/workspaces/mission-<id>/...` on the host; the
-/// pod mounts the workspaces PVC at `/workspaces`, so the mission
-/// dir maps to `/workspaces/mission-<id>/...`.
-///
-/// The leading `workspaces/` segment is stripped after the prefix
-/// strip to avoid the double-`/workspaces/workspaces/...` path bug.
+/// K8sPod mission pod. Mission-per-pod means each mission owns the
+/// whole pod (its `/workspaces` PVC IS the mission's workspace
+/// root). The control plane still computes host-side paths shaped
+/// like `<workspace.path>/workspaces/mission-<short>/repos/foo` —
+/// we strip both the workspace prefix and any leading
+/// `workspaces/mission-<short>/` segment, then prepend
+/// `/workspaces/` for the pod-internal equivalent
+/// (`/workspaces/repos/foo`).
 fn map_host_cwd_to_pod(workspace_path: &Path, cwd: &Path) -> PathBuf {
     if cwd.starts_with("/workspaces") {
         return cwd.to_path_buf();
     }
-    match cwd.strip_prefix(workspace_path) {
-        Ok(rel) if rel.as_os_str().is_empty() => PathBuf::from("/workspaces"),
-        Ok(rel) => {
-            let trimmed = rel.strip_prefix("workspaces").unwrap_or(rel);
-            if trimmed.as_os_str().is_empty() {
-                PathBuf::from("/workspaces")
-            } else {
-                PathBuf::from("/workspaces").join(trimmed)
-            }
+    let rel = match cwd.strip_prefix(workspace_path) {
+        Ok(r) => r.to_path_buf(),
+        Err(_) => return PathBuf::from("/workspaces"),
+    };
+    if rel.as_os_str().is_empty() {
+        return PathBuf::from("/workspaces");
+    }
+    // Drop a leading `workspaces/` component (the host's "all
+    // mission dirs live here" parent).
+    let after_ws = rel.strip_prefix("workspaces").unwrap_or(&rel);
+    // Drop a leading `mission-<short>/` component if present (it's
+    // meaningless inside a per-mission pod whose entire /workspaces
+    // PVC corresponds to that one mission).
+    let after_mission = match after_ws.components().next() {
+        Some(std::path::Component::Normal(c))
+            if c.to_string_lossy().starts_with("mission-") =>
+        {
+            after_ws.strip_prefix(c).unwrap_or(after_ws)
         }
-        Err(_) => PathBuf::from("/workspaces"),
+        _ => after_ws,
+    };
+    if after_mission.as_os_str().is_empty() {
+        PathBuf::from("/workspaces")
+    } else {
+        PathBuf::from("/workspaces").join(after_mission)
     }
 }
 
@@ -193,6 +206,12 @@ mod tests {
 #[derive(Debug, Clone)]
 pub struct WorkspaceExec {
     pub workspace: Workspace,
+    /// `Some(mission_id)` when this exec context belongs to a
+    /// specific mission. Required for the K8sPod backend (each
+    /// mission has its own pod, so the pod name is derived from
+    /// `mission_id`). `None` for setup / probe contexts that don't
+    /// run inside a per-mission pod.
+    pub mission_id: Option<uuid::Uuid>,
 }
 
 /// Child process spawned inside a PTY.
@@ -309,7 +328,21 @@ impl Drop for PtyChild {
 
 impl WorkspaceExec {
     pub fn new(workspace: Workspace) -> Self {
-        Self { workspace }
+        Self {
+            workspace,
+            mission_id: None,
+        }
+    }
+
+    /// Construct a `WorkspaceExec` bound to a specific mission. For
+    /// K8sPod workspaces this is required so command exec finds the
+    /// right per-mission pod. For nspawn / Host workspaces the
+    /// `mission_id` is unused and behaves identically to `new`.
+    pub fn for_mission(workspace: Workspace, mission_id: uuid::Uuid) -> Self {
+        Self {
+            workspace,
+            mission_id: Some(mission_id),
+        }
     }
 
     /// Translate a host path to a container-relative path.
@@ -963,7 +996,13 @@ impl WorkspaceExec {
                 // kube-rs WS exec path 403s on the RKE2 1.34 API
                 // server in our cluster — see the kubectl shellout
                 // commit in k8s_pod.rs for details.
-                let pod = format!("ws-{}", self.workspace.id);
+                let mission_id = self.mission_id.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "K8sPod build_command requires WorkspaceExec::for_mission; workspace_id={}",
+                        self.workspace.id
+                    )
+                })?;
+                let pod = format!("m-{}", mission_id);
                 let pod_cwd = map_host_cwd_to_pod(&self.workspace.path, cwd);
 
                 let mut shell_cmd = String::new();
@@ -1038,11 +1077,17 @@ impl WorkspaceExec {
                     self.workspace.id
                 )
             })?;
+            let mission_id = self.mission_id.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "K8sPod exec requires WorkspaceExec::for_mission; workspace_id={}",
+                    self.workspace.id
+                )
+            })?;
             let env_for_attempt = self.build_env(env);
             let pod_cwd = map_host_cwd_to_pod(&self.workspace.path, cwd);
             return k8s
                 .exec_command(
-                    self.workspace.id,
+                    mission_id,
                     Some(&pod_cwd),
                     program,
                     args,
@@ -1189,7 +1234,13 @@ impl WorkspaceExec {
             // one-shot exec, but with `-it` so the workspace's CLI
             // (claude / opencode / grok) gets a real PTY. Returns a
             // PtyChild wrapping the host-side openpty pair.
-            let pod = format!("ws-{}", self.workspace.id);
+            let mission_id = self.mission_id.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "K8sPod PTY exec requires WorkspaceExec::for_mission; workspace_id={}",
+                    self.workspace.id
+                )
+            })?;
+            let pod = format!("m-{}", mission_id);
             let pod_cwd = map_host_cwd_to_pod(&self.workspace.path, cwd);
 
             let mut shell_cmd = String::new();

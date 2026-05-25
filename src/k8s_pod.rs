@@ -38,6 +38,58 @@ use std::process::{ExitStatus, Output};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// Phases emitted by `stream_pod_startup_events`. Stream ordered
+/// (roughly): PvcBinding -> PodScheduled -> Pulling -> Pulled ->
+/// ContainerStarting -> ContainerReady -> [InitScriptRunning ->]
+/// Ready. `Error` is terminal; otherwise the stream closes after
+/// `Ready`. Variants serde-derived so they ride the existing SSE
+/// envelope without bespoke encoding.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum PodStartupEvent {
+    PvcBinding,
+    PodScheduled,
+    Pulling { image: String },
+    Pulled,
+    ContainerStarting,
+    ContainerReady,
+    InitScriptRunning,
+    Ready,
+    Error { message: String },
+}
+
+impl PodStartupEvent {
+    /// Short human-readable description for the dashboard spinner.
+    pub fn message(&self) -> String {
+        match self {
+            Self::PvcBinding => "Binding storage…".to_string(),
+            Self::PodScheduled => "Pod scheduled, waiting for image…".to_string(),
+            Self::Pulling { image } => format!("Pulling image: {}", image),
+            Self::Pulled => "Image pulled".to_string(),
+            Self::ContainerStarting => "Starting container…".to_string(),
+            Self::ContainerReady => "Container ready".to_string(),
+            Self::InitScriptRunning => "Running init script…".to_string(),
+            Self::Ready => "Ready".to_string(),
+            Self::Error { message } => format!("Error: {}", message),
+        }
+    }
+
+    /// One-word identifier suitable for `mission.pod_phase`.
+    pub fn phase_id(&self) -> &'static str {
+        match self {
+            Self::PvcBinding => "pvc_binding",
+            Self::PodScheduled => "pod_scheduled",
+            Self::Pulling { .. } => "pulling",
+            Self::Pulled => "pulled",
+            Self::ContainerStarting => "container_starting",
+            Self::ContainerReady => "container_ready",
+            Self::InitScriptRunning => "init_script_running",
+            Self::Ready => "ready",
+            Self::Error { .. } => "error",
+        }
+    }
+}
+
 /// Process-wide handle to the k8s_pod backend. Populated by
 /// `K8sPodClient::try_init` at startup; queried by call sites (like
 /// `WorkspaceExec::output`) that need to dispatch on workspace_type
@@ -52,7 +104,8 @@ pub fn global_client() -> Option<std::sync::Arc<K8sPodClient>> {
     GLOBAL_CLIENT.get().cloned().flatten()
 }
 
-const POD_LABEL_KEY: &str = "forgecart.dev/workspace-id";
+const POD_LABEL_MISSION_KEY: &str = "forgecart.dev/mission-id";
+const POD_LABEL_WORKSPACE_KEY: &str = "forgecart.dev/workspace-id";
 const POD_LABEL_MANAGED_BY_KEY: &str = "app.kubernetes.io/managed-by";
 const POD_LABEL_MANAGED_BY_VALUE: &str = "sandboxed-sh";
 const STORAGE_CLASS: &str = "harvester";
@@ -60,11 +113,13 @@ const WORKSPACES_VOLUME_SIZE: &str = "20Gi";
 const DOCKER_VOLUME_SIZE: &str = "20Gi";
 const PULL_SECRET_DEFAULT: &str = "nexus-registry";
 
-/// Truncated, dns-1123-safe Pod / PVC / ConfigMap name for a workspace.
-fn k8s_object_name(workspace_id: Uuid, suffix: &str) -> String {
-    // k8s names: max 63 chars, lowercase, [a-z0-9-]. "ws-<uuid>" fits;
+/// Per-mission Pod / PVC / ConfigMap name. Keyed on mission_id, not
+/// workspace_id, since each mission gets its own pod. Prefix `m-`
+/// disambiguates from the old `ws-*` resources during cutover.
+fn k8s_object_name(mission_id: Uuid, suffix: &str) -> String {
+    // k8s names: max 63 chars, lowercase, [a-z0-9-]. "m-<uuid>" fits;
     // suffix lets us derive PVC / ConfigMap names from the same base.
-    let base = format!("ws-{}", workspace_id);
+    let base = format!("m-{}", mission_id);
     if suffix.is_empty() {
         base
     } else {
@@ -72,25 +127,29 @@ fn k8s_object_name(workspace_id: Uuid, suffix: &str) -> String {
     }
 }
 
-fn pod_name(workspace_id: Uuid) -> String {
-    k8s_object_name(workspace_id, "")
+fn pod_name(mission_id: Uuid) -> String {
+    k8s_object_name(mission_id, "")
 }
 
-fn workspaces_pvc_name(workspace_id: Uuid) -> String {
-    k8s_object_name(workspace_id, "workspaces")
+fn workspaces_pvc_name(mission_id: Uuid) -> String {
+    k8s_object_name(mission_id, "workspaces")
 }
 
-fn docker_pvc_name(workspace_id: Uuid) -> String {
-    k8s_object_name(workspace_id, "docker")
+fn docker_pvc_name(mission_id: Uuid) -> String {
+    k8s_object_name(mission_id, "docker")
 }
 
-fn init_configmap_name(workspace_id: Uuid) -> String {
-    k8s_object_name(workspace_id, "init")
+fn init_configmap_name(mission_id: Uuid) -> String {
+    k8s_object_name(mission_id, "init")
 }
 
-fn standard_labels(workspace_id: Uuid) -> BTreeMap<String, String> {
+fn standard_labels(mission_id: Uuid, workspace_id: Uuid) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
-    labels.insert(POD_LABEL_KEY.to_string(), workspace_id.to_string());
+    labels.insert(POD_LABEL_MISSION_KEY.to_string(), mission_id.to_string());
+    labels.insert(
+        POD_LABEL_WORKSPACE_KEY.to_string(),
+        workspace_id.to_string(),
+    );
     labels.insert(
         POD_LABEL_MANAGED_BY_KEY.to_string(),
         POD_LABEL_MANAGED_BY_VALUE.to_string(),
@@ -179,39 +238,53 @@ impl K8sPodClient {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
 
-    /// Create the PVCs + (optional) ConfigMap + Pod for a workspace.
-    /// Idempotent — if the Pod already exists, this is a no-op.
-    pub async fn create_workspace_pod(
+    /// Create the PVCs + (optional) ConfigMap + Pod for a single
+    /// mission. Idempotent — if the Pod already exists, this is a
+    /// no-op so a Stale-write race or a reboot mid-create can re-run
+    /// safely. `workspace_id` is used only for the labels (so a
+    /// dashboard can list "all pods belonging to workspace X").
+    pub async fn create_mission_pod(
         &self,
+        mission_id: Uuid,
         workspace_id: Uuid,
-        init_script: Option<&str>,
         env_vars: &HashMap<String, String>,
+        init_script: Option<&str>,
     ) -> Result<()> {
-        let pod_name = pod_name(workspace_id);
+        let pod_name = pod_name(mission_id);
 
         if self.pods().get_opt(&pod_name).await?.is_some() {
-            tracing::info!(workspace_id = %workspace_id, "Pod already exists, skipping create");
+            tracing::info!(mission_id = %mission_id, "Pod already exists, skipping create");
             return Ok(());
         }
 
         // 1. PVCs
-        self.ensure_pvc(&workspaces_pvc_name(workspace_id), WORKSPACES_VOLUME_SIZE)
+        self.ensure_pvc(&workspaces_pvc_name(mission_id), WORKSPACES_VOLUME_SIZE)
             .await?;
-        self.ensure_pvc(&docker_pvc_name(workspace_id), DOCKER_VOLUME_SIZE)
+        self.ensure_pvc(&docker_pvc_name(mission_id), DOCKER_VOLUME_SIZE)
             .await?;
 
         // 2. ConfigMap (if init script supplied)
         if let Some(script) = init_script {
-            self.ensure_init_configmap(workspace_id, script).await?;
+            self.ensure_init_configmap(mission_id, script).await?;
         }
 
         // 3. Pod
-        let pod = self.build_pod_spec(workspace_id, init_script.is_some(), env_vars);
+        let pod = self.build_pod_spec(
+            mission_id,
+            workspace_id,
+            init_script.is_some(),
+            env_vars,
+        );
         self.pods()
             .create(&PostParams::default(), &pod)
             .await
-            .with_context(|| format!("Failed to create workspace pod {}", pod_name))?;
-        tracing::info!(workspace_id = %workspace_id, pod = %pod_name, "Created workspace pod");
+            .with_context(|| format!("Failed to create mission pod {}", pod_name))?;
+        tracing::info!(
+            mission_id = %mission_id,
+            workspace_id = %workspace_id,
+            pod = %pod_name,
+            "Created mission pod"
+        );
         Ok(())
     }
 
@@ -246,19 +319,18 @@ impl K8sPodClient {
     }
 
     /// Public alias of `ensure_init_configmap` so the rerun-init
-    /// handler can refresh a workspace's stored init.sh without
-    /// going through full create_workspace_pod (which would also
-    /// try to create the pod).
+    /// handler can refresh a mission's stored init.sh without
+    /// going through full create_mission_pod.
     pub async fn ensure_init_configmap_public(
         &self,
-        workspace_id: Uuid,
+        mission_id: Uuid,
         script: &str,
     ) -> Result<()> {
-        self.ensure_init_configmap(workspace_id, script).await
+        self.ensure_init_configmap(mission_id, script).await
     }
 
-    async fn ensure_init_configmap(&self, workspace_id: Uuid, script: &str) -> Result<()> {
-        let name = init_configmap_name(workspace_id);
+    async fn ensure_init_configmap(&self, mission_id: Uuid, script: &str) -> Result<()> {
+        let name = init_configmap_name(mission_id);
         let mut data = BTreeMap::new();
         data.insert("init.sh".to_string(), script.to_string());
         let cm = ConfigMap {
@@ -287,6 +359,7 @@ impl K8sPodClient {
 
     fn build_pod_spec(
         &self,
+        mission_id: Uuid,
         workspace_id: Uuid,
         with_init_script: bool,
         env_vars: &HashMap<String, String>,
@@ -295,7 +368,7 @@ impl K8sPodClient {
             Volume {
                 name: "workspaces".to_string(),
                 persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                    claim_name: workspaces_pvc_name(workspace_id),
+                    claim_name: workspaces_pvc_name(mission_id),
                     read_only: Some(false),
                 }),
                 ..Default::default()
@@ -303,7 +376,7 @@ impl K8sPodClient {
             Volume {
                 name: "docker".to_string(),
                 persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                    claim_name: docker_pvc_name(workspace_id),
+                    claim_name: docker_pvc_name(mission_id),
                     read_only: Some(false),
                 }),
                 ..Default::default()
@@ -327,7 +400,7 @@ impl K8sPodClient {
             volumes.push(Volume {
                 name: "init-script".to_string(),
                 config_map: Some(ConfigMapVolumeSource {
-                    name: init_configmap_name(workspace_id),
+                    name: init_configmap_name(mission_id),
                     default_mode: Some(0o755),
                     items: Some(vec![KeyToPath {
                         key: "init.sh".to_string(),
@@ -398,7 +471,10 @@ impl K8sPodClient {
         let container = Container {
             name: "workspace".to_string(),
             image: Some(self.image.clone()),
-            image_pull_policy: Some("Always".to_string()),
+            // IfNotPresent: once the node has the workspace-base image
+            // cached, every subsequent mission on that node skips the
+            // 30-60s pull. First mission per node still pays the cost.
+            image_pull_policy: Some("IfNotPresent".to_string()),
             env: if env_list.is_empty() {
                 None
             } else {
@@ -419,9 +495,9 @@ impl K8sPodClient {
 
         Pod {
             metadata: ObjectMeta {
-                name: Some(pod_name(workspace_id)),
+                name: Some(pod_name(mission_id)),
                 namespace: Some(self.namespace.clone()),
-                labels: Some(standard_labels(workspace_id)),
+                labels: Some(standard_labels(mission_id, workspace_id)),
                 ..Default::default()
             },
             spec: Some(PodSpec {
@@ -446,8 +522,8 @@ impl K8sPodClient {
     /// Wait for the Pod to reach `Running` phase. Times out after
     /// `timeout` and returns the last phase + most recent event for
     /// diagnostics.
-    pub async fn wait_for_ready(&self, workspace_id: Uuid, timeout: Duration) -> Result<()> {
-        let pod_name = pod_name(workspace_id);
+    pub async fn wait_for_ready(&self, mission_id: Uuid, timeout: Duration) -> Result<()> {
+        let pod_name = pod_name(mission_id);
         let start = Instant::now();
         loop {
             let pod = self
@@ -493,13 +569,13 @@ impl K8sPodClient {
     /// `workspace_exec.rs::output()` can use it as a drop-in.
     pub async fn exec_command(
         &self,
-        workspace_id: Uuid,
+        mission_id: Uuid,
         cwd: Option<&Path>,
         program: &str,
         args: &[String],
         env: &HashMap<String, String>,
     ) -> Result<Output> {
-        let pod_name = pod_name(workspace_id);
+        let pod_name = pod_name(mission_id);
 
         // Build a shell command line so we can `mkdir -p <cwd> && cd
         // <cwd> && <env...> <program> <args...>` in a single `exec`
@@ -526,7 +602,7 @@ impl K8sPodClient {
         }
 
         tracing::debug!(
-            workspace_id = %workspace_id,
+            mission_id = %mission_id,
             pod = %pod_name,
             cmd = %shell_cmd,
             "k8s_pod exec_command via kubectl"
@@ -577,7 +653,7 @@ impl K8sPodClient {
         let exit_code = output.status.code().unwrap_or(1);
 
         tracing::debug!(
-            workspace_id = %workspace_id,
+            mission_id = %mission_id,
             pod = %pod_name,
             exit = exit_code,
             stdout_len = output.stdout.len(),
@@ -595,21 +671,25 @@ impl K8sPodClient {
         })
     }
 
-    /// Delete the Pod + both PVCs + the ConfigMap. Idempotent.
-    pub async fn destroy_workspace_pod(&self, workspace_id: Uuid) -> Result<()> {
+    /// Delete the mission's Pod + both PVCs + the ConfigMap.
+    /// Idempotent — missing resources are no-ops. Subsumes the
+    /// previous `cleanup_mission_in_pod` since the pod itself is now
+    /// per-mission (no need to compose-down inside it; just kill the
+    /// pod and the containers go with it).
+    pub async fn destroy_mission_pod(&self, mission_id: Uuid) -> Result<()> {
         let mut errs: Vec<String> = Vec::new();
         let dp = DeleteParams {
             grace_period_seconds: Some(5),
             ..Default::default()
         };
-        if let Err(e) = self.pods().delete(&pod_name(workspace_id), &dp).await {
+        if let Err(e) = self.pods().delete(&pod_name(mission_id), &dp).await {
             if !is_404(&e) {
                 errs.push(format!("delete pod: {}", e));
             }
         }
         if let Err(e) = self
             .cms()
-            .delete(&init_configmap_name(workspace_id), &DeleteParams::default())
+            .delete(&init_configmap_name(mission_id), &DeleteParams::default())
             .await
         {
             if !is_404(&e) {
@@ -617,8 +697,8 @@ impl K8sPodClient {
             }
         }
         for pvc in [
-            workspaces_pvc_name(workspace_id),
-            docker_pvc_name(workspace_id),
+            workspaces_pvc_name(mission_id),
+            docker_pvc_name(mission_id),
         ] {
             if let Err(e) = self.pvcs().delete(&pvc, &DeleteParams::default()).await {
                 if !is_404(&e) {
@@ -626,6 +706,11 @@ impl K8sPodClient {
                 }
             }
         }
+        tracing::info!(
+            mission_id = %mission_id,
+            errs = errs.len(),
+            "destroy_mission_pod done"
+        );
         if errs.is_empty() {
             Ok(())
         } else {
@@ -637,10 +722,10 @@ impl K8sPodClient {
     /// readiness. Returns (status, optional error message).
     pub async fn pod_status(
         &self,
-        workspace_id: Uuid,
+        mission_id: Uuid,
     ) -> Result<(crate::workspace::WorkspaceStatus, Option<String>)> {
         use crate::workspace::WorkspaceStatus;
-        let pod = match self.pods().get_opt(&pod_name(workspace_id)).await? {
+        let pod = match self.pods().get_opt(&pod_name(mission_id)).await? {
             Some(p) => p,
             None => return Ok((WorkspaceStatus::Pending, None)),
         };
@@ -669,12 +754,12 @@ impl K8sPodClient {
         Ok((status, err))
     }
 
-    /// Read the init-log file the workspace's entrypoint writes to
+    /// Read the init-log file the mission's entrypoint writes to
     /// `/workspaces/.init.log` on first start.
-    pub async fn read_init_log(&self, workspace_id: Uuid) -> Result<String> {
+    pub async fn read_init_log(&self, mission_id: Uuid) -> Result<String> {
         let out = self
             .exec_command(
-                workspace_id,
+                mission_id,
                 None,
                 "/bin/sh",
                 &[
@@ -700,7 +785,7 @@ impl K8sPodClient {
     /// `repos.json` write) keeps working unchanged.
     pub async fn clone_repos_in_pod(
         &self,
-        workspace_id: Uuid,
+        mission_id: Uuid,
         selections: &[crate::api::github_app::RepoSelection],
         token: &str,
         pod_dest_root: &Path,
@@ -716,7 +801,7 @@ impl K8sPodClient {
         let mkdir_cmd = format!("mkdir -p {}", shell_quote(&repos_root.to_string_lossy()));
         let _ = self
             .exec_command(
-                workspace_id,
+                mission_id,
                 None,
                 "/bin/sh",
                 &["-lc".to_string(), mkdir_cmd],
@@ -738,7 +823,7 @@ impl K8sPodClient {
             // host-side clone_repos: don't clobber, treat as success.
             let probe = self
                 .exec_command(
-                    workspace_id,
+                    mission_id,
                     None,
                     "/bin/sh",
                     &[
@@ -773,7 +858,7 @@ impl K8sPodClient {
 
             match self
                 .exec_command(
-                    workspace_id,
+                    mission_id,
                     None,
                     "/bin/sh",
                     &["-lc".to_string(), clone_cmd],
@@ -783,7 +868,7 @@ impl K8sPodClient {
             {
                 Ok(out) if out.status.success() => {
                     tracing::info!(
-                        workspace_id = %workspace_id,
+                        mission_id = %mission_id,
                         repo = %sel.full_name,
                         path = %target_str,
                         "GitHub App clone OK (in-pod)"
@@ -800,7 +885,7 @@ impl K8sPodClient {
                     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
                     let redacted = stderr.replace(token, "***");
                     tracing::warn!(
-                        workspace_id = %workspace_id,
+                        mission_id = %mission_id,
                         repo = %sel.full_name,
                         status = ?out.status,
                         stderr = %redacted,
@@ -816,7 +901,7 @@ impl K8sPodClient {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        workspace_id = %workspace_id,
+                        mission_id = %mission_id,
                         repo = %sel.full_name,
                         error = %e,
                         "GitHub App clone errored (in-pod kubectl exec)"
@@ -835,71 +920,175 @@ impl K8sPodClient {
         results
     }
 
-    /// Clean up a single mission's footprint inside the workspace
-    /// pod: tears down any docker compose stacks the mission's
-    /// auto-stack hook started, then deletes the per-mission
-    /// directory on the workspaces PVC. Called from the
-    /// `delete_mission` API handler and from
-    /// `mission_workspace_gc::run_once` so neither path leaks
-    /// running containers or PVC space when the mission goes away.
-    ///
-    /// Idempotent — missing dirs / dead pods are no-ops.
-    pub async fn cleanup_mission_in_pod(&self, workspace_id: Uuid, mission_id: Uuid) -> Result<()> {
-        // Mission dirs use the short (first 8 chars) UUID; see
-        // `workspace::mission_workspace_dir_for_root`. The previous
-        // version used the full UUID, so `rm -rf` quietly succeeded
-        // against a path that didn't exist and left the real
-        // `mission-<short>` dir behind.
-        let mission_dir = format!("/workspaces/mission-{}", &mission_id.to_string()[..8]);
-        // Confirm the pod is reachable before issuing exec. If it's
-        // gone (workspace destroyed already), there's nothing to do.
-        if self
-            .pods()
-            .get_opt(&pod_name(workspace_id))
-            .await?
-            .is_none()
-        {
-            return Ok(());
+    /// Stream pod-startup phase events for a mission. Polls the
+    /// Pod + its kubelet/scheduler events at 1Hz, yielding one
+    /// `PodStartupEvent` per observed phase transition. Closes the
+    /// stream when the pod reaches `Ready` or `Error`. Dashboard's
+    /// SSE relay forwards each event to the browser so the user
+    /// sees a live "Pulling image…" / "Container starting…" /
+    /// "init.sh running…" progress instead of a silent 30-90s wait.
+    pub fn stream_pod_startup_events(
+        self: std::sync::Arc<Self>,
+        mission_id: Uuid,
+    ) -> impl futures::Stream<Item = PodStartupEvent> + Send + 'static {
+        async_stream::stream! {
+            let pod_name = pod_name(mission_id);
+            let mut last_emitted: Option<PodStartupEvent> = None;
+            let deadline = std::time::Instant::now() + Duration::from_secs(180);
+            let yield_if_new = |evt: PodStartupEvent, last: &mut Option<PodStartupEvent>| {
+                let new = last.as_ref() != Some(&evt);
+                if new { *last = Some(evt.clone()); }
+                new
+            };
+            loop {
+                if std::time::Instant::now() > deadline {
+                    yield PodStartupEvent::Error {
+                        message: format!("Pod {} did not reach Ready within 180s", pod_name),
+                    };
+                    return;
+                }
+                let pod_opt = self.pods().get_opt(&pod_name).await.ok().flatten();
+                let evt = match pod_opt.as_ref() {
+                    None => PodStartupEvent::PvcBinding,
+                    Some(pod) => {
+                        let phase = pod
+                            .status
+                            .as_ref()
+                            .and_then(|s| s.phase.as_deref())
+                            .unwrap_or("Pending");
+                        let scheduled = pod
+                            .status
+                            .as_ref()
+                            .and_then(|s| s.conditions.as_ref())
+                            .and_then(|cc| {
+                                cc.iter().find(|c| c.type_ == "PodScheduled")
+                            })
+                            .map(|c| c.status == "True")
+                            .unwrap_or(false);
+                        let cs = pod
+                            .status
+                            .as_ref()
+                            .and_then(|s| s.container_statuses.as_ref())
+                            .and_then(|v| v.first());
+                        let ready = cs.map(|c| c.ready).unwrap_or(false);
+                        let waiting_reason = cs
+                            .and_then(|c| c.state.as_ref())
+                            .and_then(|s| s.waiting.as_ref())
+                            .and_then(|w| w.reason.as_deref());
+                        let waiting_msg = cs
+                            .and_then(|c| c.state.as_ref())
+                            .and_then(|s| s.waiting.as_ref())
+                            .and_then(|w| w.message.as_deref())
+                            .unwrap_or("");
+
+                        if phase == "Failed" {
+                            PodStartupEvent::Error {
+                                message: pod
+                                    .status
+                                    .as_ref()
+                                    .and_then(|s| s.message.clone())
+                                    .unwrap_or_else(|| "pod entered Failed phase".to_string()),
+                            }
+                        } else if ready {
+                            // ready=true → past container start. If
+                            // init.sh sentinel is missing AND the
+                            // workspace has an init script mounted,
+                            // we'd treat that as InitScriptRunning,
+                            // but for simplicity we let entrypoint.sh
+                            // block on it; once container is Ready
+                            // the entrypoint has reached `sleep
+                            // infinity` and the agent can exec.
+                            PodStartupEvent::Ready
+                        } else if let Some(reason) = waiting_reason {
+                            // kubelet's standard reasons:
+                            //   ContainerCreating, PodInitializing,
+                            //   ImagePullBackOff, ErrImagePull, Pulling
+                            match reason {
+                                "Pulling" => PodStartupEvent::Pulling {
+                                    image: waiting_msg.to_string(),
+                                },
+                                "ContainerCreating" | "PodInitializing" => {
+                                    PodStartupEvent::ContainerStarting
+                                }
+                                "ImagePullBackOff" | "ErrImagePull" => PodStartupEvent::Error {
+                                    message: format!("{}: {}", reason, waiting_msg),
+                                },
+                                "CrashLoopBackOff" => PodStartupEvent::Error {
+                                    message: format!("CrashLoopBackOff: {}", waiting_msg),
+                                },
+                                _ => PodStartupEvent::ContainerStarting,
+                            }
+                        } else if !scheduled {
+                            PodStartupEvent::PodScheduled
+                        } else if phase == "Pending" {
+                            PodStartupEvent::PodScheduled
+                        } else {
+                            PodStartupEvent::ContainerStarting
+                        }
+                    }
+                };
+                let is_terminal = matches!(evt, PodStartupEvent::Ready | PodStartupEvent::Error { .. });
+                if yield_if_new(evt.clone(), &mut last_emitted) {
+                    yield evt;
+                }
+                if is_terminal {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            }
         }
-        // Single bash to: stop every compose stack the mission
-        // started, then rm -rf the mission dir. `2>&1 | head` keeps
-        // output bounded; failures inside the loop don't stop the
-        // rm.
-        let cmd = format!(
-            r#"set +e; \
-               for d in {mdir}/repos/*/; do \
-                 [ -f "$d/docker-compose.yml" ] || [ -f "$d/compose.yml" ] || continue; \
-                 echo "[cleanup] compose down: $d" >&2; \
-                 (cd "$d" && docker compose down -v --remove-orphans --timeout 10 2>&1 | head -40) >&2; \
-               done; \
-               rm -rf {mdir}; \
-               echo "[cleanup] removed {mdir}" >&2"#,
-            mdir = mission_dir
-        );
-        let out = self
-            .exec_command(
-                workspace_id,
-                None,
-                "/bin/bash",
-                &["-lc".to_string(), cmd],
-                &HashMap::new(),
-            )
-            .await?;
-        tracing::info!(
-            workspace_id = %workspace_id,
-            mission_id = %mission_id,
-            exit = ?out.status.code(),
-            stderr_sample = %String::from_utf8_lossy(&out.stderr[..out.stderr.len().min(400)]),
-            "k8s_pod cleanup_mission_in_pod done"
-        );
-        Ok(())
     }
 
-    /// Re-run the workspace's init.sh (after the operator edits the
+    /// One-shot startup cleanup. Scans the namespace for leftover
+    /// per-workspace pods (`ws-*`) from the old workspace-per-pod
+    /// model + deletes each with its PVCs and ConfigMap. Called from
+    /// `routes.rs` right after `K8sPodClient::try_init`. Idempotent;
+    /// missing resources are no-ops.
+    pub async fn gc_orphaned_workspace_pods(&self) -> Result<usize> {
+        use kube::api::ListParams;
+        let lp = ListParams::default()
+            .labels("app.kubernetes.io/managed-by=sandboxed-sh");
+        let pods = self.pods().list(&lp).await?;
+        let mut removed = 0usize;
+        let dp = DeleteParams {
+            grace_period_seconds: Some(5),
+            ..Default::default()
+        };
+        for pod in pods.items {
+            let name = pod.metadata.name.unwrap_or_default();
+            if !name.starts_with("ws-") {
+                continue;
+            }
+            let _ = self.pods().delete(&name, &dp).await;
+            // Best-effort sibling PVC + ConfigMap cleanup. The old
+            // workspace_id-keyed PVCs were named
+            // `ws-<uuid>-workspaces` / `ws-<uuid>-docker` and the
+            // ConfigMap was `ws-<uuid>-init`.
+            let base = &name; // = `ws-<uuid>`
+            let _ = self
+                .cms()
+                .delete(&format!("{}-init", base), &DeleteParams::default())
+                .await;
+            for suf in ["workspaces", "docker"] {
+                let _ = self
+                    .pvcs()
+                    .delete(&format!("{}-{}", base, suf), &DeleteParams::default())
+                    .await;
+            }
+            removed += 1;
+            tracing::info!(pod = %name, "gc_orphaned_workspace_pods: removed");
+        }
+        if removed > 0 {
+            tracing::info!(removed = removed, "gc_orphaned_workspace_pods done");
+        }
+        Ok(removed)
+    }
+
+    /// Re-run the mission's init.sh (after the operator edits the
     /// ConfigMap or wants to retry a failed init).
-    pub async fn rerun_init(&self, workspace_id: Uuid) -> Result<Output> {
+    pub async fn rerun_init(&self, mission_id: Uuid) -> Result<Output> {
         self.exec_command(
-            workspace_id,
+            mission_id,
             None,
             "/bin/bash",
             &[

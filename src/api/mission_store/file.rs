@@ -152,6 +152,8 @@ impl MissionStore for FileMissionStore {
             goal_objective: None,
             first_viewed_at: None,
             initial_repos: initial_repos.to_vec(),
+            pod_phase: None,
+            pod_message: None,
         };
         self.missions
             .write()

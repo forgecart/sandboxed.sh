@@ -124,21 +124,20 @@ pub async fn run_once(state: &Arc<AppState>, cutoff: DateTime<Utc>) -> SweepRepo
                     Some(ws) => ws,
                     None => continue,
                 };
-                // K8sPod workspaces: mission dirs live on the
-                // workspace pod's PVC, not the control plane's
-                // filesystem. Route the cleanup through the pod
-                // (also tears down any compose stacks the mission
-                // started so the pod doesn't leak running
-                // containers).
+                // K8sPod workspaces: each mission has its own pod
+                // (since the mission-per-pod cutover). The whole pod
+                // + its 2 PVCs + ConfigMap go away with one delete
+                // — much cleaner than the old in-pod compose-down +
+                // rm-rf.
                 if ws.workspace_type == workspace::WorkspaceType::K8sPod {
                     if let Some(k8s) = crate::k8s_pod::global_client() {
-                        match k8s.cleanup_mission_in_pod(workspace_id, mission.id).await {
+                        match k8s.destroy_mission_pod(mission.id).await {
                             Ok(()) => {
                                 report.removed += 1;
                                 tracing::info!(
                                     mission_id = %mission.id,
                                     workspace_id = %workspace_id,
-                                    "mission GC: removed in-pod mission dir + stopped compose stacks",
+                                    "mission GC: destroyed mission pod + PVCs",
                                 );
                             }
                             Err(err) => {
@@ -147,7 +146,7 @@ pub async fn run_once(state: &Arc<AppState>, cutoff: DateTime<Utc>) -> SweepRepo
                                     mission_id = %mission.id,
                                     workspace_id = %workspace_id,
                                     ?err,
-                                    "mission GC: in-pod cleanup failed",
+                                    "mission GC: destroy_mission_pod failed",
                                 );
                             }
                         }

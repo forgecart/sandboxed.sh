@@ -2760,6 +2760,15 @@ pub enum AgentEvent {
         metadata_model: Option<String>,
         metadata_version: Option<String>,
     },
+    /// K8sPod backend: mission pod boot is in progress. Emitted as
+    /// the pod walks through PvcBinding -> ... -> Ready (or Error).
+    /// Dashboard renders a live spinner with the latest message
+    /// while `phase != "ready"` and clears it once the agent runs.
+    MissionPodStartup {
+        mission_id: Uuid,
+        phase: String,
+        message: String,
+    },
     /// Mission run settings changed (backend/model/agent/config profile)
     MissionSettingsUpdated {
         mission_id: Uuid,
@@ -2925,6 +2934,7 @@ impl AgentEvent {
             AgentEvent::MissionActivity { .. } => "mission_activity",
             AgentEvent::MissionTitleChanged { .. } => "mission_title_changed",
             AgentEvent::MissionMetadataUpdated { .. } => "mission_metadata_updated",
+            AgentEvent::MissionPodStartup { .. } => "mission_pod_startup",
             AgentEvent::MissionSettingsUpdated { .. } => "mission_settings_updated",
             AgentEvent::FidoSignRequest { .. } => "fido_sign_request",
             AgentEvent::GoalIteration { .. } => "goal_iteration",
@@ -2951,6 +2961,7 @@ impl AgentEvent {
             AgentEvent::MissionActivity { mission_id, .. } => *mission_id,
             AgentEvent::MissionTitleChanged { mission_id, .. } => Some(*mission_id),
             AgentEvent::MissionMetadataUpdated { mission_id, .. } => Some(*mission_id),
+            AgentEvent::MissionPodStartup { mission_id, .. } => Some(*mission_id),
             AgentEvent::MissionSettingsUpdated { mission_id, .. } => Some(*mission_id),
             AgentEvent::FidoSignRequest { .. } => None,
             AgentEvent::GoalIteration { mission_id, .. } => *mission_id,
@@ -5184,12 +5195,12 @@ pub async fn delete_mission(
                 if let Some(k8s) = crate::k8s_pod::global_client() {
                     let workspace_id = ws.id;
                     tokio::spawn(async move {
-                        if let Err(e) = k8s.cleanup_mission_in_pod(workspace_id, mission_id).await {
+                        if let Err(e) = k8s.destroy_mission_pod(mission_id).await {
                             tracing::warn!(
                                 mission_id = %mission_id,
                                 workspace_id = %workspace_id,
                                 error = %e,
-                                "K8sPod mission cleanup failed (leaving for GC sweep)"
+                                "K8sPod mission pod destroy failed (leaving for GC sweep)"
                             );
                         }
                     });
@@ -8480,6 +8491,105 @@ async fn control_actor_loop(
             .await
     }
 
+    /// For K8sPod workspaces, kick off eager pod creation + the
+    /// startup-event stream so the dashboard can render live phase
+    /// progress while the pod boots. No-op for nspawn / Host
+    /// workspaces. Best-effort: failures log + transition mission
+    /// to Error, but don't block the calling thread.
+    fn spawn_mission_pod_bootstrap(
+        mission: &Mission,
+        workspaces: &workspace::SharedWorkspaceStore,
+        mission_store: &Arc<dyn MissionStore>,
+        events_tx: &broadcast::Sender<AgentEvent>,
+    ) {
+        let mission_id = mission.id;
+        let workspace_id = mission.workspace_id;
+        let workspaces = workspaces.clone();
+        let mission_store = mission_store.clone();
+        let events_tx = events_tx.clone();
+        tokio::spawn(async move {
+            let ws = match workspaces.get(workspace_id).await {
+                Some(w) => w,
+                None => {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        workspace_id = %workspace_id,
+                        "spawn_mission_pod_bootstrap: workspace not found"
+                    );
+                    return;
+                }
+            };
+            if ws.workspace_type != workspace::WorkspaceType::K8sPod {
+                return;
+            }
+            let k8s = match crate::k8s_pod::global_client() {
+                Some(c) => c,
+                None => {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        "spawn_mission_pod_bootstrap: k8s_pod backend unavailable"
+                    );
+                    return;
+                }
+            };
+
+            // Trigger create (idempotent if a previous run already
+            // started it) and stream phase events.
+            let create_outcome = k8s
+                .create_mission_pod(
+                    mission_id,
+                    workspace_id,
+                    &ws.env_vars,
+                    ws.init_script.as_deref(),
+                )
+                .await;
+            if let Err(e) = create_outcome {
+                tracing::error!(
+                    mission_id = %mission_id,
+                    error = %e,
+                    "create_mission_pod failed"
+                );
+                let _ = mission_store
+                    .update_mission_pod_phase(
+                        mission_id,
+                        Some("error"),
+                        Some(&format!("create_mission_pod: {}", e)),
+                    )
+                    .await;
+                return;
+            }
+
+            use futures::StreamExt;
+            let stream = k8s.clone().stream_pod_startup_events(mission_id);
+            futures::pin_mut!(stream);
+            while let Some(event) = stream.next().await {
+                let phase = event.phase_id();
+                let message = event.message();
+                let _ = mission_store
+                    .update_mission_pod_phase(mission_id, Some(phase), Some(&message))
+                    .await;
+                // Best-effort broadcast on the existing SSE channel
+                // so live dashboards see the progress without
+                // polling. Wrapped in a `Pong`-shaped no-op JSON
+                // payload — picked the simplest existing variant
+                // that carries arbitrary string data.
+                let _ = events_tx.send(AgentEvent::MissionPodStartup {
+                    mission_id,
+                    phase: phase.to_string(),
+                    message,
+                });
+                if matches!(
+                    event,
+                    crate::k8s_pod::PodStartupEvent::Ready
+                        | crate::k8s_pod::PodStartupEvent::Error { .. }
+                ) {
+                    break;
+                }
+            }
+            tracing::info!(mission_id = %mission_id, "mission pod bootstrap finished");
+        });
+    }
+
     // Helper to validate and prepare an interrupted or blocked mission for resume.
     async fn resume_mission_impl(
         mission_store: &Arc<dyn MissionStore>,
@@ -9189,6 +9299,13 @@ async fn control_actor_loop(
                                 ).await {
                                     tracing::warn!("Failed to write runtime workspace state on create: {}", e);
                                 }
+
+                                // For K8sPod workspaces, start the
+                                // mission's pod NOW (eager) so the
+                                // dashboard can render live boot
+                                // progress while the user composes
+                                // their first message.
+                                spawn_mission_pod_bootstrap(&mission, &workspaces, &mission_store, &events_tx);
 
                                 let _ = respond.send(Ok(mission));
                             }
@@ -11384,31 +11501,28 @@ async fn run_single_control_turn(
                 .map(|w| w.workspace_type == workspace::WorkspaceType::K8sPod)
                 .unwrap_or(false);
             let results = if is_k8s_pod {
-                if let Some(k8s) = crate::k8s_pod::global_client() {
+                if let (Some(k8s), Some(mid)) = (crate::k8s_pod::global_client(), mission_id) {
+                    // Wait for the per-mission pod (which
+                    // `spawn_mission_pod_bootstrap` started eagerly
+                    // at create time) before attempting the clone.
+                    if let Err(e) = k8s
+                        .wait_for_ready(mid, std::time::Duration::from_secs(180))
+                        .await
+                    {
+                        tracing::warn!(
+                            mission_id = %mid,
+                            error = %e,
+                            "wait_for_ready before clone failed; clone will likely error"
+                        );
+                    }
                     match client.installation_token().await {
                         Ok(token) => {
-                            let ws_id = runtime_workspace
-                                .as_ref()
-                                .map(|w| w.id)
-                                .expect("k8s_pod path requires a workspace");
-                            // Translate host mission dir to the pod's
-                            // /workspaces/mission-<id> path. Strip the
-                            // workspace.path prefix and the leading
-                            // `workspaces/` segment (same logic as the
-                            // exec dispatcher in workspace_exec.rs).
-                            let pod_dir = runtime_workspace
-                                .as_ref()
-                                .and_then(|w| working_dir_path.strip_prefix(&w.path).ok())
-                                .map(|rel| {
-                                    let trimmed = rel.strip_prefix("workspaces").unwrap_or(rel);
-                                    if trimmed.as_os_str().is_empty() {
-                                        std::path::PathBuf::from("/workspaces")
-                                    } else {
-                                        std::path::PathBuf::from("/workspaces").join(trimmed)
-                                    }
-                                })
-                                .unwrap_or_else(|| std::path::PathBuf::from("/workspaces"));
-                            k8s.clone_repos_in_pod(ws_id, &initial_repos, &token, &pod_dir)
+                            // Per-mission pod: /workspaces IS the
+                            // mission's workspace root (no mission-X
+                            // subdir inside the pod). Repos land at
+                            // /workspaces/repos/<name>.
+                            let pod_dir = std::path::PathBuf::from("/workspaces");
+                            k8s.clone_repos_in_pod(mid, &initial_repos, &token, &pod_dir)
                                 .await
                         }
                         Err(e) => {
@@ -11418,7 +11532,7 @@ async fn run_single_control_turn(
                     }
                 } else {
                     tracing::warn!(
-                        "k8s_pod workspace has initial_repos but K8sPodClient is unavailable; skipping clone"
+                        "k8s_pod workspace has initial_repos but k8s client or mission_id is unavailable; skipping clone"
                     );
                     Vec::new()
                 }
@@ -17440,6 +17554,8 @@ And the report:
             goal_objective: None,
             first_viewed_at: None,
             initial_repos: Vec::new(),
+            pod_phase: None,
+            pod_message: None,
         };
         let weak = Mission {
             id: Uuid::new_v4(),
@@ -17472,6 +17588,8 @@ And the report:
             goal_objective: None,
             first_viewed_at: None,
             initial_repos: Vec::new(),
+            pod_phase: None,
+            pod_message: None,
         };
 
         let strong_score = mission_search_relevance_score(
@@ -17519,6 +17637,8 @@ And the report:
             goal_objective: None,
             first_viewed_at: None,
             initial_repos: Vec::new(),
+            pod_phase: None,
+            pod_message: None,
         };
 
         let score = mission_search_relevance_score(
@@ -17563,6 +17683,8 @@ And the report:
             goal_objective: None,
             first_viewed_at: None,
             initial_repos: Vec::new(),
+            pod_phase: None,
+            pod_message: None,
         };
 
         let score = mission_search_relevance_score(
@@ -17607,6 +17729,8 @@ And the report:
             goal_objective: None,
             first_viewed_at: None,
             initial_repos: Vec::new(),
+            pod_phase: None,
+            pod_message: None,
         };
 
         let score = mission_search_relevance_score(
@@ -17651,6 +17775,8 @@ And the report:
             goal_objective: None,
             first_viewed_at: None,
             initial_repos: Vec::new(),
+            pod_phase: None,
+            pod_message: None,
         };
 
         let score = mission_search_relevance_score(
@@ -17779,6 +17905,8 @@ And the report:
             goal_objective: None,
             first_viewed_at: None,
             initial_repos: Vec::new(),
+            pod_phase: None,
+            pod_message: None,
         };
         let before = mission_search_freshness_key(
             &[MissionSearchCandidate {

@@ -74,6 +74,14 @@ export interface Mission {
   goal_objective?: string | null;
   /** Repos this mission was created with (from the GitHub-App picker). */
   initial_repos?: RepoSelection[];
+  /** K8sPod backend only: latest pod-startup phase
+   * ("pvc_binding" | "pod_scheduled" | "pulling" | "pulled" |
+   * "container_starting" | "container_ready" | "init_script_running" |
+   * "ready" | "error"). Surfaced while the mission is still `pending`. */
+  pod_phase?: string | null;
+  /** Human-readable detail accompanying `pod_phase` — e.g. image
+   * being pulled, or the kube event message on `error`. */
+  pod_message?: string | null;
 }
 
 export interface StoredEvent {

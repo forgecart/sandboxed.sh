@@ -1920,6 +1920,27 @@ impl SqliteMissionStore {
                 .map_err(|e| format!("Failed to add initial_repos column: {}", e))?;
         }
 
+        // pod_phase / pod_message: K8sPod backend's per-mission pod
+        // startup progress. Written by the pod-startup broadcaster as
+        // the pod boots through PvcBinding -> ... -> Ready. NULL once
+        // the pod is up and the agent is running (or always NULL for
+        // nspawn / Host missions).
+        for col in ["pod_phase", "pod_message"] {
+            let exists: bool = conn
+                .prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('missions') WHERE name = '{}'",
+                    col
+                ))
+                .map_err(|e| format!("Failed to check for {} column: {}", col, e))?
+                .exists([])
+                .map_err(|e| format!("Failed to query table info: {}", e))?;
+            if !exists {
+                tracing::info!("Running migration: adding '{}' column to missions table", col);
+                conn.execute(&format!("ALTER TABLE missions ADD COLUMN {} TEXT", col), [])
+                    .map_err(|e| format!("Failed to add {} column: {}", col, e))?;
+            }
+        }
+
         Ok(())
     }
 
@@ -2278,6 +2299,8 @@ impl MissionStore for SqliteMissionStore {
                                 .flatten()
                                 .and_then(|s| serde_json::from_str(&s).ok())
                                 .unwrap_or_default(),
+                            pod_phase: None,
+                            pod_message: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2363,6 +2386,8 @@ impl MissionStore for SqliteMissionStore {
                                 .flatten()
                                 .and_then(|s| serde_json::from_str(&s).ok())
                                 .unwrap_or_default(),
+                            pod_phase: None,
+                            pod_message: None,
                     })
                 })
                 .optional()
@@ -2493,6 +2518,8 @@ impl MissionStore for SqliteMissionStore {
             goal_objective: None,
             first_viewed_at: None,
             initial_repos: initial_repos_vec,
+            pod_phase: None,
+            pod_message: None,
         };
 
         let m = mission.clone();
@@ -2589,6 +2616,8 @@ impl MissionStore for SqliteMissionStore {
                                 .flatten()
                                 .and_then(|s| serde_json::from_str(&s).ok())
                                 .unwrap_or_default(),
+                            pod_phase: None,
+                            pod_message: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2996,6 +3025,28 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn update_mission_pod_phase(
+        &self,
+        id: Uuid,
+        phase: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let phase = phase.map(|s| s.to_string());
+        let message = message.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE missions SET pod_phase = ?1, pod_message = ?2 WHERE id = ?3",
+                params![phase, message, id.to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn update_mission_tree(&self, id: Uuid, tree: &AgentTreeNode) -> Result<(), String> {
         let conn = self.conn.clone();
         let now = now_string();
@@ -3188,6 +3239,8 @@ impl MissionStore for SqliteMissionStore {
                         goal_objective: None,
                         first_viewed_at: None,
                         initial_repos: Vec::new(),
+                        pod_phase: None,
+                        pod_message: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -3263,6 +3316,8 @@ impl MissionStore for SqliteMissionStore {
                         goal_objective: row.get(15).ok().flatten(),
                         first_viewed_at: None,
                         initial_repos: Vec::new(),
+                        pod_phase: None,
+                        pod_message: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -3667,6 +3722,7 @@ impl MissionStore for SqliteMissionStore {
             | AgentEvent::SessionIdUpdate { .. }
             | AgentEvent::MissionActivity { .. }
             | AgentEvent::MissionTitleChanged { .. }
+            | AgentEvent::MissionPodStartup { .. }
             | AgentEvent::FidoSignRequest { .. } => return Ok(()),
         };
 
@@ -5240,6 +5296,8 @@ impl MissionStore for SqliteMissionStore {
                         goal_objective: None,
                         first_viewed_at: None,
                         initial_repos: Vec::new(),
+                        pod_phase: None,
+                        pod_message: None,
                     })
                 })
                 .map_err(|e| e.to_string())?

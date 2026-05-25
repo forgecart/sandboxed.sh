@@ -110,6 +110,19 @@ pub struct Mission {
     /// historically.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub initial_repos: Vec<crate::api::github_app::RepoSelection>,
+    /// K8sPod backend only: short phase identifier for the mission's
+    /// pod boot (`pvc_binding`, `pod_scheduled`, `pulling`,
+    /// `container_starting`, `container_ready`, `ready`, `error`).
+    /// `None` for nspawn / Host missions, and for K8sPod missions that
+    /// have reached `ready` (the field is cleared after the agent
+    /// successfully runs its first turn so the dashboard stops
+    /// rendering the progress spinner).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_phase: Option<String>,
+    /// K8sPod backend only: most recent human-readable message for
+    /// the pod-startup phase. Empty when the workspace is up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_message: Option<String>,
 }
 
 fn default_backend() -> String {
@@ -1097,6 +1110,22 @@ pub trait MissionStore: Send + Sync {
         goal_mode: bool,
         goal_objective: Option<&str>,
     ) -> Result<(), String>;
+
+    /// K8sPod-only: update the mission's pod-startup phase + message
+    /// as the workspace pod boots. Default implementation is a no-op
+    /// (mission stores that don't persist these fields silently
+    /// drop the call; the broadcaster reads them back at the next
+    /// `get_mission` if persisted, or relies on the SSE stream
+    /// otherwise).
+    async fn update_mission_pod_phase(
+        &self,
+        id: Uuid,
+        phase: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<(), String> {
+        let _ = (id, phase, message);
+        Ok(())
+    }
 
     /// Update mission agent tree.
     async fn update_mission_tree(&self, id: Uuid, tree: &AgentTreeNode) -> Result<(), String>;
