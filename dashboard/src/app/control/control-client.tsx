@@ -158,6 +158,7 @@ import {
   MessageSquare,
   Users,
   BriefcaseBusiness,
+  GitBranch,
   Inbox,
   Flag,
 } from "lucide-react";
@@ -394,6 +395,7 @@ import {
   MissionSwitcher,
   normalizeMetadataText,
 } from "@/components/mission-switcher";
+import { ChangesPanel } from "@/components/changes-panel";
 import { WorkerPanel } from "@/components/worker-panel";
 import { WorkersStrip } from "@/components/workers-strip";
 import {
@@ -4851,6 +4853,11 @@ export default function ControlClient() {
   const [showWorkbenchPanel, setShowWorkbenchPanel] = useState(
     () => searchParams.get("workbench") === "1",
   );
+  // Changes panel — fetches per-mission git status + diff inside the
+  // K8sPod's repos. Off by default; click the Changes tab in the
+  // sub-agent strip to open. Reset to closed when the viewed mission
+  // changes (a different mission has its own changes set).
+  const [showChangesPanel, setShowChangesPanel] = useState(false);
   const handleToggleThinkingPanel = useCallback(() => {
     setShowThinkingPanel((prev) => {
       const next = !prev;
@@ -5308,6 +5315,7 @@ export default function ControlClient() {
   // when the user switches to mission B.
   useEffect(() => {
     setActiveSubagentTab(null);
+    setShowChangesPanel(false);
   }, [viewingMissionId]);
 
   // Tell the backend the user opened this mission. The server records
@@ -10031,6 +10039,14 @@ export default function ControlClient() {
     (activeMission?.workspace_id
       ? workspaceNameById[activeMission.workspace_id]
       : undefined);
+  // The Changes panel only works for K8sPod-backed missions (we
+  // exec `git status` / `git diff` inside the per-mission pod).
+  // Hide the Changes tab for host / container workspaces.
+  const activeMissionIsK8sPod = useMemo(() => {
+    if (!activeMission?.workspace_id) return false;
+    const ws = workspaces.find((w) => w.id === activeMission.workspace_id);
+    return ws?.workspace_type === "k8s_pod";
+  }, [activeMission?.workspace_id, workspaces]);
   const activeMissionSelectorLabel = activeMission
     ? activeMission.title?.trim() ||
       activeMission.short_description?.trim() ||
@@ -10982,17 +10998,44 @@ export default function ControlClient() {
               parentMission={viewingParentMission}
               onSelectWorker={handleViewMission}
             />
-            {/* Sub-agent tab strip — one chip per RUNNING Agent
-                tool call (completed sub-agents drop out so the
-                strip only reflects what's live). Clicking switches
-                the chat below to that sub-agent's scoped activity.
-                Hidden when no sub-agents are running. */}
-            {hasInMissionSubagents && (
-              <SubagentTabStrip
-                subagents={runningSubagents}
-                activeTab={activeSubagentTab}
-                onSelect={setActiveSubagentTab}
-              />
+            {/* Tab strip above the chat — combines the sub-agent
+                chips (when any are running) and a `Changes` pill
+                that opens the git-diff drawer. Always renders for
+                K8sPod missions so the user can pop the Changes
+                view open at any time. */}
+            {(hasInMissionSubagents ||
+              activeMissionIsK8sPod) && (
+              <div className="flex items-center justify-between border-b border-white/[0.06] bg-white/[0.01]">
+                <div className="flex-1 min-w-0">
+                  {hasInMissionSubagents ? (
+                    <SubagentTabStrip
+                      subagents={runningSubagents}
+                      activeTab={activeSubagentTab}
+                      onSelect={setActiveSubagentTab}
+                    />
+                  ) : (
+                    <div className="px-4 py-2 text-[10px] uppercase tracking-wider text-white/30">
+                      Main thread
+                    </div>
+                  )}
+                </div>
+                {activeMissionIsK8sPod && (
+                  <button
+                    type="button"
+                    onClick={() => setShowChangesPanel((v) => !v)}
+                    className={cn(
+                      "shrink-0 mx-3 my-1.5 flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium transition-colors",
+                      showChangesPanel
+                        ? "bg-emerald-500/20 text-emerald-200 border border-emerald-500/40"
+                        : "text-white/50 hover:text-white/80 hover:bg-white/[0.04] border border-white/[0.06]",
+                    )}
+                    title="View file changes inside the per-mission pod"
+                  >
+                    <GitBranch className="h-3 w-3" />
+                    Changes
+                  </button>
+                )}
+              </div>
             )}
             {/* Messages */}
             <div
@@ -11552,6 +11595,7 @@ export default function ControlClient() {
           {(showWorkbenchPanel ||
             showThinkingPanel ||
             showDesktopStream ||
+            showChangesPanel ||
             (showWorkerPanel && isBossMission) ||
             hasInMissionSubagents) && (
             <div
@@ -11663,6 +11707,7 @@ export default function ControlClient() {
                   className={
                     showWorkbenchPanel ||
                     showDesktopStream ||
+                    showChangesPanel ||
                     (showWorkerPanel && isBossMission)
                       ? "flex-1 min-h-0"
                       : "flex-1"
@@ -11670,6 +11715,18 @@ export default function ControlClient() {
                   basePath={missionWorkingDirectory}
                   missionId={viewingMissionId}
                 />
+              )}
+
+              {/* Changes Panel — per-mission git status + unified
+                  diff viewer running inside the K8sPod. Click the
+                  Changes pill in the tab strip to open. */}
+              {showChangesPanel && activeMission && (
+                <div className="flex-1 min-h-0">
+                  <ChangesPanel
+                    missionId={activeMission.id}
+                    onClose={() => setShowChangesPanel(false)}
+                  />
+                </div>
               )}
 
               {/* Desktop Stream Panel */}
