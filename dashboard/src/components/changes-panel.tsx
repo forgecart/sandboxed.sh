@@ -93,6 +93,16 @@ interface RepoSearchHit {
   snippet: string;
 }
 
+/**
+ * Cap how many hits we keep in the React state list at any one
+ * time. The server may stream up to the SEARCH_HARD_CAP it
+ * enforces (1k); above this number the user can't visually scan
+ * the list anyway and the DOM grows unbounded. Beyond the cap we
+ * still update the loaded/total counter so the user knows more
+ * matched.
+ */
+const MAX_RENDERED_HITS = 500;
+
 interface MissionChangedFile {
   path: string;
   status: string;
@@ -177,6 +187,10 @@ export function ChangesPanel({
   const [findQuery, setFindQuery] = useState("");
   const [findRepo, setFindRepo] = useState<string | null>(null);
   const [findHits, setFindHits] = useState<RepoSearchHit[]>([]);
+  // Held alive across renders so the next runSearch invocation
+  // can cancel the previous in-flight stream. Cleared when the
+  // server emits `done` or `error`.
+  const findCancelRef = useRef<(() => void) | null>(null);
   const [findLoading, setFindLoading] = useState(false);
   const [findError, setFindError] = useState<string | null>(null);
   const [findTruncated, setFindTruncated] = useState(false);
@@ -542,27 +556,64 @@ export function ChangesPanel({
     setFindError(null);
     setFindHits([]);
     setFindTruncated(false);
+    // Cancel any in-flight previous search so we don't pile
+    // multiple grep processes against the pod when the user
+    // hits "Find" twice or the input debounce fires again.
+    if (findCancelRef.current) {
+      try {
+        findCancelRef.current();
+      } catch {
+        // ignore
+      }
+      findCancelRef.current = null;
+    }
+    // Buffer hits between renders so a 500-hit response doesn't
+    // trigger 500 React reconciles. Flushed on the next animation
+    // frame.
+    const pendingHits: RepoSearchHit[] = [];
+    let flushScheduled = false;
+    const flush = () => {
+      flushScheduled = false;
+      if (pendingHits.length === 0) return;
+      const drained = pendingHits.splice(0);
+      setFindHits((prev) => {
+        if (prev.length >= MAX_RENDERED_HITS) return prev;
+        const remaining = MAX_RENDERED_HITS - prev.length;
+        return [...prev, ...drained.slice(0, remaining)];
+      });
+    };
     try {
       const stream = getWorkspaceStream(missionId);
-      const done = await stream.stream<
+      const request = stream.stream<
         { total: number; truncated: boolean },
         SearchHitChunk
       >(
         "search",
         { repo: findRepo, q: findQuery, limit: 200 },
         {
-          onChunk: ({ hit }) => {
-            // Append hits as they arrive — the user sees the
-            // first match within milliseconds even on big repos.
-            setFindHits((prev) => [...prev, hit]);
+          onChunk: (chunk) => {
+            // Server batches hits ~25 per chunk. Old format
+            // (single `hit`) kept for safety.
+            const incoming = chunk.hits ?? (chunk.hit ? [chunk.hit] : []);
+            if (incoming.length === 0) return;
+            pendingHits.push(...incoming);
+            if (!flushScheduled) {
+              flushScheduled = true;
+              window.requestAnimationFrame(flush);
+            }
           },
         },
-      ).result;
+      );
+      findCancelRef.current = request.cancel;
+      const done = await request.result;
+      flush();
       setFindTruncated(done.truncated);
     } catch (e) {
+      flush();
       const msg = e instanceof Error ? e.message : String(e);
       setFindError(msg);
     } finally {
+      findCancelRef.current = null;
       setFindLoading(false);
     }
   }, [findQuery, findRepo, missionId]);

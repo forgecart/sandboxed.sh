@@ -67,8 +67,15 @@ export interface ChangedFileChunk {
   };
 }
 
+/**
+ * Server batches hits to ~25 per chunk (or every ~50ms) to keep
+ * the WS frame count + React re-render count under control on
+ * dense matches. Legacy `hit` shape kept around because older
+ * builds emit it as a single-hit chunk.
+ */
 export interface SearchHitChunk {
-  hit: { file: string; line: number; snippet: string };
+  hits?: Array<{ file: string; line: number; snippet: string }>;
+  hit?: { file: string; line: number; snippet: string };
 }
 
 export interface FsChangeEvent {

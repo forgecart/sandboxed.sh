@@ -735,10 +735,47 @@ async fn search(tx: &WsTx, id: &str, mission_id: Uuid, params: Value) {
     } else {
         format!("/workspaces/repos/{}/{}", p.repo, p.path.trim_matches('/'))
     };
-    // Spawn streaming grep — emit hits as lines arrive. `head -n`
-    // caps in-stream so a runaway pattern can't OOM us.
+    // grep with hardened excludes. Without these, an NX-style
+    // monorepo has tens of thousands of files under
+    // `node_modules/` and `dist/` and a wide regex floods the
+    // pipe → kills the pod CPU + chokes the browser. The set
+    // below covers the heavy hitters across the ecosystems we
+    // see: JS (node_modules / dist / .next / .nuxt / .turbo /
+    // .parcel-cache / build / out), Rust (target), Python
+    // (__pycache__ / .venv / venv), and Go (vendor). Plus
+    // lockfiles, sourcemaps, and minified bundles where the
+    // "line" is megabytes and a single match would lock up the
+    // dashboard. `-m 50` caps matches per file so a runaway
+    // pattern on a long file doesn't dominate the result list.
     let cmd = format!(
-        "cd {} 2>/dev/null && grep -rnIE --color=never --exclude-dir=.git -- {} . 2>/dev/null | head -n {}",
+        "cd {} 2>/dev/null && grep -rnIE --color=never -m 50 \
+         --exclude-dir=.git \
+         --exclude-dir=node_modules \
+         --exclude-dir=dist \
+         --exclude-dir=build \
+         --exclude-dir=out \
+         --exclude-dir=.next \
+         --exclude-dir=.nuxt \
+         --exclude-dir=.turbo \
+         --exclude-dir=.parcel-cache \
+         --exclude-dir=.cache \
+         --exclude-dir=target \
+         --exclude-dir=__pycache__ \
+         --exclude-dir=.venv \
+         --exclude-dir=venv \
+         --exclude-dir=vendor \
+         --exclude-dir=coverage \
+         --exclude='*.lock' \
+         --exclude='*.lockb' \
+         --exclude='package-lock.json' \
+         --exclude='yarn.lock' \
+         --exclude='pnpm-lock.yaml' \
+         --exclude='bun.lock' \
+         --exclude='*.min.js' \
+         --exclude='*.min.css' \
+         --exclude='*.map' \
+         --exclude='*.bundle.js' \
+         -- {} . 2>/dev/null | head -n {}",
         shell_quote(&scope),
         shell_quote(&p.q),
         limit
@@ -756,6 +793,28 @@ async fn search(tx: &WsTx, id: &str, mission_id: Uuid, params: Value) {
     };
     let mut lines = BufReader::new(stdout).lines();
     let mut hits = 0usize;
+    // Batch hits before flushing to the WS. One JSON frame per
+    // hit melts the browser when matches are dense; batches
+    // collapse ~25 hits into one envelope. We also flush every
+    // ~50 ms regardless so the user sees the first results fast
+    // even on sparse matches.
+    const BATCH_SIZE: usize = 25;
+    const BATCH_FLUSH_MS: u64 = 50;
+    const MAX_SNIPPET_LEN: usize = 500;
+    let mut batch: Vec<Value> = Vec::with_capacity(BATCH_SIZE);
+    let mut last_flush = std::time::Instant::now();
+    let flush = |tx: &WsTx, id: &str, batch: &mut Vec<Value>| {
+        let drained = std::mem::take(batch);
+        let count = drained.len();
+        let tx = tx.clone();
+        let id = id.to_string();
+        async move {
+            if count == 0 {
+                return;
+            }
+            send_chunk(&tx, &id, json!({ "hits": drained })).await;
+        }
+    };
     while let Ok(Some(line)) = lines.next_line().await {
         let s = line.strip_prefix("./").unwrap_or(&line);
         let mut it = s.splitn(3, ':');
@@ -767,21 +826,27 @@ async fn search(tx: &WsTx, id: &str, mission_id: Uuid, params: Value) {
             Some(v) => v,
             None => continue,
         };
-        let snippet = it.next().unwrap_or("").to_string();
-        send_chunk(
-            tx,
-            id,
-            json!({
-                "hit": { "file": file, "line": lineno, "snippet": snippet }
-            }),
-        )
-        .await;
+        let mut snippet = it.next().unwrap_or("").to_string();
+        // Truncate freakishly long lines (minified files can have
+        // multi-MB single lines). Without this every match in a
+        // bundle would blow up both the WS frame and the React
+        // render.
+        if snippet.len() > MAX_SNIPPET_LEN {
+            snippet.truncate(MAX_SNIPPET_LEN);
+            snippet.push_str("…");
+        }
+        batch.push(json!({ "file": file, "line": lineno, "snippet": snippet }));
         hits += 1;
-        // Tick progress every 25 hits — finer-grained makes the
-        // dashboard jitter without adding signal.
-        if hits.is_multiple_of(25) {
+        let should_flush =
+            batch.len() >= BATCH_SIZE || last_flush.elapsed().as_millis() as u64 >= BATCH_FLUSH_MS;
+        if should_flush {
+            flush(tx, id, &mut batch).await;
+            last_flush = std::time::Instant::now();
             send_progress(tx, id, hits, limit).await;
         }
+    }
+    if !batch.is_empty() {
+        flush(tx, id, &mut batch).await;
     }
     let _ = child.kill().await;
     send_done(tx, id, json!({ "total": hits, "truncated": hits >= limit })).await;
