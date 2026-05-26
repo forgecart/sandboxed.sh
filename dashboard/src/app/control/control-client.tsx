@@ -3449,11 +3449,166 @@ function isTodoWriteTool(toolName: string): boolean {
   return toolName.toLowerCase() === "todowrite";
 }
 
+// Plan-mode signals. Two distinct cases yield a finalized plan:
+//   (a) `ExitPlanMode`: canonical — the agent calls this with the
+//       plan content in `args.plan`. Fires when the agent
+//       intentionally leaves plan mode to present a finalized
+//       implementation strategy.
+//   (b) `Write` to a `.claude/plans/*.md` path: Claude Code's
+//       plan-mode writer dumps the draft plan to a file under
+//       `.claude/plans/` even when ExitPlanMode is never called
+//       (we've seen sessions with 6 EnterPlanMode but 0 ExitPlanMode
+//       that still produced a plan via Write).
+// The classifier returns the plan markdown if either matches.
+function extractPlanFromTool(
+  toolName: string,
+  args: unknown,
+): { plan: string; title: string } | null {
+  if (!args || typeof args !== "object") return null;
+  const obj = args as Record<string, unknown>;
+  const nameLower = toolName.toLowerCase();
+  if (nameLower === "exitplanmode") {
+    const plan = obj["plan"];
+    if (typeof plan === "string" && plan.trim()) {
+      return { plan, title: "Plan finalized" };
+    }
+  }
+  if (nameLower === "write" || nameLower === "edit") {
+    const fp = obj["file_path"];
+    if (
+      typeof fp === "string" &&
+      /\.claude\/plans\/[^/]+\.md$/i.test(fp)
+    ) {
+      const content = obj["content"];
+      const newContent = obj["new_string"];
+      const plan =
+        (typeof content === "string" && content) ||
+        (typeof newContent === "string" && newContent) ||
+        "";
+      if (plan.trim()) {
+        const base =
+          fp.split("/").pop()?.replace(/\.md$/i, "") ?? "Plan";
+        return {
+          plan,
+          title: `Plan: ${base.replace(/[-_]/g, " ")}`,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+function isPlanTool(toolName: string, args: unknown): boolean {
+  return extractPlanFromTool(toolName, args) !== null;
+}
+
 // Right-side workbench panel showing the agent's CURRENT task list.
 // Driven by `latestAgentTodos` (a memo that picks the most recent
 // TodoWrite snapshot from the mission's chat items). Each TodoWrite
 // is a full plan, not a diff — only the newest matters. Hidden when
 // no todos are present.
+// Compact in-chat card for a finalized plan. Click → full-screen
+// markdown modal so the user can actually read the plan. Same
+// dispatcher slot as TodoWriteItem / SubagentToolItem.
+const PlanItem = memo(function PlanItem({
+  item,
+}: {
+  item: Extract<ChatItem, { kind: "tool" }>;
+}) {
+  const planInfo = useMemo(
+    () => extractPlanFromTool(item.name, item.args),
+    [item.name, item.args],
+  );
+  const [open, setOpen] = useState(false);
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+  if (!planInfo) return null;
+  const lineCount = planInfo.plan.split("\n").length;
+  return (
+    <>
+      <div
+        id={`chat-item-${item.id}`}
+        data-chat-item-id={item.id}
+        className="my-2 rounded-lg border border-violet-500/30 bg-violet-500/[0.06] overflow-hidden"
+      >
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          className="w-full flex items-center justify-between gap-3 px-3 py-2 text-left hover:bg-violet-500/[0.1] transition-colors"
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            <FileText className="h-4 w-4 text-violet-300 shrink-0" />
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-violet-100 truncate">
+                {planInfo.title}
+              </p>
+              <p className="text-[11px] text-white/40">
+                {lineCount} line{lineCount === 1 ? "" : "s"} · click to view
+              </p>
+            </div>
+          </div>
+          <span className="shrink-0 inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium bg-violet-500/20 text-violet-200 hover:bg-violet-500/30">
+            <Eye className="h-3.5 w-3.5" />
+            Show plan
+          </span>
+        </button>
+      </div>
+
+      {open && mounted &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-[80] flex items-stretch justify-center"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="plan-modal-title"
+          >
+            <div
+              className="absolute inset-0 bg-black/70 backdrop-blur-sm animate-in fade-in duration-150"
+              onClick={() => setOpen(false)}
+            />
+            <div className="relative w-full h-full flex flex-col bg-[#101010] sm:m-3 sm:rounded-2xl sm:border sm:border-white/[0.06] shadow-2xl animate-in fade-in zoom-in-95 duration-150 overflow-hidden">
+              <div className="flex items-center justify-between px-4 py-3 border-b border-white/[0.06]">
+                <div className="flex items-center gap-2 min-w-0">
+                  <FileText className="h-4 w-4 text-violet-400 shrink-0" />
+                  <h3
+                    id="plan-modal-title"
+                    className="text-sm font-medium text-white truncate"
+                  >
+                    {planInfo.title}
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setOpen(false)}
+                  className="p-1.5 rounded-md text-white/40 hover:text-white/80 hover:bg-white/[0.06] transition-colors"
+                  title="Close (Esc)"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              <div className="flex-1 min-h-0 overflow-y-auto">
+                <div className="mx-auto max-w-4xl xl:max-w-5xl px-6 py-6 prose-glass">
+                  <MarkdownContent content={planInfo.plan} />
+                </div>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
+    </>
+  );
+});
+
 function AgentTasksPanel({
   todos,
   onClose,
@@ -4307,6 +4462,12 @@ function CollapsedToolGroup({
     if (isTodoWriteTool(tool.name)) {
       return null;
     }
+    // ExitPlanMode + Write/Edit to `.claude/plans/*.md` → render
+    // as a compact "Plan" card that opens a full-screen markdown
+    // modal on click.
+    if (isPlanTool(tool.name, tool.args)) {
+      return <PlanItem key={tool.id} item={tool} />;
+    }
     return (
       <ToolCallItem
         key={tool.id}
@@ -4730,6 +4891,11 @@ const ChatItemRow = memo(function ChatItemRow({
     // not as a chat card — see renderTool comment above.
     if (isTodoWriteTool(item.name)) {
       return null;
+    }
+
+    // Finalized-plan card with full-screen markdown modal.
+    if (isPlanTool(item.name, item.args)) {
+      return <PlanItem item={item} />;
     }
 
     return (
