@@ -755,8 +755,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         .route(
             "/api/control/missions/:id/file",
-            get(super::changes::get_mission_file)
-                .put(super::changes::write_mission_file),
+            get(super::changes::get_mission_file).put(super::changes::write_mission_file),
         )
         .route(
             "/api/control/missions/:id/search",

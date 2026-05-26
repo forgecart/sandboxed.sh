@@ -707,7 +707,12 @@ pub async fn write_mission_file(
             &HashMap::new(),
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("exec failed: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("exec failed: {e}"),
+            )
+        })?;
     if !out.status.success() {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -773,7 +778,7 @@ pub async fn search_mission_repo(
             return Err((StatusCode::BAD_REQUEST, "invalid path".into()));
         }
     }
-    let limit = q.limit.unwrap_or(200).min(500).max(1);
+    let limit = q.limit.unwrap_or(200).clamp(1, 500);
     let k8s = match crate::k8s_pod::global_client() {
         Some(c) => c,
         None => {
@@ -787,11 +792,7 @@ pub async fn search_mission_repo(
     let scope = if q.path.is_empty() {
         format!("/workspaces/repos/{}", q.repo)
     } else {
-        format!(
-            "/workspaces/repos/{}/{}",
-            q.repo,
-            q.path.trim_matches('/')
-        )
+        format!("/workspaces/repos/{}/{}", q.repo, q.path.trim_matches('/'))
     };
     // grep returns exit 1 when there are no matches — we want to
     // succeed with empty hits. `|| true` keeps the script status 0.
