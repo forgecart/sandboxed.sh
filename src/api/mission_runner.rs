@@ -267,6 +267,25 @@ fn extract_telegram_instructions(user_message: &str) -> Option<String> {
 ///
 /// The function is idempotent — it only writes once (checks for the `# Telegram Structured Memory`
 /// marker).
+/// Marker line that distinguishes our file-refs block from any
+/// other CLAUDE.md content. Kept short so a `grep -qF` check is
+/// fast; unique enough that no project would write it by hand.
+const DASHBOARD_FILE_REFS_MARKER: &str = "# Dashboard File References";
+
+/// The instruction block we append. Kept in a const so the host
+/// path and pod path emit identical content (the agent shouldn't
+/// see two slightly-different copies if a mission ever migrates
+/// between workspace types).
+const DASHBOARD_FILE_REFS_BODY: &str = "\n\n# Dashboard File References\n\n\
+When you reference a specific file or line of code, write it as \
+`repo/path/to/file.ext:line` (or `repo/path/to/file.ext` without a line) — \
+the `repo` is the directory name as it appears under `/workspaces/repos/`. \
+Example: `forgecart/src/api/control.rs:1234`.\n\n\
+The dashboard renders these inline as clickable links that open the file in \
+the Monaco editor at that line, so prefer this form over prose like \
+\"line 42 of control.rs\". You may use it inside backticks or as bare text; \
+both linkify.\n";
+
 /// Append a short instruction block to CLAUDE.md telling the agent
 /// to write file references in a regex-friendly form
 /// (`repo/path/to/file.ext:line`). The dashboard's chat renderer
@@ -275,27 +294,19 @@ fn extract_telegram_instructions(user_message: &str) -> Option<String> {
 ///
 /// Idempotent — re-running on the same file leaves the marker
 /// intact and skips. Mirrors the Telegram inject pattern.
+///
+/// HOST-PATH ONLY. For K8sPod missions the agent's CLAUDE.md
+/// lives inside the pod at `/workspaces/CLAUDE.md`; use
+/// `inject_dashboard_file_refs_into_pod_claude_md` instead.
 pub fn inject_dashboard_file_refs_into_claude_md(claude_md_path: &Path) {
-    const MARKER: &str = "# Dashboard File References";
     let existing = std::fs::read_to_string(claude_md_path).unwrap_or_default();
-    if existing.contains(MARKER) {
+    if existing.contains(DASHBOARD_FILE_REFS_MARKER) {
         return;
     }
-    let mut extra = String::new();
-    extra.push_str("\n\n");
-    extra.push_str(MARKER);
-    extra.push_str("\n\n");
-    extra.push_str(
-        "When you reference a specific file or line of code, write it as\n\
-         `repo/path/to/file.ext:line` (or `repo/path/to/file.ext` without a line) — \
-         the `repo` is the directory name as it appears under `/workspaces/repos/`. \
-         Example: `forgecart/src/api/control.rs:1234`.\n\n\
-         The dashboard renders these inline as clickable links that open the file in \
-         the Monaco editor at that line, so prefer this form over prose like \
-         \"line 42 of control.rs\". You may use it inside backticks or as bare text; \
-         both linkify.\n",
-    );
-    if let Err(e) = std::fs::write(claude_md_path, format!("{}{}", existing, extra)) {
+    if let Err(e) = std::fs::write(
+        claude_md_path,
+        format!("{}{}", existing, DASHBOARD_FILE_REFS_BODY),
+    ) {
         tracing::warn!(
             path = %claude_md_path.display(),
             error = %e,
@@ -306,6 +317,64 @@ pub fn inject_dashboard_file_refs_into_claude_md(claude_md_path: &Path) {
             path = %claude_md_path.display(),
             "Injected dashboard file-refs instruction into CLAUDE.md"
         );
+    }
+}
+
+/// K8sPod twin of `inject_dashboard_file_refs_into_claude_md`.
+/// Writes `/workspaces/CLAUDE.md` inside the per-mission pod via
+/// kubectl exec — that's where Claude Code picks it up since the
+/// agent's cwd is `/workspaces/repos/<repo>` (or `/workspaces`)
+/// and Claude walks up the tree.
+///
+/// Idempotent via a `grep -qF` check on the marker before writing.
+pub async fn inject_dashboard_file_refs_into_pod_claude_md(
+    k8s: &std::sync::Arc<crate::k8s_pod::K8sPodClient>,
+    mission_id: Uuid,
+) {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(DASHBOARD_FILE_REFS_BODY.as_bytes());
+    // The script:
+    //  1. Touch the file if missing (so `grep` doesn't error)
+    //  2. Skip if our marker is already there
+    //  3. Otherwise base64-decode the body and append
+    let script = format!(
+        "set -e; f=/workspaces/CLAUDE.md; [ -f \"$f\" ] || touch \"$f\"; \
+         if grep -qF '{marker}' \"$f\" 2>/dev/null; then exit 0; fi; \
+         printf '%s' '{b64}' | base64 -d >> \"$f\"",
+        marker = DASHBOARD_FILE_REFS_MARKER,
+        b64 = b64,
+    );
+    match k8s
+        .exec_command(
+            mission_id,
+            None,
+            "/bin/bash",
+            &["-lc".to_string(), script],
+            &std::collections::HashMap::new(),
+        )
+        .await
+    {
+        Ok(out) if out.status.success() => {
+            tracing::info!(
+                mission_id = %mission_id,
+                "Injected dashboard file-refs instruction into pod CLAUDE.md"
+            );
+        }
+        Ok(out) => {
+            tracing::warn!(
+                mission_id = %mission_id,
+                exit = ?out.status.code(),
+                stderr = %String::from_utf8_lossy(&out.stderr),
+                "pod CLAUDE.md inject exec non-zero"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                mission_id = %mission_id,
+                error = %e,
+                "pod CLAUDE.md inject exec failed"
+            );
+        }
     }
 }
 
@@ -3203,7 +3272,21 @@ async fn run_mission_turn(
     // For every mission: tell the agent how to write file references
     // so the dashboard's chat renderer can linkify them. Idempotent;
     // safe to re-run on every turn. Creates the CLAUDE.md if missing.
-    {
+    //
+    // K8sPod missions need the CLAUDE.md to land INSIDE the pod's
+    // workspace volume — the host `mission_work_dir` is just
+    // bookkeeping and the agent never reads from it. For other
+    // workspace types the host path is the agent's actual workdir.
+    if workspace.workspace_type == crate::workspace::WorkspaceType::K8sPod {
+        if let Some(k8s) = crate::k8s_pod::global_client() {
+            inject_dashboard_file_refs_into_pod_claude_md(&k8s, mission_id).await;
+        } else {
+            tracing::warn!(
+                mission_id = %mission_id,
+                "K8sPod mission but K8sPodClient unavailable — skipping CLAUDE.md inject"
+            );
+        }
+    } else {
         let claude_md_path = mission_work_dir.join("CLAUDE.md");
         if !claude_md_path.exists() {
             let _ = std::fs::write(&claude_md_path, "");
