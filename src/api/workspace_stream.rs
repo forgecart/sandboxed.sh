@@ -735,47 +735,34 @@ async fn search(tx: &WsTx, id: &str, mission_id: Uuid, params: Value) {
     } else {
         format!("/workspaces/repos/{}/{}", p.repo, p.path.trim_matches('/'))
     };
-    // grep with hardened excludes. Without these, an NX-style
-    // monorepo has tens of thousands of files under
-    // `node_modules/` and `dist/` and a wide regex floods the
-    // pipe → kills the pod CPU + chokes the browser. The set
-    // below covers the heavy hitters across the ecosystems we
-    // see: JS (node_modules / dist / .next / .nuxt / .turbo /
-    // .parcel-cache / build / out), Rust (target), Python
-    // (__pycache__ / .venv / venv), and Go (vendor). Plus
-    // lockfiles, sourcemaps, and minified bundles where the
-    // "line" is megabytes and a single match would lock up the
-    // dashboard. `-m 50` caps matches per file so a runaway
-    // pattern on a long file doesn't dominate the result list.
+    // Use `git grep` so the search respects each repo's
+    // .gitignore automatically. On an NX-style monorepo with
+    // node_modules / dist / .turbo / etc. listed in .gitignore,
+    // this is the difference between scanning ~1k tracked
+    // source files and ~50k generated/dep files (which would
+    // peg the pod and stream MBs to the browser).
+    //
+    // Flags:
+    //  - `-I` skip binary files
+    //  - `-n` line numbers
+    //  - `-E` extended regex
+    //  - `--no-color` plain output
+    //  - `--untracked` also search files not yet committed
+    //    (still ignored by .gitignore, so safe)
+    //  - `--max-count=50` per-file cap so a runaway match in
+    //    one big file doesn't dominate
+    //  - `--no-index` falls back to filesystem walk for non-git
+    //    paths (subdir of a repo, or a repo without git yet)
+    //  - `--recurse-submodules` searches submodules too
+    //
+    // The first `cd` makes git's discovery walk land on the
+    // right repo root; if `p.path` points deep into the tree we
+    // still want git's index-aware behaviour.
     let cmd = format!(
-        "cd {} 2>/dev/null && grep -rnIE --color=never -m 50 \
-         --exclude-dir=.git \
-         --exclude-dir=node_modules \
-         --exclude-dir=dist \
-         --exclude-dir=build \
-         --exclude-dir=out \
-         --exclude-dir=.next \
-         --exclude-dir=.nuxt \
-         --exclude-dir=.turbo \
-         --exclude-dir=.parcel-cache \
-         --exclude-dir=.cache \
-         --exclude-dir=target \
-         --exclude-dir=__pycache__ \
-         --exclude-dir=.venv \
-         --exclude-dir=venv \
-         --exclude-dir=vendor \
-         --exclude-dir=coverage \
-         --exclude='*.lock' \
-         --exclude='*.lockb' \
-         --exclude='package-lock.json' \
-         --exclude='yarn.lock' \
-         --exclude='pnpm-lock.yaml' \
-         --exclude='bun.lock' \
-         --exclude='*.min.js' \
-         --exclude='*.min.css' \
-         --exclude='*.map' \
-         --exclude='*.bundle.js' \
-         -- {} . 2>/dev/null | head -n {}",
+        "cd {} 2>/dev/null && \
+         git grep -InE --no-color --untracked --max-count=50 \
+         --recurse-submodules -e {} -- . ':!*.min.*' ':!*.map' ':!*.bundle.js' \
+         2>/dev/null | head -n {} || true",
         shell_quote(&scope),
         shell_quote(&p.q),
         limit
@@ -857,6 +844,17 @@ async fn subscribe_fs(tx: &WsTx, id: &str, mission_id: Uuid) {
         Some(c) => c,
         None => return send_error(tx, Some(id), "pod unavailable").await,
     };
+    // inotifywait recursively watches every dir it sees. On an
+    // NX-style monorepo with `node_modules/` checked out, that's
+    // tens of thousands of dirs — `inotifywait` either blows
+    // through the kernel's `fs.inotify.max_user_watches` (8192
+    // default on most distros) and bails, or chews through
+    // pod memory holding all the watch descriptors. Either way,
+    // opening the editor "crashed the server".
+    //
+    // `@<dir>` syntax tells inotifywait to NOT recurse into
+    // that subtree while still watching its siblings. Listed in
+    // order of frequency-and-size.
     let mut child = match k8s
         .spawn_streaming_exec(
             mission_id,
@@ -865,6 +863,27 @@ async fn subscribe_fs(tx: &WsTx, id: &str, mission_id: Uuid) {
                 "-mr",
                 "--quiet",
                 "/workspaces/repos",
+                "@/workspaces/repos/.git",
+                "@/workspaces/repos/node_modules",
+                "@/workspaces/repos/dist",
+                "@/workspaces/repos/build",
+                "@/workspaces/repos/.next",
+                "@/workspaces/repos/.nuxt",
+                "@/workspaces/repos/.turbo",
+                "@/workspaces/repos/.parcel-cache",
+                "@/workspaces/repos/.cache",
+                "@/workspaces/repos/target",
+                "@/workspaces/repos/__pycache__",
+                "@/workspaces/repos/.venv",
+                "@/workspaces/repos/venv",
+                "@/workspaces/repos/vendor",
+                "@/workspaces/repos/coverage",
+                "--exclude",
+                // Excludes are regex matched against the full
+                // path of each event. Catches deeper occurrences
+                // (e.g. `.../my-pkg/node_modules/`) that the
+                // top-level `@<dir>` excludes miss.
+                "(^|/)(\\.git|node_modules|dist|build|out|\\.next|\\.nuxt|\\.turbo|\\.parcel-cache|\\.cache|target|__pycache__|\\.venv|venv|vendor|coverage)(/|$)",
                 "-e",
                 "close_write,move,create,delete",
                 "--format",
