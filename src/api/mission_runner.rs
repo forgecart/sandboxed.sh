@@ -4799,21 +4799,42 @@ pub fn run_claudecode_turn<'a>(
             // or ~/.claude/projects/<hash>/.  We check the broader `.claude/projects`
             // dir for *any* session data rather than guessing the exact hash, since the
             // hash depends on the absolute cwd path inside the container.
-            let claude_projects_dir = work_dir.join(".claude").join("projects");
-            let has_projects = claude_projects_dir.exists()
-                && std::fs::read_dir(&claude_projects_dir)
-                    .map(|mut entries| entries.next().is_some())
-                    .unwrap_or(false);
-            if !has_projects {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    session_id = %session_id,
-                    projects_dir = %claude_projects_dir.display(),
-                    "Session marker exists but no Claude session data found on disk; \
-                     skipping --resume to avoid CLI hang"
-                );
+            //
+            // IMPORTANT for K8sPod: the host-side `work_dir` is just a
+            // bookkeeping path on the control-plane FS — Claude's
+            // actual session data lives at `/root/.claude/projects/`
+            // INSIDE the per-mission pod, not at
+            // `<host-work_dir>/.claude/projects/`. Inspecting the
+            // host path would always return "no data", we'd skip
+            // `--resume`, fall back to `--session-id X` which Claude
+            // would refuse with "Session ID … is already in use"
+            // because the in-pod session already exists.
+            //
+            // For K8sPod we trust the marker file alone — if it
+            // says this work_dir + session_id was previously
+            // initiated, the in-pod data IS there. The CLI's own
+            // "no conversation found" guard will surface a real
+            // missing-data case as a separate error we can recover
+            // from via `ResetSessionFresh`.
+            if workspace.workspace_type == crate::workspace::WorkspaceType::K8sPod {
+                true
+            } else {
+                let claude_projects_dir = work_dir.join(".claude").join("projects");
+                let has_projects = claude_projects_dir.exists()
+                    && std::fs::read_dir(&claude_projects_dir)
+                        .map(|mut entries| entries.next().is_some())
+                        .unwrap_or(false);
+                if !has_projects {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        session_id = %session_id,
+                        projects_dir = %claude_projects_dir.display(),
+                        "Session marker exists but no Claude session data found on disk; \
+                         skipping --resume to avoid CLI hang"
+                    );
+                }
+                has_projects
             }
-            has_projects
         } else {
             false
         };
