@@ -11771,33 +11771,6 @@ async fn run_single_control_turn(
                             error = %result.output,
                             "Incomplete Claude turn detected; retrying once by continuing the current session"
                         );
-                        // Kill any leftover claude process inside the
-                        // pod before the resume retry — the previous
-                        // failure may have left the session lock
-                        // held by a zombie process, which would
-                        // immediately fail the resume with "Session
-                        // ID … is already in use".
-                        if let Some(k8s) = crate::k8s_pod::global_client() {
-                            // See mission_runner.rs for the [c]laude trick — the
-                            // ps/awk pipeline matches claude-* processes WITHOUT
-                            // the regex literal containing "claude", so the bash
-                            // hosting this script doesn't kill itself.
-                            let kill_script = "ps -eo pid,args --no-headers 2>/dev/null \
-                                             | awk '/[c]laude --print/ || /[c]laude --session-id/ {print $1}' \
-                                             | xargs -r kill -9 2>/dev/null; \
-                                             rm -f /root/.claude/projects/*/sessions/*.lock 2>/dev/null; \
-                                             true";
-                            let _ = k8s
-                                .exec_command(
-                                    mid,
-                                    None,
-                                    "/bin/bash",
-                                    &["-lc".to_string(), kill_script.to_string()],
-                                    &std::collections::HashMap::new(),
-                                )
-                                .await;
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        }
                         effective_message =
                             super::mission_runner::claudecode_resume_current_session_message()
                                 .to_string();
@@ -11841,40 +11814,6 @@ async fn run_single_control_turn(
                         let session_marker = ctx.working_dir.join(".claude-session-initiated");
                         if session_marker.exists() {
                             let _ = std::fs::remove_file(&session_marker);
-                        }
-
-                        // Nuke any leftover `claude` processes inside
-                        // the per-mission pod (K8sPod backend only).
-                        // The original failure mode here is a broken
-                        // PTY (kubectl-exec channel I/O error 5) but
-                        // the claude process inside the pod survives
-                        // — when the retry spawns a fresh claude, the
-                        // still-running old one holds the session
-                        // lock and the new process errors out with
-                        // "Session ID … is already in use". Killing
-                        // the orphan releases the lock so the retry
-                        // can actually start.
-                        if let Some(k8s) = crate::k8s_pod::global_client() {
-                            let kill_script = "pkill -9 -f 'claude ' 2>/dev/null; \
-                                               rm -f /root/.claude/projects/*/sessions/*.lock 2>/dev/null; \
-                                               true";
-                            let _ = k8s
-                                .exec_command(
-                                    mid,
-                                    None,
-                                    "/bin/bash",
-                                    &["-lc".to_string(), kill_script.to_string()],
-                                    &std::collections::HashMap::new(),
-                                )
-                                .await;
-                            // Brief grace period so OS cleans up the
-                            // killed process's lock state before the
-                            // new one tries to claim it.
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            tracing::info!(
-                                mission_id = %mid,
-                                "Killed orphan claude process(es) inside per-mission pod before retry"
-                            );
                         }
 
                         let history_for_retry = match history.last() {
