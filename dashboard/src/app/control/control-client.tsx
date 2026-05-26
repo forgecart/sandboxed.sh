@@ -3846,9 +3846,20 @@ function ChangesModal({
   onClose: () => void;
 }) {
   const [mounted, setMounted] = useState(false);
+  // Don't tear down ChangesPanel when the user closes the modal —
+  // its internal state (open tabs, edit buffers, scroll, dirty
+  // flags, fetched changes data) is expensive to rebuild. Once
+  // we've ever opened the modal for a mission, keep the panel
+  // mounted; just hide its host div via CSS when closed. Monaco's
+  // `automaticLayout: true` re-measures on the next show, so the
+  // editor renders cleanly when the modal reopens.
+  const [everOpened, setEverOpened] = useState(false);
   useEffect(() => {
     setMounted(true);
   }, []);
+  useEffect(() => {
+    if (open) setEverOpened(true);
+  }, [open]);
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -3858,19 +3869,35 @@ function ChangesModal({
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
-  if (!open || !mounted || !missionId) return null;
+  if (!mounted || !missionId) return null;
+  if (!everOpened) return null;
   return createPortal(
     <div
-      className="fixed inset-0 z-[80] flex items-stretch justify-center"
+      className={cn(
+        "fixed inset-0 z-[80] flex items-stretch justify-center",
+        // When closed: invisible + non-interactive, but the
+        // children stay mounted so ChangesPanel preserves its
+        // tabs / edit buffers / cached changes data.
+        !open && "pointer-events-none invisible",
+      )}
       role="dialog"
       aria-modal="true"
       aria-label="Mission changes"
+      aria-hidden={!open}
     >
       <div
-        className="absolute inset-0 bg-black/70 backdrop-blur-sm animate-in fade-in duration-150"
-        onClick={onClose}
+        className={cn(
+          "absolute inset-0 bg-black/70 backdrop-blur-sm transition-opacity duration-150",
+          open ? "opacity-100" : "opacity-0",
+        )}
+        onClick={open ? onClose : undefined}
       />
-      <div className="relative w-full h-full flex flex-col bg-[#101010] sm:m-3 sm:rounded-2xl sm:border sm:border-white/[0.06] shadow-2xl animate-in fade-in zoom-in-95 duration-150 overflow-hidden">
+      <div
+        className={cn(
+          "relative w-full h-full flex flex-col bg-[#101010] sm:m-3 sm:rounded-2xl sm:border sm:border-white/[0.06] shadow-2xl overflow-hidden transition-opacity duration-150",
+          open ? "opacity-100" : "opacity-0",
+        )}
+      >
         <ChangesPanel missionId={missionId} onClose={onClose} />
       </div>
     </div>,
@@ -11222,6 +11249,28 @@ export default function ControlClient() {
               <span className="hidden sm:inline">Workbench</span>
             </button>
 
+            {/* Editor mode toggle — only when the mission has a
+                per-mission pod (K8sPod). Opens the Monaco
+                workspace (diff + file editor + project find). */}
+            {activeMissionIsK8sPod && (
+              <button
+                type="button"
+                onClick={() => setShowChangesPanel((v) => !v)}
+                className={cn(
+                  "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
+                  showChangesPanel
+                    ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+                    : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
+                )}
+                title={
+                  showChangesPanel ? "Close code editor" : "Open code editor"
+                }
+              >
+                <Code className="h-4 w-4" />
+                <span className="hidden sm:inline">Editor</span>
+              </button>
+            )}
+
             {/* Thinking panel toggle */}
             <button
               onClick={handleToggleThinkingPanel}
@@ -11964,22 +12013,8 @@ export default function ControlClient() {
                     </div>
                   )}
                 </div>
-                {activeMissionIsK8sPod && (
-                  <button
-                    type="button"
-                    onClick={() => setShowChangesPanel((v) => !v)}
-                    className={cn(
-                      "shrink-0 mx-3 my-1.5 flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium transition-colors",
-                      showChangesPanel
-                        ? "bg-emerald-500/20 text-emerald-200 border border-emerald-500/40"
-                        : "text-white/50 hover:text-white/80 hover:bg-white/[0.04] border border-white/[0.06]",
-                    )}
-                    title="View file changes inside the per-mission pod"
-                  >
-                    <GitBranch className="h-3 w-3" />
-                    Changes
-                  </button>
-                )}
+                {/* Changes pill removed — replaced by the
+                    "Editor" toggle in the topbar. */}
               </div>
             )}
             {/* Messages */}

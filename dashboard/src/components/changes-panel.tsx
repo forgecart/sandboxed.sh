@@ -608,6 +608,12 @@ export function ChangesPanel({
         />
       )}
 
+      {/* Initial-load progress bar — surfaced only while the first
+          fetch is in flight (`!data && loading`). Subsequent
+          Refreshes flag the icon-spin but don't repaint this strip
+          so the panel doesn't visually reset every time. */}
+      <ChangesLoadProgress active={!data && loading} />
+
       {error && (
         <div className="px-4 py-3 text-xs text-red-300 bg-red-500/10 border-b border-red-500/20">
           {error}
@@ -675,9 +681,9 @@ export function ChangesPanel({
               )}
             </div>
             <div className="flex-1 min-h-0 overflow-y-auto py-1">
-              {!data && loading && (
-                <div className="p-3 text-sm text-white/40">Loading…</div>
-              )}
+              {/* Inline "Loading…" text dropped — the top progress
+                  bar already surfaces the initial-load state, and
+                  the Refresh icon spin handles subsequent fetches. */}
               {data && totalFiles === 0 && !data.unavailable && (
                 <div className="p-3 text-sm text-white/40">
                   No uncommitted changes in any cloned repo.
@@ -1335,6 +1341,70 @@ function FindPanel({
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * Animated initial-load progress bar.
+ *
+ * Backend doesn't stream progress, so we can't show *real*
+ * progress — every percentage from the server would be a lie.
+ * Instead, we simulate an asymptotic ramp: percent climbs fast
+ * at first, then slows as it nears 95%. Never hits 100% on its
+ * own; only the `active=false` transition snaps it home. This
+ * matches the cadence users expect from network requests and is
+ * the same trick used by NProgress / pace.js. Time constant is
+ * tuned to a ~6 s typical first-load of the changes endpoint on
+ * a medium repo.
+ *
+ * When `active` flips false (load done or never started), the
+ * bar fills to 100% with a brief animation, then fades out.
+ */
+function ChangesLoadProgress({ active }: { active: boolean }) {
+  const [pct, setPct] = useState(0);
+  const [visible, setVisible] = useState(false);
+  const startRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (active) {
+      setVisible(true);
+      setPct(2);
+      startRef.current = Date.now();
+      const id = setInterval(() => {
+        const start = startRef.current ?? Date.now();
+        const elapsed = Date.now() - start;
+        // Asymptotic to 95%. Time constant 2200 ms tuned so the
+        // bar reaches ~50% at 1.5s, ~80% at 3.5s, ~95% at 7s.
+        const target = 2 + 93 * (1 - Math.exp(-elapsed / 2200));
+        setPct(target);
+      }, 90);
+      return () => clearInterval(id);
+    }
+    // Inactive: snap to 100%, then hide.
+    setPct(100);
+    const fadeOut = window.setTimeout(() => setVisible(false), 300);
+    return () => window.clearTimeout(fadeOut);
+  }, [active]);
+
+  if (!visible) return null;
+  return (
+    <div
+      className={cn(
+        "relative h-1 bg-white/[0.04] border-b border-white/[0.06] overflow-hidden transition-opacity",
+        active ? "opacity-100" : "opacity-0 duration-300",
+      )}
+    >
+      <div
+        className="absolute inset-y-0 left-0 bg-gradient-to-r from-indigo-500/80 to-emerald-500/80 transition-[width] duration-150 ease-out"
+        style={{ width: `${pct}%` }}
+      />
+      <span
+        className="absolute right-2 -top-0.5 text-[9px] font-mono text-white/40 leading-none select-none pointer-events-none"
+        style={{ textShadow: "0 0 4px rgba(0,0,0,0.6)" }}
+      >
+        {Math.floor(pct)}%
+      </span>
     </div>
   );
 }
