@@ -1,6 +1,7 @@
 "use client";
 
 import type { Monaco } from "@monaco-editor/react";
+import { emitFileRef } from "@/lib/file-ref-bus";
 
 /**
  * Monaco setup helpers shared by the diff viewer and the file
@@ -120,6 +121,69 @@ export function ensureTypeScriptDefaults(monaco: Monaco) {
     });
     def.setEagerModelSync(true);
   }
+}
+
+/**
+ * Register a Monaco editor opener that routes cross-file
+ * navigations (Cmd-click on an identifier, right-click → Go to
+ * Definition, etc.) through our tab system.
+ *
+ * Monaco's standalone build has NO default opener — when the
+ * editor needs to navigate to a URI it doesn't already host as
+ * a model, it silently no-ops. So Cmd-click on a symbol defined
+ * in another file would fire the LSP `textDocument/definition`,
+ * get back a `file:///workspaces/repos/<repo>/<path>` Location,
+ * then fail to navigate.
+ *
+ * Our opener parses that URI and dispatches to the file-ref bus,
+ * which the dashboard already wires up to open a new edit tab at
+ * the target line.
+ *
+ * `openCodeEditor` returns `true` to tell Monaco "I handled it"
+ * so it doesn't try its own (no-op) navigation afterward.
+ *
+ * Idempotent — Monaco caches openers internally; re-registering
+ * the same handler is harmless.
+ */
+let openerRegistered = false;
+export function ensureEditorOpener(monaco: Monaco) {
+  if (openerRegistered) return;
+  openerRegistered = true;
+  // The `IEditorOpener` shape isn't exported from the
+  // @monaco-editor/react public types, so cast at the boundary
+  // and accept the loose signature internally.
+  type UriLike = { toString(): string };
+  type RangeLike = { startLineNumber?: number };
+  type PositionLike = { lineNumber?: number };
+  const opener = {
+    openCodeEditor(
+      _source: unknown,
+      resource: UriLike,
+      selectionOrPosition?: RangeLike | PositionLike | null,
+    ): boolean {
+      const uri = resource.toString();
+      const m = uri.match(
+        /^file:\/\/\/workspaces\/repos\/([^/]+)\/(.+?)(?:#.*)?$/,
+      );
+      if (!m) return false;
+      const [, repo, path] = m;
+      let line: number | undefined;
+      if (selectionOrPosition) {
+        if ("startLineNumber" in selectionOrPosition) {
+          line = (selectionOrPosition as RangeLike).startLineNumber;
+        } else if ("lineNumber" in selectionOrPosition) {
+          line = (selectionOrPosition as PositionLike).lineNumber;
+        }
+      }
+      emitFileRef({ repo, path, line });
+      return true;
+    },
+  };
+  (
+    monaco.editor as unknown as {
+      registerEditorOpener: (o: typeof opener) => unknown;
+    }
+  ).registerEditorOpener(opener);
 }
 
 /**

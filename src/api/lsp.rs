@@ -73,6 +73,13 @@ async fn run_lsp_bridge(socket: WebSocket, mission_id: Uuid) -> anyhow::Result<(
     let k8s = crate::k8s_pod::global_client()
         .ok_or_else(|| anyhow::anyhow!("k8s client unavailable (not running in cluster?)"))?;
 
+    // Backfill for missions started before the workspace-base
+    // image rebuild that baked in typescript-language-server.
+    // If the binary is missing, install it on the fly so the
+    // user doesn't have to recreate the mission pod just to get
+    // language support. ~10s install, one-shot per pod.
+    ensure_tsserver_installed(&k8s, mission_id).await?;
+
     // Spawn typescript-language-server inside the pod. The
     // workspace-base image installs it globally — we invoke the
     // bare binary so `--stdio` framing isn't disturbed by a shell
@@ -224,5 +231,61 @@ async fn write_lsp_message(stdin: &mut ChildStdin, body: &[u8]) -> anyhow::Resul
     stdin.write_all(header.as_bytes()).await?;
     stdin.write_all(body).await?;
     stdin.flush().await?;
+    Ok(())
+}
+
+/// Ensure `typescript-language-server` is on PATH inside the pod.
+/// Pods built from the workspace-base image >= the rebuild that
+/// added it already have it — this is a one-shot backfill for
+/// older pods. Idempotent: the `which` check short-circuits.
+async fn ensure_tsserver_installed(
+    k8s: &std::sync::Arc<crate::k8s_pod::K8sPodClient>,
+    mission_id: Uuid,
+) -> anyhow::Result<()> {
+    // Cheap probe first. We don't want to spawn npm on every
+    // LSP open.
+    let probe = k8s
+        .exec_command(
+            mission_id,
+            None,
+            "/bin/bash",
+            &[
+                "-lc".to_string(),
+                "command -v typescript-language-server >/dev/null".to_string(),
+            ],
+            &std::collections::HashMap::new(),
+        )
+        .await?;
+    if probe.status.success() {
+        return Ok(());
+    }
+    tracing::info!(
+        mission_id = %mission_id,
+        "typescript-language-server missing; installing via npm"
+    );
+    // `--silent --no-fund --no-audit` keeps the output short so we
+    // don't fill the kubectl-exec stderr buffer. Pinning the same
+    // versions the workspace-base image uses.
+    let install = k8s
+        .exec_command(
+            mission_id,
+            None,
+            "/bin/bash",
+            &[
+                "-lc".to_string(),
+                "npm install -g --silent --no-fund --no-audit \
+                 typescript@5.7.3 typescript-language-server@4.4.0"
+                    .to_string(),
+            ],
+            &std::collections::HashMap::new(),
+        )
+        .await?;
+    if !install.status.success() {
+        anyhow::bail!(
+            "npm install typescript-language-server failed (exit {:?}): {}",
+            install.status.code(),
+            String::from_utf8_lossy(&install.stderr)
+        );
+    }
     Ok(())
 }

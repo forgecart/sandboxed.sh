@@ -4,6 +4,7 @@ import { useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
 import type { DiffOnMount, Monaco } from "@monaco-editor/react";
 import {
+  ensureEditorOpener,
   ensureTheme,
   ensureTypeScriptDefaults,
   languageForPath,
@@ -64,6 +65,7 @@ export function MonacoDiffViewer({ path, head, worktree, splitView }: Props) {
   const onMount: DiffOnMount = (editor, monaco: Monaco) => {
     ensureTheme(monaco);
     ensureTypeScriptDefaults(monaco);
+    ensureEditorOpener(monaco);
     monaco.editor.setTheme("forgecart-dark");
     editorRef.current = {
       layout: () => editor.layout(),

@@ -5,6 +5,7 @@ import dynamic from "next/dynamic";
 import type { Monaco, OnMount } from "@monaco-editor/react";
 import type { editor } from "monaco-editor";
 import {
+  ensureEditorOpener,
   ensureTheme,
   ensureTypeScriptDefaults,
   languageForPath,
@@ -83,6 +84,7 @@ export function MonacoFileEditor({
   const onMount: OnMount = (ed, monaco: Monaco) => {
     ensureTheme(monaco);
     ensureTypeScriptDefaults(monaco);
+    ensureEditorOpener(monaco);
     monaco.editor.setTheme("forgecart-dark");
     editorRef.current = ed;
 
