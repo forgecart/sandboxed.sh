@@ -3836,6 +3836,48 @@ const PlanItem = memo(function PlanItem({
   );
 });
 
+function ChangesModal({
+  open,
+  missionId,
+  onClose,
+}: {
+  open: boolean;
+  missionId: string | null;
+  onClose: () => void;
+}) {
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!open || !mounted || !missionId) return null;
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[80] flex items-stretch justify-center"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Mission changes"
+    >
+      <div
+        className="absolute inset-0 bg-black/70 backdrop-blur-sm animate-in fade-in duration-150"
+        onClick={onClose}
+      />
+      <div className="relative w-full h-full flex flex-col bg-[#101010] sm:m-3 sm:rounded-2xl sm:border sm:border-white/[0.06] shadow-2xl animate-in fade-in zoom-in-95 duration-150 overflow-hidden">
+        <ChangesPanel missionId={missionId} onClose={onClose} />
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
 function AgentTasksPanel({
   todos,
   onClose,
@@ -11087,6 +11129,16 @@ export default function ControlClient() {
           onClose={() => setShowAutomationsDialog(false)}
         />
 
+        {/* Changes modal — per-mission git status + diff viewer in
+            a full-screen dialog. Previously rendered in the
+            right-column sidecar; promoted to a modal so the diff
+            pane gets the full viewport. Esc / backdrop / X close. */}
+        <ChangesModal
+          open={showChangesPanel && !!activeMission}
+          missionId={activeMission?.id ?? null}
+          onClose={() => setShowChangesPanel(false)}
+        />
+
         {/* Header */}
         <div className="relative z-10 mb-3 sm:mb-6 flex items-center justify-between gap-2 lg:gap-4">
           <div className="flex items-center gap-3 min-w-0 overflow-hidden">
@@ -12515,15 +12567,15 @@ export default function ControlClient() {
             </div>
           </div>
 
-          {/* Right column: Workbench, Desktop Stream, Changes,
-              Workers, Sub-agents, Agent Tasks stacked. Renders when
-              ANY child panel wants to be visible — each child has
-              its own dismiss state so closing one collapses just
-              that panel; closing the LAST visible child collapses
-              the whole column. */}
+          {/* Right column: Workbench, Desktop Stream, Workers,
+              Sub-agents, Agent Tasks stacked. Renders when ANY
+              child panel wants to be visible — each child has its
+              own dismiss state so closing one collapses just that
+              panel; closing the LAST visible child collapses the
+              whole column. Changes lives in a full-screen modal,
+              not this column. */}
           {(showWorkbenchPanel ||
             showDesktopStream ||
-            showChangesPanel ||
             (showWorkerPanel && isBossMission) ||
             (showSubagentsPanel && hasInMissionSubagents) ||
             (showAgentTasksPanel &&
@@ -12645,7 +12697,6 @@ export default function ControlClient() {
                     className={cn(
                       showWorkbenchPanel ||
                         showDesktopStream ||
-                        showChangesPanel ||
                         (showWorkerPanel && isBossMission) ||
                         (showSubagentsPanel && hasInMissionSubagents)
                         ? "flex-1 min-h-0"
@@ -12656,18 +12707,6 @@ export default function ControlClient() {
 
               {/* (Thinking Panel removed — thoughts now render
                   inline in the main chat thread.) */}
-
-              {/* Changes Panel — per-mission git status + unified
-                  diff viewer running inside the K8sPod. Click the
-                  Changes pill in the tab strip to open. */}
-              {showChangesPanel && activeMission && (
-                <div className="flex-1 min-h-0">
-                  <ChangesPanel
-                    missionId={activeMission.id}
-                    onClose={() => setShowChangesPanel(false)}
-                  />
-                </div>
-              )}
 
               {/* Desktop Stream Panel */}
               {showDesktopStream && (
