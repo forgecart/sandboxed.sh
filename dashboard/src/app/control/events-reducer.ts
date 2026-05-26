@@ -3,6 +3,13 @@ import { isStreamContinuation } from "@/lib/stream-continuation";
 
 export type CostSource = "actual" | "estimated" | "unknown";
 
+export interface TokenUsageRecord {
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheReadInputTokens: number;
+}
+
 export type ChatItem =
   | {
       kind: "user";
@@ -23,6 +30,7 @@ export type ChatItem =
       sharedFiles?: SharedFile[];
       resumable?: boolean;
       goalIteration?: number;
+      usage?: TokenUsageRecord;
       /**
        * Raw terminal_reason from the backend's completion_evidence, when
        * present. Lets the UI distinguish a real agent failure from a
@@ -97,6 +105,30 @@ export function parseCostAmount(raw: unknown): number | undefined {
     }
   }
   return undefined;
+}
+
+function readUsageInt(raw: unknown): number {
+  if (typeof raw === "number" && Number.isFinite(raw)) return Math.max(0, Math.trunc(raw));
+  if (typeof raw === "string") {
+    const n = Number(raw);
+    if (Number.isFinite(n)) return Math.max(0, Math.trunc(n));
+  }
+  return 0;
+}
+
+export function parseUsage(raw: unknown): TokenUsageRecord | undefined {
+  if (!isRecord(raw)) return undefined;
+  const input = readUsageInt(raw["input_tokens"]);
+  const output = readUsageInt(raw["output_tokens"]);
+  const cacheCreate = readUsageInt(raw["cache_creation_input_tokens"]);
+  const cacheRead = readUsageInt(raw["cache_read_input_tokens"]);
+  if (input + output + cacheCreate + cacheRead === 0) return undefined;
+  return {
+    inputTokens: input,
+    outputTokens: output,
+    cacheCreationInputTokens: cacheCreate,
+    cacheReadInputTokens: cacheRead,
+  };
 }
 
 export function parseCostMetadata(
@@ -251,6 +283,7 @@ export function eventsToItemsImpl(
           timestamp,
           terminalReason,
           resumable,
+          usage: parseUsage(meta["usage"]),
         });
         lastAssistantTimestamp = timestamp;
         break;

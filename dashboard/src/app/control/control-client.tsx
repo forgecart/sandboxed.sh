@@ -36,7 +36,9 @@ import {
   eventsToItemsImpl,
   isRecord,
   parseCostMetadata,
+  parseUsage,
   type ChatItem,
+  type TokenUsageRecord,
 } from "./events-reducer";
 export type { ChatItem } from "./events-reducer";
 import {
@@ -2772,6 +2774,115 @@ function SubagentChatView({
   );
 }
 
+interface MissionUsageStats {
+  totalInput: number;
+  totalOutput: number;
+  totalCacheRead: number;
+  totalCacheCreate: number;
+  latestInput: number;
+  latestModel: string | null;
+  assistantTurns: number;
+}
+
+/**
+ * Heuristic mapping of model id → context window in tokens.
+ *
+ * Used for the workbench progress gauge so "% of memory left" is
+ * meaningful per model. The `[1m]` suffix is Anthropic's 1M-token
+ * context variant; we treat it as the bigger window. We default to
+ * the 200K Sonnet/Opus baseline when the model is unknown — better
+ * to under-report headroom than fabricate it.
+ */
+function modelContextWindow(model: string | null): number {
+  if (!model) return 200_000;
+  const m = model.toLowerCase();
+  if (m.includes("[1m]")) return 1_000_000;
+  if (m.includes("opus") || m.includes("sonnet") || m.includes("haiku")) {
+    return 200_000;
+  }
+  if (m.includes("gpt-4.1") || m.includes("gpt-4o") || m.includes("gpt-5")) {
+    return 128_000;
+  }
+  if (m.includes("grok") || m.includes("xai")) return 131_072;
+  return 200_000;
+}
+
+function formatTokenCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 100_000 ? 0 : 1)}k`;
+  return n.toString();
+}
+
+function CircleGauge({
+  value,
+  max,
+  label,
+  centerLabel,
+  tone,
+}: {
+  value: number;
+  max: number;
+  label: string;
+  centerLabel: string;
+  tone: "indigo" | "violet" | "emerald" | "amber" | "rose";
+}) {
+  const pct = max > 0 ? Math.min(100, (value / max) * 100) : 0;
+  const radius = 22;
+  const circumference = 2 * Math.PI * radius;
+  const offset = circumference * (1 - pct / 100);
+  const stroke =
+    tone === "indigo"
+      ? "rgb(129 140 248)"
+      : tone === "violet"
+        ? "rgb(167 139 250)"
+        : tone === "emerald"
+          ? "rgb(52 211 153)"
+          : tone === "amber"
+            ? "rgb(251 191 36)"
+            : "rgb(251 113 133)";
+  return (
+    <div className="flex flex-col items-center gap-1.5">
+      <svg width={60} height={60} viewBox="0 0 60 60" aria-hidden="true">
+        <circle
+          cx={30}
+          cy={30}
+          r={radius}
+          stroke="rgba(255,255,255,0.07)"
+          strokeWidth={5}
+          fill="none"
+        />
+        <circle
+          cx={30}
+          cy={30}
+          r={radius}
+          stroke={stroke}
+          strokeWidth={5}
+          fill="none"
+          strokeLinecap="round"
+          strokeDasharray={circumference}
+          strokeDashoffset={offset}
+          transform="rotate(-90 30 30)"
+          style={{ transition: "stroke-dashoffset 400ms ease" }}
+        />
+        <text
+          x={30}
+          y={32}
+          textAnchor="middle"
+          dominantBaseline="middle"
+          fontSize={12}
+          fontWeight={600}
+          fill="rgba(255,255,255,0.92)"
+        >
+          {centerLabel}
+        </text>
+      </svg>
+      <span className="text-[10px] uppercase tracking-wide text-white/40">
+        {label}
+      </span>
+    </div>
+  );
+}
+
 function MissionWorkbenchPanel({
   mission,
   workspaceLabel,
@@ -2787,6 +2898,7 @@ function MissionWorkbenchPanel({
   onSetStatus,
   runSettingsSlot,
   dockerServices,
+  usage,
   className,
 }: {
   mission: Mission | null;
@@ -2811,6 +2923,10 @@ function MissionWorkbenchPanel({
    *  populated for K8sPod missions whose initial_repos brought up a
    *  compose stack). Empty / undefined hides the panel. */
   dockerServices?: import("@/lib/api").DockerServiceStatus[];
+  /** Token usage stats aggregated from this mission's
+   *  assistant_message events. Hidden until at least one turn
+   *  reports usage. */
+  usage?: MissionUsageStats;
   className?: string;
 }) {
   const title =
@@ -2961,6 +3077,98 @@ function MissionWorkbenchPanel({
 
             {dockerServices && dockerServices.length > 0 && (
               <DockerServicesPanel services={dockerServices} />
+            )}
+
+            {/* Token usage gauges. The "Context" gauge is the input
+                side of the most recent turn (raw + cache_read +
+                cache_creation) as a fraction of the model's context
+                window — i.e. how much memory the agent currently
+                has left. "Output" is cumulative output tokens for
+                the whole mission, scaled against an arbitrary 100k
+                soft cap (purely visual; the real spend is in
+                Stats). Hidden until at least one assistant turn
+                reports usage. */}
+            {usage && usage.assistantTurns > 0 && (
+              <section className="space-y-2">
+                <p className="text-[10px] uppercase tracking-wide text-white/30">
+                  Token usage
+                </p>
+                <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-3">
+                  <div className="grid grid-cols-2 gap-3">
+                    <CircleGauge
+                      value={usage.latestInput}
+                      max={modelContextWindow(usage.latestModel)}
+                      label="Context"
+                      centerLabel={`${Math.min(
+                        100,
+                        Math.round(
+                          (usage.latestInput /
+                            modelContextWindow(usage.latestModel)) *
+                            100,
+                        ),
+                      )}%`}
+                      tone={
+                        usage.latestInput /
+                          modelContextWindow(usage.latestModel) >
+                        0.85
+                          ? "rose"
+                          : usage.latestInput /
+                                modelContextWindow(usage.latestModel) >
+                              0.6
+                            ? "amber"
+                            : "indigo"
+                      }
+                    />
+                    <CircleGauge
+                      value={usage.totalOutput}
+                      max={100_000}
+                      label="Output"
+                      centerLabel={formatTokenCount(usage.totalOutput)}
+                      tone="emerald"
+                    />
+                  </div>
+                  <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-1 text-[10px]">
+                    <div className="flex items-center justify-between">
+                      <span className="text-white/40">Memory left</span>
+                      <span className="font-mono text-white/80">
+                        {formatTokenCount(
+                          Math.max(
+                            0,
+                            modelContextWindow(usage.latestModel) -
+                              usage.latestInput,
+                          ),
+                        )}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-white/40">Turns</span>
+                      <span className="font-mono text-white/80">
+                        {usage.assistantTurns}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-white/40">Cache hit</span>
+                      <span className="font-mono text-white/80">
+                        {usage.latestInput > 0
+                          ? `${Math.round(
+                              (usage.totalCacheRead /
+                                Math.max(1, usage.totalCacheRead + usage.totalInput)) *
+                                100,
+                            )}%`
+                          : "—"}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-white/40">Window</span>
+                      <span className="font-mono text-white/80">
+                        {formatTokenCount(
+                          modelContextWindow(usage.latestModel),
+                        )}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </section>
             )}
 
             {/* Agent Tasks moved to its own right-column panel — see
@@ -8771,6 +8979,7 @@ export default function ControlClient() {
               sharedFiles: sharedFiles ?? existing.sharedFiles,
               resumable,
               goalIteration: goalIterationForEvent ?? existing.goalIteration,
+              usage: parseUsage(data["usage"]) ?? existing.usage,
             };
             return updated;
           }
@@ -8789,6 +8998,7 @@ export default function ControlClient() {
             // goal mode so the chat badge can render "Iteration N"
             // instead of the noisy per-turn "Turn complete".
             goalIteration: goalIterationForEvent,
+            usage: parseUsage(data["usage"]),
           };
 
           const firstQueuedIdx = filtered.findIndex(
@@ -10672,6 +10882,45 @@ export default function ControlClient() {
     return null;
   }, [items]);
 
+  // Token totals + latest-turn context occupancy. Sum is over every
+  // assistant_message that carried a `usage` field. `latestInput` is
+  // the input-side of the most recent turn (raw input + cached read
+  // + cache creation) — Anthropic's API re-sends the entire prior
+  // conversation as input each turn, so this approximates how much
+  // of the model's context window is currently occupied. `output`
+  // is cumulative across the whole mission since the agent only
+  // ever appends.
+  const missionUsage = useMemo(() => {
+    let totalInput = 0;
+    let totalOutput = 0;
+    let totalCacheRead = 0;
+    let totalCacheCreate = 0;
+    let latestInput = 0;
+    let latestModel: string | null = null;
+    let assistantTurns = 0;
+    for (const item of items) {
+      if (item.kind !== "assistant" || !item.usage) continue;
+      const u = item.usage;
+      totalInput += u.inputTokens;
+      totalOutput += u.outputTokens;
+      totalCacheRead += u.cacheReadInputTokens;
+      totalCacheCreate += u.cacheCreationInputTokens;
+      latestInput =
+        u.inputTokens + u.cacheReadInputTokens + u.cacheCreationInputTokens;
+      latestModel = item.model ?? latestModel;
+      assistantTurns += 1;
+    }
+    return {
+      totalInput,
+      totalOutput,
+      totalCacheRead,
+      totalCacheCreate,
+      latestInput,
+      latestModel,
+      assistantTurns,
+    };
+  }, [items]);
+
   // Plan cards dedupe by file path: while the agent is in plan
   // mode it Writes the plan file repeatedly (every refinement).
   // Render ONLY the latest Write per `.claude/plans/<name>.md` so
@@ -10961,6 +11210,33 @@ export default function ControlClient() {
                     {childMissions.length}
                   </span>
                 )}
+              </button>
+            )}
+
+            {/* Agent tasks toggle — visible whenever the agent has emitted
+                at least one TodoWrite for this mission. Closing the panel
+                stays closed (per-mission dismiss state); this button is the
+                only path back. */}
+            {latestAgentTodos && latestAgentTodos.length > 0 && (
+              <button
+                onClick={() => setShowAgentTasksPanel((prev) => !prev)}
+                className={cn(
+                  "flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-sm transition-colors",
+                  showAgentTasksPanel
+                    ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-400"
+                    : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
+                )}
+                title={
+                  showAgentTasksPanel
+                    ? "Hide agent tasks panel"
+                    : "Show agent tasks panel"
+                }
+              >
+                <Flag className="h-4 w-4" />
+                <span className="hidden lg:inline">Tasks</span>
+                <span className="text-xs opacity-60">
+                  {latestAgentTodos.length}
+                </span>
               </button>
             )}
 
@@ -12278,6 +12554,7 @@ export default function ControlClient() {
                       ? dockerServicesByMission[activeMission.id]
                       : undefined
                   }
+                  usage={missionUsage}
                   runSettingsSlot={
                     activeMission && !viewingMissionIsRunning ? (
                       <NewMissionDialog
