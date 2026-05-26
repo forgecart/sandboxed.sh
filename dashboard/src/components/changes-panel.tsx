@@ -77,6 +77,10 @@ interface OpenTab {
   binary?: boolean;
   /** Edit tabs: line to reveal once on first open (used by find). */
   initialLine?: number;
+  /** Edit tabs: file changed on disk while the local buffer was
+   *  dirty. Banner asks the user to Reload (drop local) or Keep
+   *  mine. Cleared on reload or on the next save attempt. */
+  externallyModified?: boolean;
 }
 
 interface RepoSearchHit {
@@ -392,6 +396,148 @@ export function ChangesPanel({
   );
 
   const activeTab = activeTabId ? tabs.get(activeTabId) ?? null : null;
+
+  // Pull the latest worktree content for a single edit tab and
+  // replace its buffer + baseline. Used by both the explicit
+  // "Reload" action in the externally-modified banner and the
+  // auto-reload path when the local buffer is clean.
+  const refetchEditTab = useCallback(
+    async (tabId: string) => {
+      const tab = tabs.get(tabId);
+      if (!tab || tab.kind !== "edit") return;
+      try {
+        const API_BASE = getRuntimeApiBase();
+        const params = new URLSearchParams({
+          repo: tab.repoName,
+          path: tab.filePath,
+        });
+        const res = await fetch(
+          `${API_BASE}/api/control/missions/${missionId}/file?${params.toString()}`,
+          { headers: { ...authHeader() } },
+        );
+        if (!res.ok) return;
+        const body: {
+          content: string;
+          binary: boolean;
+          truncated: boolean;
+          unavailable: boolean;
+        } = await res.json();
+        setTabs((prev) => {
+          const cur = prev.get(tabId);
+          if (!cur || cur.kind !== "edit") return prev;
+          const next = new Map(prev);
+          next.set(tabId, {
+            ...cur,
+            editValue: body.content,
+            editBaseline: body.content,
+            externallyModified: false,
+          });
+          return next;
+        });
+      } catch {
+        // Best-effort — the next inotify tick (or the user's
+        // manual Refresh) will get another chance.
+      }
+    },
+    [missionId, tabs],
+  );
+
+  // Live file-system stream. One WebSocket per mission, opened
+  // once on mount, closed on unmount or mission change. Tabs
+  // share the stream. Backend lives in src/api/fs_watch.rs and
+  // forwards `inotifywait` lines from inside the pod.
+  //
+  // On each {repo, path, event}:
+  //  - If buffer is CLEAN  → silently refetch + replace (the agent
+  //    just edited the file we're viewing; you want the new
+  //    content without an interaction). The model.setValue() call
+  //    runs through Monaco's onDidChangeContent which our LSP
+  //    client already hooks into to send textDocument/didChange,
+  //    so the LSP stays in sync for free.
+  //  - If buffer is DIRTY  → mark externallyModified=true; render
+  //    a banner with [Reload] / [Keep mine]. Don't auto-clobber
+  //    the user's work.
+  const tabsRef = useRef(tabs);
+  useEffect(() => {
+    tabsRef.current = tabs;
+  }, [tabs]);
+  useEffect(() => {
+    if (!missionId) return;
+    const API_BASE = getRuntimeApiBase();
+    const wsUrl =
+      API_BASE.replace(/^http(s?):/, (_, s) => `ws${s}:`) +
+      `/api/control/missions/${missionId}/fs-events`;
+    // Attach the bearer token via query string — the browser's
+    // WebSocket API can't set headers.
+    const tok = (authHeader().Authorization ?? "").replace(/^Bearer\s+/i, "");
+    const url = tok ? `${wsUrl}?token=${encodeURIComponent(tok)}` : wsUrl;
+    let ws: WebSocket | null = null;
+    let cancelled = false;
+    // Reconnect with exponential backoff up to 30 s.
+    let backoff = 1000;
+    const connect = () => {
+      if (cancelled) return;
+      ws = new WebSocket(url);
+      ws.onopen = () => {
+        backoff = 1000;
+      };
+      ws.onmessage = (event) => {
+        let parsed: {
+          type?: string;
+          repo?: string;
+          path?: string;
+          event?: string;
+        };
+        try {
+          parsed = JSON.parse(event.data);
+        } catch {
+          return;
+        }
+        if (parsed.type !== "fs_change" || !parsed.repo || !parsed.path) return;
+        const repo = parsed.repo;
+        const path = parsed.path;
+        // Find all edit tabs matching this file.
+        for (const tab of tabsRef.current.values()) {
+          if (tab.kind !== "edit") continue;
+          if (tab.repoName !== repo || tab.filePath !== path) continue;
+          const dirty = tab.editValue !== tab.editBaseline;
+          if (dirty) {
+            setTabs((prev) => {
+              const cur = prev.get(tab.id);
+              if (!cur) return prev;
+              if (cur.externallyModified) return prev;
+              const next = new Map(prev);
+              next.set(tab.id, { ...cur, externallyModified: true });
+              return next;
+            });
+          } else {
+            void refetchEditTab(tab.id);
+          }
+        }
+      };
+      ws.onclose = () => {
+        if (cancelled) return;
+        window.setTimeout(connect, backoff);
+        backoff = Math.min(30_000, backoff * 2);
+      };
+      ws.onerror = () => {
+        try {
+          ws?.close();
+        } catch {
+          // ignore
+        }
+      };
+    };
+    connect();
+    return () => {
+      cancelled = true;
+      try {
+        ws?.close();
+      } catch {
+        // ignore
+      }
+    };
+  }, [missionId, refetchEditTab]);
 
   const runSearch = useCallback(async () => {
     if (!findQuery.trim() || !findRepo) {
@@ -725,6 +871,19 @@ export function ChangesPanel({
                 vim={vimMode}
                 onChange={(v) => updateEditValue(activeTab.id, v)}
                 onSave={() => void saveTab(activeTab.id)}
+                onReload={() => void refetchEditTab(activeTab.id)}
+                onKeepMine={() =>
+                  setTabs((prev) => {
+                    const cur = prev.get(activeTab.id);
+                    if (!cur) return prev;
+                    const next = new Map(prev);
+                    next.set(activeTab.id, {
+                      ...cur,
+                      externallyModified: false,
+                    });
+                    return next;
+                  })
+                }
               />
             ) : (
               <div className="flex h-full items-center justify-center text-sm text-white/40">
@@ -1155,6 +1314,8 @@ function ActiveTabBody({
   vim,
   onChange,
   onSave,
+  onReload,
+  onKeepMine,
 }: {
   tab: OpenTab;
   missionId: string;
@@ -1162,6 +1323,8 @@ function ActiveTabBody({
   vim: boolean;
   onChange: (next: string) => void;
   onSave: () => void;
+  onReload: () => void;
+  onKeepMine: () => void;
 }) {
   if (tab.kind === "diff" && tab.diff) {
     return (
@@ -1230,6 +1393,28 @@ function ActiveTabBody({
           </span>
         )}
       </div>
+      {tab.externallyModified && (
+        <div className="flex items-center gap-2 px-4 py-1.5 border-b border-amber-500/30 bg-amber-500/10 text-[12px] text-amber-200">
+          <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+          <span className="flex-1">
+            This file changed on disk while you were editing it.
+          </span>
+          <button
+            type="button"
+            onClick={onReload}
+            className="px-2 py-0.5 rounded border border-amber-400/30 text-[11px] hover:bg-amber-400/15"
+          >
+            Reload
+          </button>
+          <button
+            type="button"
+            onClick={onKeepMine}
+            className="px-2 py-0.5 rounded border border-white/10 text-[11px] text-white/70 hover:bg-white/[0.04]"
+          >
+            Keep mine
+          </button>
+        </div>
+      )}
       <MonacoFileEditor
         path={tab.filePath}
         missionId={missionId}

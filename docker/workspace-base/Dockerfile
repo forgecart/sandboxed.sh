@@ -16,11 +16,15 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Base tools the workspace and agents need.
+# `inotify-tools` ships `inotifywait`, used by the dashboard's
+# /fs-events WebSocket to stream pod-side file changes for live
+# editor updates.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash ca-certificates curl gnupg lsb-release \
         git openssh-client \
         sudo less \
         iproute2 iptables \
+        inotify-tools \
         tini \
     && rm -rf /var/lib/apt/lists/*
 

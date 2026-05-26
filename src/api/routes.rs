@@ -763,6 +763,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         .route("/api/control/missions/:id/lsp", get(super::lsp::lsp_bridge))
         .route(
+            "/api/control/missions/:id/fs-events",
+            get(super::fs_watch::fs_events),
+        )
+        .route(
             "/api/control/missions/:id/tree",
             get(control::get_mission_tree),
         )
