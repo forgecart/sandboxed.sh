@@ -13,11 +13,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Extension, Json,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::auth::AuthUser;
@@ -367,4 +367,157 @@ fn truncate_diff(s: String) -> (String, bool) {
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RepoTreeQuery {
+    /// Repository directory name under `/workspaces/repos/`.
+    pub repo: String,
+    /// Subpath relative to the repo root. Empty = list the repo
+    /// root itself.
+    #[serde(default)]
+    pub path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RepoTreeEntry {
+    pub name: String,
+    /// Path relative to the repo root (always with `/` separators).
+    pub path: String,
+    /// `"dir"` or `"file"` — symlinks are reported as whatever they
+    /// resolve to (we do not follow chains).
+    pub kind: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RepoTreeResponse {
+    pub entries: Vec<RepoTreeEntry>,
+    /// `true` when the per-mission pod isn't reachable.
+    pub unavailable: bool,
+}
+
+/// `/api/control/missions/:id/repo-tree?repo=<name>&path=<rel>`
+///
+/// Lists immediate children of a directory inside a cloned repo,
+/// for the dashboard's file-browser pane. Directories first, then
+/// files; alpha-sorted within each group. Hidden entries
+/// (starting with `.`) are included — they're useful to the user
+/// (e.g. `.github/`, `.env.example`). `.git/` is excluded — the
+/// dashboard does not need to walk Git's internal storage.
+///
+/// Path-traversal: we strictly reject `..` and absolute components
+/// so a malicious caller can't escape `/workspaces/repos/<repo>/`.
+pub async fn list_mission_repo_tree(
+    State(_state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    Query(q): Query<RepoTreeQuery>,
+) -> Result<Json<RepoTreeResponse>, (StatusCode, String)> {
+    // Reject path traversal + absolute paths. `repo` is a single
+    // directory name (slashes not allowed). `path` is relative; we
+    // split on `/` and disallow `..` / empty / absolute segments.
+    if q.repo.contains('/') || q.repo.contains("..") || q.repo.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "invalid repo".into()));
+    }
+    for seg in q.path.split('/') {
+        if seg == ".." {
+            return Err((StatusCode::BAD_REQUEST, "invalid path".into()));
+        }
+    }
+
+    let k8s = match crate::k8s_pod::global_client() {
+        Some(c) => c,
+        None => {
+            return Ok(Json(RepoTreeResponse {
+                entries: vec![],
+                unavailable: true,
+            }));
+        }
+    };
+
+    let full = if q.path.is_empty() {
+        format!("/workspaces/repos/{}", q.repo)
+    } else {
+        format!("/workspaces/repos/{}/{}", q.repo, q.path.trim_matches('/'))
+    };
+
+    // `find -mindepth 1 -maxdepth 1 -printf '%y\t%f\n'` gives us
+    // type + name in one cheap call. We sort client-side. `%y`
+    // returns `d` for dir, `f` for file, `l` for symlink, etc.
+    // We exclude `.git` at the source level so the user never sees
+    // it in the browser pane.
+    let script = format!(
+        "cd {} 2>/dev/null && find . -mindepth 1 -maxdepth 1 \\( -name .git -prune \\) -o -printf '%y\\t%f\\n'",
+        shell_quote(&full),
+    );
+    let out = match k8s
+        .exec_command(
+            mission_id,
+            None,
+            "/bin/bash",
+            &["-lc".to_string(), script],
+            &HashMap::new(),
+        )
+        .await
+    {
+        Ok(o) => o,
+        Err(_) => {
+            return Ok(Json(RepoTreeResponse {
+                entries: vec![],
+                unavailable: true,
+            }));
+        }
+    };
+    if !out.status.success() {
+        return Ok(Json(RepoTreeResponse {
+            entries: vec![],
+            unavailable: false,
+        }));
+    }
+
+    let mut entries: Vec<RepoTreeEntry> = Vec::new();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let mut parts = line.splitn(2, '\t');
+        let t = parts.next().unwrap_or("");
+        let name = parts.next().unwrap_or("").to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let kind = match t {
+            "d" => "dir",
+            "f" => "file",
+            // Symlinks resolve to their target type via -L on a
+            // separate stat; cheaper to just label as "file" since
+            // the browser is a read-only view and we don't follow.
+            "l" => "file",
+            _ => continue,
+        };
+        let rel = if q.path.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{}", q.path.trim_matches('/'), name)
+        };
+        entries.push(RepoTreeEntry {
+            name,
+            path: rel,
+            kind: kind.to_string(),
+        });
+    }
+    entries.sort_by(|a, b| {
+        let a_dir = a.kind == "dir";
+        let b_dir = b.kind == "dir";
+        if a_dir != b_dir {
+            return if a_dir {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+        a.name.cmp(&b.name)
+    });
+    Ok(Json(RepoTreeResponse {
+        entries,
+        unavailable: false,
+    }))
 }

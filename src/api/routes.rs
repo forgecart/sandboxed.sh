@@ -750,6 +750,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(super::changes::list_mission_changes),
         )
         .route(
+            "/api/control/missions/:id/repo-tree",
+            get(super::changes::list_mission_repo_tree),
+        )
+        .route(
             "/api/control/missions/:id/tree",
             get(control::get_mission_tree),
         )
