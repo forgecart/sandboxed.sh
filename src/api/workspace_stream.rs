@@ -833,7 +833,7 @@ async fn search(tx: &WsTx, id: &str, mission_id: Uuid, params: Value) {
         // render.
         if snippet.len() > MAX_SNIPPET_LEN {
             snippet.truncate(MAX_SNIPPET_LEN);
-            snippet.push_str("…");
+            snippet.push('…');
         }
         batch.push(json!({ "file": file, "line": lineno, "snippet": snippet }));
         hits += 1;
