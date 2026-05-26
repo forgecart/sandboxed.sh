@@ -3463,34 +3463,29 @@ function isTodoWriteTool(toolName: string): boolean {
 function extractPlanFromTool(
   toolName: string,
   args: unknown,
-): { plan: string; title: string } | null {
+): { plan: string; title: string; filePath: string | null } | null {
   if (!args || typeof args !== "object") return null;
   const obj = args as Record<string, unknown>;
   const nameLower = toolName.toLowerCase();
   if (nameLower === "exitplanmode") {
     const plan = obj["plan"];
     if (typeof plan === "string" && plan.trim()) {
-      return { plan, title: "Plan finalized" };
+      return { plan, title: "Plan finalized", filePath: null };
     }
   }
-  if (nameLower === "write" || nameLower === "edit") {
+  // Only Write counts as a "snapshot" of the plan — Edit's
+  // `new_string` is just the inserted fragment, not the whole plan,
+  // so we let Edit render as a regular tool card.
+  if (nameLower === "write") {
     const fp = obj["file_path"];
-    if (
-      typeof fp === "string" &&
-      /\.claude\/plans\/[^/]+\.md$/i.test(fp)
-    ) {
+    if (typeof fp === "string" && /\.claude\/plans\/[^/]+\.md$/i.test(fp)) {
       const content = obj["content"];
-      const newContent = obj["new_string"];
-      const plan =
-        (typeof content === "string" && content) ||
-        (typeof newContent === "string" && newContent) ||
-        "";
-      if (plan.trim()) {
-        const base =
-          fp.split("/").pop()?.replace(/\.md$/i, "") ?? "Plan";
+      if (typeof content === "string" && content.trim()) {
+        const base = fp.split("/").pop()?.replace(/\.md$/i, "") ?? "Plan";
         return {
-          plan,
+          plan: content,
           title: `Plan: ${base.replace(/[-_]/g, " ")}`,
+          filePath: fp,
         };
       }
     }
@@ -3500,6 +3495,22 @@ function extractPlanFromTool(
 
 function isPlanTool(toolName: string, args: unknown): boolean {
   return extractPlanFromTool(toolName, args) !== null;
+}
+
+/**
+ * Plan-card "key": the file path for plan-file Writes (so multiple
+ * Writes to the same file dedupe), or the tool_call_id for
+ * ExitPlanMode (which is canonical and per-call, never deduped).
+ * `null` when the tool isn't a plan tool at all.
+ */
+function planToolDedupeKey(
+  toolName: string,
+  args: unknown,
+  toolCallId: string,
+): string | null {
+  const info = extractPlanFromTool(toolName, args);
+  if (!info) return null;
+  return info.filePath ?? toolCallId;
 }
 
 // Right-side workbench panel showing the agent's CURRENT task list.
@@ -4441,12 +4452,14 @@ function CollapsedToolGroup({
   onToggleExpand,
   workspaceId,
   missionId,
+  visiblePlanToolIds,
 }: {
   tools: Extract<ChatItem, { kind: "tool" }>[];
   isExpanded: boolean;
   onToggleExpand: () => void;
   workspaceId?: string;
   missionId?: string;
+  visiblePlanToolIds?: Set<string>;
 }) {
   const hiddenCount = tools.length - 1;
   const lastTool = tools[tools.length - 1];
@@ -4462,10 +4475,14 @@ function CollapsedToolGroup({
     if (isTodoWriteTool(tool.name)) {
       return null;
     }
-    // ExitPlanMode + Write/Edit to `.claude/plans/*.md` → render
-    // as a compact "Plan" card that opens a full-screen markdown
-    // modal on click.
+    // ExitPlanMode + Write to `.claude/plans/*.md` → "Plan" card
+    // with a full-screen markdown modal. Earlier Writes to the
+    // same plan file are deduped away by `visiblePlanToolIds`
+    // (only the latest snapshot per file path renders).
     if (isPlanTool(tool.name, tool.args)) {
+      if (visiblePlanToolIds && !visiblePlanToolIds.has(tool.id)) {
+        return null;
+      }
       return <PlanItem key={tool.id} item={tool} />;
     }
     return (
@@ -4538,6 +4555,10 @@ type ChatItemRowProps = {
     result: unknown,
   ) => Promise<void>;
   onOptimisticToolResult: (toolCallId: string, result: unknown) => void;
+  /** Set of tool-call item ids whose plan card should render —
+   *  passing it lets the row dedupe earlier plan-file writes (see
+   *  `visiblePlanToolIds` memo in the parent). */
+  visiblePlanToolIds?: Set<string>;
 };
 
 /**
@@ -4558,6 +4579,7 @@ const ChatItemRow = memo(function ChatItemRow({
   onResume,
   onToolResult,
   onOptimisticToolResult,
+  visiblePlanToolIds,
 }: ChatItemRowProps) {
   const renderedContent =
     item.kind === "assistant" && item.sharedFiles?.length
@@ -4585,6 +4607,7 @@ const ChatItemRow = memo(function ChatItemRow({
           onToggleExpand={() => onToggleToolGroup(item.groupId)}
           workspaceId={workspaceId}
           missionId={missionId}
+          visiblePlanToolIds={visiblePlanToolIds}
         />
       </div>
     );
@@ -4894,7 +4917,13 @@ const ChatItemRow = memo(function ChatItemRow({
     }
 
     // Finalized-plan card with full-screen markdown modal.
+    // Dedupe by file path so only the latest Write per
+    // `.claude/plans/*.md` renders (see parent's
+    // `visiblePlanToolIds` memo).
     if (isPlanTool(item.name, item.args)) {
+      if (visiblePlanToolIds && !visiblePlanToolIds.has(item.id)) {
+        return null;
+      }
       return <PlanItem item={item} />;
     }
 
@@ -10643,6 +10672,23 @@ export default function ControlClient() {
     return null;
   }, [items]);
 
+  // Plan cards dedupe by file path: while the agent is in plan
+  // mode it Writes the plan file repeatedly (every refinement).
+  // Render ONLY the latest Write per `.claude/plans/<name>.md` so
+  // the user always sees the current plan, not a stack of stale
+  // drafts. ExitPlanMode calls never dedupe (each is a distinct
+  // finalize event keyed by tool_call_id).
+  const visiblePlanToolIds = useMemo<Set<string>>(() => {
+    const latestIdByKey = new Map<string, string>();
+    for (const item of items) {
+      if (item.kind !== "tool") continue;
+      const key = planToolDedupeKey(item.name, item.args, item.toolCallId);
+      if (key === null) continue;
+      latestIdByKey.set(key, item.id);
+    }
+    return new Set(latestIdByKey.values());
+  }, [items]);
+
   const hasInMissionSubagents = runningSubagents.length > 0;
   const isBossMission =
     childMissions.length > 0 ||
@@ -11799,6 +11845,7 @@ export default function ControlClient() {
                             onResume={stableResumeMission}
                             onToolResult={handleToolResultCommit}
                             onOptimisticToolResult={handleOptimisticToolResult}
+                            visiblePlanToolIds={visiblePlanToolIds}
                           />
                         </div>
                       );
