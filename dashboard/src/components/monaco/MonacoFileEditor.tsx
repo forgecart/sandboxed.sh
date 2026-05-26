@@ -4,7 +4,11 @@ import { useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
 import type { Monaco, OnMount } from "@monaco-editor/react";
 import type { editor } from "monaco-editor";
-import { ensureTheme, languageForPath } from "./setup";
+import {
+  ensureTheme,
+  ensureTypeScriptDefaults,
+  languageForPath,
+} from "./setup";
 
 const Editor = dynamic(
   () => import("@monaco-editor/react").then((m) => m.Editor),
@@ -64,6 +68,7 @@ export function MonacoFileEditor({
 
   const onMount: OnMount = (ed, monaco: Monaco) => {
     ensureTheme(monaco);
+    ensureTypeScriptDefaults(monaco);
     monaco.editor.setTheme("forgecart-dark");
     editorRef.current = ed;
 

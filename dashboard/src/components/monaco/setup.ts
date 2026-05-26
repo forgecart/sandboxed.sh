@@ -74,6 +74,55 @@ export function languageForPath(path: string): string {
 }
 
 /**
+ * Configure Monaco's bundled TypeScript / JavaScript language
+ * services for our single-file editing mode.
+ *
+ * The default TS service ships with classic module resolution
+ * and treats every open file as an isolated compilation unit —
+ * so importing a sibling file produces "Cannot find module
+ * './foo'" (TS2792). Since we don't load the user's whole
+ * project into Monaco's model graph, *semantic* diagnostics are
+ * just noise: every relative import would light up red.
+ *
+ * Solution: disable semantic diagnostics (no module resolution
+ * errors, no missing-type errors) but keep syntactic diagnostics
+ * (real parse errors stay visible). Also set NodeNext-style
+ * compiler options so the language service at least understands
+ * the syntax it's parsing (JSX, modern target).
+ *
+ * Idempotent — re-running on every editor mount is fine.
+ */
+export function ensureTypeScriptDefaults(monaco: Monaco) {
+  const targets = [
+    monaco.languages.typescript.typescriptDefaults,
+    monaco.languages.typescript.javascriptDefaults,
+  ];
+  for (const def of targets) {
+    def.setDiagnosticsOptions({
+      noSemanticValidation: true,
+      noSyntaxValidation: false,
+      noSuggestionDiagnostics: true,
+    });
+    def.setCompilerOptions({
+      target: monaco.languages.typescript.ScriptTarget.ESNext,
+      module: monaco.languages.typescript.ModuleKind.ESNext,
+      moduleResolution:
+        monaco.languages.typescript.ModuleResolutionKind.NodeJs,
+      allowNonTsExtensions: true,
+      allowJs: true,
+      jsx: monaco.languages.typescript.JsxEmit.ReactJSX,
+      esModuleInterop: true,
+      allowSyntheticDefaultImports: true,
+      skipLibCheck: true,
+      // Keep `import type` working even though we have no real
+      // resolution.
+      isolatedModules: true,
+    });
+    def.setEagerModelSync(true);
+  }
+}
+
+/**
  * Register our dark theme on the Monaco instance once. We mirror
  * the rest of the dashboard's palette (indigo accent, near-black
  * background) rather than using `vs-dark` so the editor doesn't

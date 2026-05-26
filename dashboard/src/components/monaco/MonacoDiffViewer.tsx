@@ -3,7 +3,11 @@
 import { useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
 import type { DiffOnMount, Monaco } from "@monaco-editor/react";
-import { ensureTheme, languageForPath } from "./setup";
+import {
+  ensureTheme,
+  ensureTypeScriptDefaults,
+  languageForPath,
+} from "./setup";
 
 const DiffEditor = dynamic(
   () => import("@monaco-editor/react").then((m) => m.DiffEditor),
@@ -59,6 +63,7 @@ export function MonacoDiffViewer({ path, head, worktree, splitView }: Props) {
 
   const onMount: DiffOnMount = (editor, monaco: Monaco) => {
     ensureTheme(monaco);
+    ensureTypeScriptDefaults(monaco);
     monaco.editor.setTheme("forgecart-dark");
     editorRef.current = {
       layout: () => editor.layout(),
