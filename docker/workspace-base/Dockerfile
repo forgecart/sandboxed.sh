@@ -47,10 +47,20 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 # avoids the "bun-fallback hang" path the resolver takes when
 # /usr/local/bin/claude --version doesn't substring-match.
 ARG CLAUDE_VERSION=2.1.140
+# typescript-language-server runs alongside the agent so the dashboard's
+# Monaco editor can connect over the LSP WebSocket bridge (see
+# `/api/control/missions/:id/lsp`) and get real cross-file diagnostics,
+# completions, etc. ~30 MB image bump, ~80 MB resident per pod. Pinned
+# so a tsserver upgrade doesn't quietly break the LSP wire protocol.
+ARG TS_VERSION=5.7.3
+ARG TS_LSP_VERSION=4.4.0
 RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && npm install -g --silent pnpm@latest \
     && npm install -g --silent "@anthropic-ai/claude-code@${CLAUDE_VERSION}" \
+    && npm install -g --silent \
+        "typescript@${TS_VERSION}" \
+        "typescript-language-server@${TS_LSP_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
 # --- gh ---------------------------------------------------------------------

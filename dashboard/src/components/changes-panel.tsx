@@ -720,6 +720,7 @@ export function ChangesPanel({
             {activeTab ? (
               <ActiveTabBody
                 tab={activeTab}
+                missionId={missionId}
                 splitView={viewMode === "split"}
                 vim={vimMode}
                 onChange={(v) => updateEditValue(activeTab.id, v)}
@@ -1149,12 +1150,14 @@ function TabBar({
  */
 function ActiveTabBody({
   tab,
+  missionId,
   splitView,
   vim,
   onChange,
   onSave,
 }: {
   tab: OpenTab;
+  missionId: string;
   splitView: boolean;
   vim: boolean;
   onChange: (next: string) => void;
@@ -1229,6 +1232,8 @@ function ActiveTabBody({
       </div>
       <MonacoFileEditor
         path={tab.filePath}
+        missionId={missionId}
+        repoName={tab.repoName}
         value={tab.editValue ?? ""}
         vim={vim}
         initialLine={tab.initialLine}

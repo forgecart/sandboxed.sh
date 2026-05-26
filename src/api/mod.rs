@@ -33,6 +33,7 @@ pub mod github_app;
 mod github_auth;
 pub(crate) mod grok_goal;
 pub mod library;
+pub mod lsp;
 pub mod mcp;
 pub mod metadata_llm;
 pub mod mission_runner;

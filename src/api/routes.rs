@@ -762,6 +762,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(super::changes::search_mission_repo),
         )
         .route(
+            "/api/control/missions/:id/lsp",
+            get(super::lsp::lsp_bridge),
+        )
+        .route(
             "/api/control/missions/:id/tree",
             get(control::get_mission_tree),
         )

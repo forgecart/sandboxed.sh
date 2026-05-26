@@ -9,6 +9,8 @@ import {
   ensureTypeScriptDefaults,
   languageForPath,
 } from "./setup";
+import { getLspClient, modelUriFor } from "./lsp-pool";
+import type { LspClient } from "./lsp-client";
 
 const Editor = dynamic(
   () => import("@monaco-editor/react").then((m) => m.Editor),
@@ -36,6 +38,12 @@ interface Props {
   initialLine?: number;
   /** Read-only mode (e.g. binary / >MAX_DIFF_BYTES). */
   readOnly?: boolean;
+  /** When provided, connect this editor's model to the per-mission
+   *  LSP (typescript-language-server inside the pod) so diagnostics,
+   *  hover, completion and go-to-definition resolve against the
+   *  real project graph. Pair must be set together. */
+  missionId?: string;
+  repoName?: string;
 }
 
 /**
@@ -56,6 +64,8 @@ export function MonacoFileEditor({
   vim,
   initialLine,
   readOnly,
+  missionId,
+  repoName,
 }: Props) {
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
   const vimStatusRef = useRef<HTMLDivElement | null>(null);
@@ -63,6 +73,10 @@ export function MonacoFileEditor({
   // client. The "disposer" object is kept here so we can clean up
   // before re-init or on unmount.
   const vimRef = useRef<{ dispose: () => void } | null>(null);
+  // Stash the LSP client + URI captured at attach time so the
+  // unmount cleanup can call closeModel without re-resolving the
+  // pool (which would race with React's StrictMode double-mount).
+  const lspAttachRef = useRef<{ client: LspClient; uri: string } | null>(null);
 
   const language = languageForPath(path);
 
@@ -83,6 +97,25 @@ export function MonacoFileEditor({
       ed.revealLineInCenter(initialLine);
       ed.setPosition({ lineNumber: initialLine, column: 1 });
       ed.focus();
+    }
+
+    // LSP attach. Skip if we don't have a mission+repo (e.g. a
+    // standalone editor outside the Changes workspace).
+    if (missionId && repoName) {
+      const model = ed.getModel();
+      if (model) {
+        const uri = model.uri.toString();
+        void getLspClient(missionId, repoName, monaco)
+          .then((client: LspClient) => {
+            lspAttachRef.current = { client, uri };
+            client.openModel(model);
+          })
+          .catch((err: unknown) => {
+            // LSP failure is non-fatal — the editor still works,
+            // just without cross-file diagnostics.
+            console.warn("LSP attach failed:", err);
+          });
+      }
     }
   };
 
@@ -112,19 +145,35 @@ export function MonacoFileEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vim]);
 
-  // Unmount cleanup for the vim adapter.
+  // Unmount cleanup for the vim adapter + LSP document.
   useEffect(() => {
     return () => {
       vimRef.current?.dispose();
       vimRef.current = null;
+      const attach = lspAttachRef.current;
+      if (attach) {
+        try {
+          attach.client.closeModel(attach.uri);
+        } catch {
+          // ignore — client may already be disposed
+        }
+        lspAttachRef.current = null;
+      }
     };
   }, []);
+
+  // When attached to an LSP we use the real workspace URI so the
+  // server can resolve relative imports against the project graph.
+  // Without LSP we fall back to the raw repo-relative path (the
+  // original behaviour).
+  const monacoPath =
+    missionId && repoName ? modelUriFor(repoName, path) : path;
 
   return (
     <div className="flex flex-col h-full min-h-0 min-w-0">
       <div className="flex-1 min-h-0">
         <Editor
-          path={path}
+          path={monacoPath}
           value={value}
           language={language}
           theme="forgecart-dark"

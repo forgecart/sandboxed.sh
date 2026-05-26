@@ -687,6 +687,57 @@ impl K8sPodClient {
         })
     }
 
+    /// Spawn a long-running, stdin/stdout-piped command inside the
+    /// per-mission pod via `kubectl exec -i`. The caller owns the
+    /// returned `Child` and is responsible for draining stdout +
+    /// killing the process when done.
+    ///
+    /// Used by the LSP WebSocket bridge to drive
+    /// `typescript-language-server --stdio` (and friends). Unlike
+    /// `exec_command`, we don't wrap the command in a shell so the
+    /// language server's stdio framing isn't mangled by a bash
+    /// `-lc` rcfile preamble.
+    pub async fn spawn_streaming_exec(
+        &self,
+        mission_id: Uuid,
+        program: &str,
+        args: &[&str],
+    ) -> Result<tokio::process::Child> {
+        let pod_name = pod_name(mission_id);
+        let api_server = std::env::var("KUBERNETES_SERVICE_HOST")
+            .ok()
+            .map(|host| {
+                let port =
+                    std::env::var("KUBERNETES_SERVICE_PORT").unwrap_or_else(|_| "443".to_string());
+                format!("https://{}:{}", host, port)
+            })
+            .unwrap_or_else(|| "https://kubernetes.default.svc".to_string());
+
+        let mut cmd = tokio::process::Command::new("kubectl");
+        cmd.arg("--token")
+            .arg(read_sa_token().unwrap_or_default())
+            .arg("--certificate-authority")
+            .arg("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+            .arg("--server")
+            .arg(&api_server)
+            .arg("--namespace")
+            .arg(&self.namespace)
+            .arg("exec")
+            .arg("-i")
+            .arg(&pod_name)
+            .arg("--")
+            .arg(program);
+        for a in args {
+            cmd.arg(*a);
+        }
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        cmd.spawn()
+            .with_context(|| format!("kubectl exec -i {} -- {}", pod_name, program))
+    }
+
     /// Snapshot of every compose service currently known to the
     /// mission pod's dockerd. Runs `docker compose ps --format json
     /// --all` from each `/workspaces/repos/*` directory that has a
