@@ -11778,9 +11778,15 @@ async fn run_single_control_turn(
                         // immediately fail the resume with "Session
                         // ID … is already in use".
                         if let Some(k8s) = crate::k8s_pod::global_client() {
-                            let kill_script = "pkill -9 -f 'claude ' 2>/dev/null; \
-                                               rm -f /root/.claude/projects/*/sessions/*.lock 2>/dev/null; \
-                                               true";
+                            // See mission_runner.rs for the [c]laude trick — the
+                            // ps/awk pipeline matches claude-* processes WITHOUT
+                            // the regex literal containing "claude", so the bash
+                            // hosting this script doesn't kill itself.
+                            let kill_script = "ps -eo pid,args --no-headers 2>/dev/null \
+                                             | awk '/[c]laude --print/ || /[c]laude --session-id/ {print $1}' \
+                                             | xargs -r kill -9 2>/dev/null; \
+                                             rm -f /root/.claude/projects/*/sessions/*.lock 2>/dev/null; \
+                                             true";
                             let _ = k8s
                                 .exec_command(
                                     mid,

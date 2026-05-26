@@ -5738,10 +5738,17 @@ pub fn run_claudecode_turn<'a>(
                                                             if let Some(k8s) =
                                                                 crate::k8s_pod::global_client()
                                                             {
-                                                                let kill_script = "pkill -9 -f 'claude --print' 2>/dev/null; \
-                                                                                   pkill -9 -f 'claude --session-id' 2>/dev/null; \
-                                                                                   rm -f /root/.claude/projects/*/sessions/*.lock 2>/dev/null; \
-                                                                                   true";
+                                                                // `[c]laude` trick: the regex literal
+                                                                // doesn't contain "claude", so the awk /
+                                                                // ps pipeline doesn't match its own
+                                                                // cmdline (which would self-suicide the
+                                                                // bash). Then xargs sends SIGKILL to
+                                                                // every matching pid in one shot.
+                                                                let kill_script = "ps -eo pid,args --no-headers 2>/dev/null \
+                                                                                 | awk '/[c]laude --print/ || /[c]laude --session-id/ {print $1}' \
+                                                                                 | xargs -r kill -9 2>/dev/null; \
+                                                                                 rm -f /root/.claude/projects/*/sessions/*.lock 2>/dev/null; \
+                                                                                 true";
                                                                 let _ = k8s
                                                                     .exec_command(
                                                                         mission_id,
@@ -5754,6 +5761,12 @@ pub fn run_claudecode_turn<'a>(
                                                                         &std::collections::HashMap::new(),
                                                                     )
                                                                     .await;
+                                                                // Brief grace so the OS reaps the killed
+                                                                // process before we respawn.
+                                                                tokio::time::sleep(
+                                                                    std::time::Duration::from_millis(500),
+                                                                )
+                                                                .await;
                                                             }
                                                         }
 
