@@ -5721,6 +5721,42 @@ pub fn run_claudecode_turn<'a>(
                                                         pty.kill();
                                                         reader_handle.abort();
 
+                                                        // Killing the local kubectl-exec PTY
+                                                        // sends SIGKILL to kubectl client; the
+                                                        // exec'd `claude` inside the pod gets
+                                                        // a HUP/INT through the apiserver but
+                                                        // doesn't always die cleanly. If it
+                                                        // survives, it holds the session lock
+                                                        // and the post-answer respawn fails
+                                                        // with "Session ID is already in use".
+                                                        // For K8sPod missions, explicitly nuke
+                                                        // any leftover claude + stale lock
+                                                        // files before continuing.
+                                                        if workspace.workspace_type
+                                                            == crate::workspace::WorkspaceType::K8sPod
+                                                        {
+                                                            if let Some(k8s) =
+                                                                crate::k8s_pod::global_client()
+                                                            {
+                                                                let kill_script = "pkill -9 -f 'claude --print' 2>/dev/null; \
+                                                                                   pkill -9 -f 'claude --session-id' 2>/dev/null; \
+                                                                                   rm -f /root/.claude/projects/*/sessions/*.lock 2>/dev/null; \
+                                                                                   true";
+                                                                let _ = k8s
+                                                                    .exec_command(
+                                                                        mission_id,
+                                                                        None,
+                                                                        "/bin/bash",
+                                                                        &[
+                                                                            "-lc".to_string(),
+                                                                            kill_script.to_string(),
+                                                                        ],
+                                                                        &std::collections::HashMap::new(),
+                                                                    )
+                                                                    .await;
+                                                            }
+                                                        }
+
                                                         let answer = tokio::select! {
                                                             _ = cancel.cancelled() => {
                                                                 return AgentResult::failure("Cancelled".to_string(), 0)
