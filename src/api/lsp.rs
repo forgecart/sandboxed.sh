@@ -78,11 +78,7 @@ async fn run_lsp_bridge(socket: WebSocket, mission_id: Uuid) -> anyhow::Result<(
     // bare binary so `--stdio` framing isn't disturbed by a shell
     // rc file.
     let mut child = k8s
-        .spawn_streaming_exec(
-            mission_id,
-            "typescript-language-server",
-            &["--stdio"],
-        )
+        .spawn_streaming_exec(mission_id, "typescript-language-server", &["--stdio"])
         .await?;
     let stdin = child
         .stdin
@@ -216,8 +212,8 @@ async fn read_lsp_message(stdout: &mut BufReader<ChildStdout>) -> anyhow::Result
         }
         // Other headers (Content-Type, etc.) ignored.
     }
-    let len = content_length
-        .ok_or_else(|| anyhow::anyhow!("LSP message missing Content-Length"))?;
+    let len =
+        content_length.ok_or_else(|| anyhow::anyhow!("LSP message missing Content-Length"))?;
     let mut body = vec![0u8; len];
     stdout.read_exact(&mut body).await?;
     Ok(Some(body))
