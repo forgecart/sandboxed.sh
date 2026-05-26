@@ -267,6 +267,48 @@ fn extract_telegram_instructions(user_message: &str) -> Option<String> {
 ///
 /// The function is idempotent — it only writes once (checks for the `# Telegram Structured Memory`
 /// marker).
+/// Append a short instruction block to CLAUDE.md telling the agent
+/// to write file references in a regex-friendly form
+/// (`repo/path/to/file.ext:line`). The dashboard's chat renderer
+/// linkifies these so the user can click straight into the Monaco
+/// editor at the matching line.
+///
+/// Idempotent — re-running on the same file leaves the marker
+/// intact and skips. Mirrors the Telegram inject pattern.
+pub fn inject_dashboard_file_refs_into_claude_md(claude_md_path: &Path) {
+    const MARKER: &str = "# Dashboard File References";
+    let existing = std::fs::read_to_string(claude_md_path).unwrap_or_default();
+    if existing.contains(MARKER) {
+        return;
+    }
+    let mut extra = String::new();
+    extra.push_str("\n\n");
+    extra.push_str(MARKER);
+    extra.push_str("\n\n");
+    extra.push_str(
+        "When you reference a specific file or line of code, write it as\n\
+         `repo/path/to/file.ext:line` (or `repo/path/to/file.ext` without a line) — \
+         the `repo` is the directory name as it appears under `/workspaces/repos/`. \
+         Example: `forgecart/src/api/control.rs:1234`.\n\n\
+         The dashboard renders these inline as clickable links that open the file in \
+         the Monaco editor at that line, so prefer this form over prose like \
+         \"line 42 of control.rs\". You may use it inside backticks or as bare text; \
+         both linkify.\n",
+    );
+    if let Err(e) = std::fs::write(claude_md_path, format!("{}{}", existing, extra)) {
+        tracing::warn!(
+            path = %claude_md_path.display(),
+            error = %e,
+            "Failed to write dashboard file-refs injection to CLAUDE.md"
+        );
+    } else {
+        tracing::info!(
+            path = %claude_md_path.display(),
+            "Injected dashboard file-refs instruction into CLAUDE.md"
+        );
+    }
+}
+
 pub fn inject_telegram_identity_into_claude_md(
     claude_md_path: &Path,
     user_message: &str,
@@ -3157,6 +3199,17 @@ async fn run_mission_turn(
     } else {
         mission_work_dir
     };
+
+    // For every mission: tell the agent how to write file references
+    // so the dashboard's chat renderer can linkify them. Idempotent;
+    // safe to re-run on every turn. Creates the CLAUDE.md if missing.
+    {
+        let claude_md_path = mission_work_dir.join("CLAUDE.md");
+        if !claude_md_path.exists() {
+            let _ = std::fs::write(&claude_md_path, "");
+        }
+        inject_dashboard_file_refs_into_claude_md(&claude_md_path);
+    }
 
     // For Telegram missions, append channel instructions and memory awareness
     // to CLAUDE.md so the backend LLM adopts the bot persona.

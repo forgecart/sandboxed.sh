@@ -130,9 +130,18 @@ interface MissionChangesResponse {
 export function ChangesPanel({
   missionId,
   onClose,
+  pendingOpen,
+  onPendingOpenConsumed,
 }: {
   missionId: string;
   onClose: () => void;
+  /** External request to open a specific file at a specific line —
+   *  used by the chat's file-ref linkifier. ChangesPanel calls
+   *  `openEditTab(repo, path, line)` and then signals the parent
+   *  to clear the pending state so re-clicking the same ref still
+   *  fires (state-equality otherwise no-ops the effect). */
+  pendingOpen?: { repo: string; path: string; line?: number } | null;
+  onPendingOpenConsumed?: () => void;
 }) {
   const [data, setData] = useState<MissionChangesResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -377,6 +386,18 @@ export function ChangesPanel({
     },
     [missionId],
   );
+
+  // External "open this file at line N" request — e.g. chat
+  // file-ref linkifier dispatches one when the user clicks a
+  // `repo/path:line` reference. We fire openEditTab + ack so the
+  // parent can clear the pending state (so the SAME ref clicked
+  // twice still re-opens).
+  useEffect(() => {
+    if (!pendingOpen) return;
+    void openEditTab(pendingOpen.repo, pendingOpen.path, pendingOpen.line);
+    onPendingOpenConsumed?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingOpen]);
 
   const updateEditValue = useCallback((id: string, value: string) => {
     setTabs((prev) => {

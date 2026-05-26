@@ -10,6 +10,8 @@ import { cn } from "@/lib/utils";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
 import { transformRichTags } from "@/lib/rich-tags";
+import { emitFileRef } from "@/lib/file-ref-bus";
+import { findFileRefs, parseFileRef } from "@/lib/file-ref";
 import {
   FILE_EXTENSIONS,
   isMarkdownFile,
@@ -18,6 +20,91 @@ import {
   isCodeFile,
   isArchiveFile,
 } from "@/lib/file-extensions";
+
+/**
+ * Clickable file reference rendered inside chat markdown. Emits
+ * to the file-ref bus, which the control surface picks up to
+ * open the Editor modal at that file + line. Styled to look like
+ * a link, with a subtle code-tinted bg so paths still read as
+ * paths.
+ */
+function FileRefLink({
+  repo,
+  path,
+  line,
+  children,
+}: {
+  repo: string;
+  path: string;
+  line?: number;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        emitFileRef({ repo, path, line });
+      }}
+      title={`Open ${repo}/${path}${line ? `:${line}` : ""} in editor`}
+      className="text-indigo-300 hover:text-indigo-200 underline underline-offset-2 decoration-indigo-500/40 hover:decoration-indigo-400/70 transition-colors font-mono text-[0.95em]"
+    >
+      {children}
+    </button>
+  );
+}
+
+/**
+ * Walk a React `children` payload and replace any text node that
+ * contains `repo/path[:line]` matches with FileRefLink fragments.
+ * Returns the original `children` untouched when there are no
+ * matches (no allocation on the common path).
+ */
+function linkifyChildren(children: React.ReactNode): React.ReactNode {
+  if (typeof children === "string") {
+    return linkifyString(children);
+  }
+  if (Array.isArray(children)) {
+    const out: React.ReactNode[] = [];
+    let dirty = false;
+    for (const c of children) {
+      if (typeof c === "string") {
+        const replaced = linkifyString(c);
+        if (replaced !== c) dirty = true;
+        if (Array.isArray(replaced)) out.push(...replaced);
+        else out.push(replaced);
+      } else {
+        out.push(c);
+      }
+    }
+    return dirty ? out : children;
+  }
+  return children;
+}
+
+function linkifyString(s: string): React.ReactNode {
+  const refs = findFileRefs(s);
+  if (refs.length === 0) return s;
+  const parts: React.ReactNode[] = [];
+  let cursor = 0;
+  refs.forEach((ref, i) => {
+    if (ref.start > cursor) parts.push(s.slice(cursor, ref.start));
+    parts.push(
+      <FileRefLink
+        key={`${ref.start}-${i}`}
+        repo={ref.repo}
+        path={ref.path}
+        line={ref.line}
+      >
+        {ref.raw}
+      </FileRefLink>,
+    );
+    cursor = ref.end;
+  });
+  if (cursor < s.length) parts.push(s.slice(cursor));
+  return parts;
+}
 
 interface MarkdownContentProps {
   content: string;
@@ -1004,6 +1091,30 @@ export const MarkdownContent = memo(function MarkdownContent({
       const isInline = !match && !codeString.includes("\n");
 
       if (isInline) {
+        // Highest-priority match: `repo/path[:line]` ref the
+        // agent emits per the CLAUDE.md instruction. Open in the
+        // Monaco editor at the line via the file-ref bus.
+        const ref = parseFileRef(codeString);
+        if (ref) {
+          return (
+            <button
+              type="button"
+              className="px-1.5 py-0.5 rounded bg-white/[0.06] text-indigo-300 text-xs font-mono cursor-pointer hover:bg-white/[0.1] hover:text-indigo-200 transition-colors"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                emitFileRef({
+                  repo: ref.repo,
+                  path: ref.path,
+                  line: ref.line,
+                });
+              }}
+              title={`Open ${codeString} in editor`}
+            >
+              {children}
+            </button>
+          );
+        }
         if (isFilePath(codeString)) {
           return (
             <code
@@ -1061,6 +1172,21 @@ export const MarkdownContent = memo(function MarkdownContent({
     },
     pre({ children }) {
       return <>{children}</>;
+    },
+    // Linkify bare `repo/path:line` mentions inside prose. The
+    // file-ref regex is conservative (whitelisted extensions,
+    // 2+ path segments) so it won't fire on dotted package
+    // names or URL fragments. Children that already render as
+    // <a>/<code>/<FileRefLink> pass through untouched — only
+    // raw string children get walked.
+    p({ children }) {
+      return <p>{linkifyChildren(children)}</p>;
+    },
+    li({ children }) {
+      return <li>{linkifyChildren(children)}</li>;
+    },
+    td({ children }) {
+      return <td>{linkifyChildren(children)}</td>;
     },
   }), [basePath, workspaceId, missionId]);
 

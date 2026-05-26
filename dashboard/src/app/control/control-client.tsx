@@ -60,6 +60,7 @@ import { inferMissionRole } from "@/lib/mission-role";
 import { getMissionDotColor, isFinishedStatus } from "@/lib/mission-status";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
+import { onFileRef } from "@/lib/file-ref-bus";
 import { stripRichFileTagsByName } from "@/lib/rich-tags";
 import { readCachedEvents, writeCachedEvents } from "@/lib/event-cache";
 import {
@@ -3840,10 +3841,14 @@ function ChangesModal({
   open,
   missionId,
   onClose,
+  pendingOpen,
+  onPendingOpenConsumed,
 }: {
   open: boolean;
   missionId: string | null;
   onClose: () => void;
+  pendingOpen?: { repo: string; path: string; line?: number } | null;
+  onPendingOpenConsumed?: () => void;
 }) {
   const [mounted, setMounted] = useState(false);
   // Don't tear down ChangesPanel when the user closes the modal —
@@ -3898,7 +3903,12 @@ function ChangesModal({
           open ? "opacity-100" : "opacity-0",
         )}
       >
-        <ChangesPanel missionId={missionId} onClose={onClose} />
+        <ChangesPanel
+          missionId={missionId}
+          onClose={onClose}
+          pendingOpen={pendingOpen}
+          onPendingOpenConsumed={onPendingOpenConsumed}
+        />
       </div>
     </div>,
     document.body,
@@ -5681,6 +5691,20 @@ export default function ControlClient() {
   // sub-agent strip to open. Reset to closed when the viewed mission
   // changes (a different mission has its own changes set).
   const [showChangesPanel, setShowChangesPanel] = useState(false);
+  // Pending "open this file at line N" request, set by the chat's
+  // file-ref linkifier. ChangesPanel consumes it on next render
+  // and acks via onPendingOpenConsumed.
+  const [pendingFileRef, setPendingFileRef] = useState<
+    { repo: string; path: string; line?: number } | null
+  >(null);
+  // Bus subscription: when the chat dispatches a file-ref click,
+  // open the editor modal and queue the target for ChangesPanel.
+  useEffect(() => {
+    return onFileRef((target) => {
+      setPendingFileRef(target);
+      setShowChangesPanel(true);
+    });
+  }, []);
   const handleToggleThinkingPanel = useCallback(() => {
     setShowThinkingPanel((prev) => {
       const next = !prev;
@@ -11164,6 +11188,8 @@ export default function ControlClient() {
           open={showChangesPanel && !!activeMission}
           missionId={activeMission?.id ?? null}
           onClose={() => setShowChangesPanel(false)}
+          pendingOpen={pendingFileRef}
+          onPendingOpenConsumed={() => setPendingFileRef(null)}
         />
 
         {/* Header */}
