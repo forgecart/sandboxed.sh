@@ -55,6 +55,7 @@ pub mod settings;
 pub mod system;
 pub mod telegram;
 pub mod types;
+pub mod workspace_stream;
 pub mod workspaces;
 
 pub use routes::serve;

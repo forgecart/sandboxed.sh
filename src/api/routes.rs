@@ -767,6 +767,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(super::fs_watch::fs_events),
         )
         .route(
+            "/api/control/missions/:id/workspace-stream",
+            get(super::workspace_stream::workspace_stream),
+        )
+        .route(
             "/api/control/missions/:id/tree",
             get(control::get_mission_tree),
         )

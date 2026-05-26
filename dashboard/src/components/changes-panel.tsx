@@ -21,9 +21,13 @@ import {
   Circle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { apiGet } from "@/lib/api/core";
-import { authHeader } from "@/lib/auth";
-import { getRuntimeApiBase } from "@/lib/settings";
+import {
+  getWorkspaceStream,
+  type ChangedFileChunk,
+  type FsChangeEvent,
+  type ListChangesReady,
+  type SearchHitChunk,
+} from "@/lib/workspace-stream";
 import { MonacoDiffViewer } from "./monaco/MonacoDiffViewer";
 import { MonacoFileEditor } from "./monaco/MonacoFileEditor";
 
@@ -132,6 +136,12 @@ export function ChangesPanel({
 }) {
   const [data, setData] = useState<MissionChangesResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  // Real loaded/total from the streaming list_changes endpoint.
+  // Replaces the prior simulated progress bar.
+  const [loadProgress, setLoadProgress] = useState<{
+    loaded: number;
+    total: number;
+  }>({ loaded: 0, total: 0 });
   const [error, setError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<DiffViewMode>(() =>
     readStoredViewMode(),
@@ -182,24 +192,73 @@ export function ChangesPanel({
     window.localStorage.setItem(VIM_STORAGE_KEY, vimMode ? "1" : "0");
   }, [vimMode]);
 
-  const reload = async () => {
+  // Streaming load over the mux WS. The server first emits
+  // `ready` with the full file list (we render the tree right
+  // away) and then `chunk` per file as its head/worktree
+  // content lands. Real progress = loaded/total from the
+  // `progress` events.
+  const reload = useCallback(async () => {
     setLoading(true);
     setError(null);
+    setLoadProgress({ loaded: 0, total: 0 });
+    const stream = getWorkspaceStream(missionId);
     try {
-      const res = await apiGet<MissionChangesResponse>(
-        `/api/control/missions/${missionId}/changes`,
-        "Failed to load changes",
-      );
-      setData(res);
-      if (findRepo === null && res.repos.length > 0) {
-        setFindRepo(res.repos[0].name);
-      }
+      await stream.stream<{ total: number }, ChangedFileChunk, ListChangesReady>(
+        "list_changes",
+        {},
+        {
+          onReady: (ready) => {
+            // Materialise placeholder MissionChangedFile entries
+            // so the tree renders before per-file content arrives.
+            const repos: MissionChangedRepo[] = ready.repos.map((r) => ({
+              name: r.name,
+              files: r.files.map((f) => ({
+                path: f.path,
+                status: f.status,
+                diff: "",
+                head_content: null,
+                worktree_content: null,
+                truncated: false,
+              })),
+            }));
+            setData({ mission_id: missionId, repos, unavailable: false });
+            if (findRepo === null && repos.length > 0) {
+              setFindRepo(repos[0].name);
+            }
+            setLoadProgress({ loaded: 0, total: ready.total });
+          },
+          onChunk: ({ file }) => {
+            setData((prev) => {
+              if (!prev) return prev;
+              const repos = prev.repos.map((r) => {
+                if (r.name !== file.repo) return r;
+                return {
+                  ...r,
+                  files: r.files.map((f) =>
+                    f.path === file.path
+                      ? {
+                          ...f,
+                          status: file.status,
+                          head_content: file.head_content,
+                          worktree_content: file.worktree_content,
+                          truncated: file.truncated,
+                        }
+                      : f,
+                  ),
+                };
+              });
+              return { ...prev, repos };
+            });
+          },
+          onProgress: ({ loaded, total }) => setLoadProgress({ loaded, total }),
+        },
+      ).result;
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
-  };
+  }, [missionId, findRepo]);
 
   useEffect(() => {
     void reload();
@@ -283,21 +342,14 @@ export function ChangesPanel({
       setActiveTabId(id);
       if (exists) return;
 
-      // Load file content from the backend.
+      // Load file content via the mux WS.
       try {
-        const API_BASE = getRuntimeApiBase();
-        const params = new URLSearchParams({ repo: repoName, path: filePath });
-        const res = await fetch(
-          `${API_BASE}/api/control/missions/${missionId}/file?${params.toString()}`,
-          { headers: { ...authHeader() } },
-        );
-        if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-        const body: {
+        const stream = getWorkspaceStream(missionId);
+        const body = await stream.call<{
           content: string;
           binary: boolean;
           truncated: boolean;
-          unavailable: boolean;
-        } = await res.json();
+        }>("read_file", { repo: repoName, path: filePath });
         setTabs((prev) => {
           const cur = prev.get(id);
           if (!cur) return prev;
@@ -308,7 +360,7 @@ export function ChangesPanel({
             binary: body.binary,
             editValue: body.content,
             editBaseline: body.content,
-            error: body.unavailable ? "Pod unavailable" : null,
+            error: null,
           });
           return next;
         });
@@ -349,23 +401,12 @@ export function ChangesPanel({
         return next;
       });
       try {
-        const API_BASE = getRuntimeApiBase();
-        const params = new URLSearchParams({
+        const stream = getWorkspaceStream(missionId);
+        await stream.call<{ ok: boolean }>("write_file", {
           repo: tab.repoName,
           path: tab.filePath,
+          content: tab.editValue,
         });
-        const res = await fetch(
-          `${API_BASE}/api/control/missions/${missionId}/file?${params.toString()}`,
-          {
-            method: "PUT",
-            headers: {
-              "Content-Type": "application/json",
-              ...authHeader(),
-            },
-            body: JSON.stringify({ content: tab.editValue }),
-          },
-        );
-        if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
         setTabs((prev) => {
           const cur = prev.get(id);
           if (!cur) return prev;
@@ -406,22 +447,12 @@ export function ChangesPanel({
       const tab = tabs.get(tabId);
       if (!tab || tab.kind !== "edit") return;
       try {
-        const API_BASE = getRuntimeApiBase();
-        const params = new URLSearchParams({
-          repo: tab.repoName,
-          path: tab.filePath,
-        });
-        const res = await fetch(
-          `${API_BASE}/api/control/missions/${missionId}/file?${params.toString()}`,
-          { headers: { ...authHeader() } },
-        );
-        if (!res.ok) return;
-        const body: {
+        const stream = getWorkspaceStream(missionId);
+        const body = await stream.call<{
           content: string;
           binary: boolean;
           truncated: boolean;
-          unavailable: boolean;
-        } = await res.json();
+        }>("read_file", { repo: tab.repoName, path: tab.filePath });
         setTabs((prev) => {
           const cur = prev.get(tabId);
           if (!cur || cur.kind !== "edit") return prev;
@@ -442,101 +473,41 @@ export function ChangesPanel({
     [missionId, tabs],
   );
 
-  // Live file-system stream. One WebSocket per mission, opened
-  // once on mount, closed on unmount or mission change. Tabs
-  // share the stream. Backend lives in src/api/fs_watch.rs and
-  // forwards `inotifywait` lines from inside the pod.
-  //
-  // On each {repo, path, event}:
-  //  - If buffer is CLEAN  → silently refetch + replace (the agent
-  //    just edited the file we're viewing; you want the new
-  //    content without an interaction). The model.setValue() call
-  //    runs through Monaco's onDidChangeContent which our LSP
-  //    client already hooks into to send textDocument/didChange,
-  //    so the LSP stays in sync for free.
-  //  - If buffer is DIRTY  → mark externallyModified=true; render
-  //    a banner with [Reload] / [Keep mine]. Don't auto-clobber
-  //    the user's work.
+  // Live file-system subscription rides on the same mux WS as
+  // changes / read_file / search. On each {repo, path, event}:
+  //  - Buffer CLEAN → silently refetch + replace. Monaco's
+  //    onDidChangeContent triggers our LSP client's didChange so
+  //    the language server stays in sync for free.
+  //  - Buffer DIRTY → mark externallyModified=true; render a
+  //    banner with [Reload] / [Keep mine] so the user's in-flight
+  //    typing isn't clobbered.
   const tabsRef = useRef(tabs);
   useEffect(() => {
     tabsRef.current = tabs;
   }, [tabs]);
   useEffect(() => {
     if (!missionId) return;
-    const API_BASE = getRuntimeApiBase();
-    const wsUrl =
-      API_BASE.replace(/^http(s?):/, (_, s) => `ws${s}:`) +
-      `/api/control/missions/${missionId}/fs-events`;
-    // Attach the bearer token via query string — the browser's
-    // WebSocket API can't set headers.
-    const tok = (authHeader().Authorization ?? "").replace(/^Bearer\s+/i, "");
-    const url = tok ? `${wsUrl}?token=${encodeURIComponent(tok)}` : wsUrl;
-    let ws: WebSocket | null = null;
-    let cancelled = false;
-    // Reconnect with exponential backoff up to 30 s.
-    let backoff = 1000;
-    const connect = () => {
-      if (cancelled) return;
-      ws = new WebSocket(url);
-      ws.onopen = () => {
-        backoff = 1000;
-      };
-      ws.onmessage = (event) => {
-        let parsed: {
-          type?: string;
-          repo?: string;
-          path?: string;
-          event?: string;
-        };
-        try {
-          parsed = JSON.parse(event.data);
-        } catch {
-          return;
+    const stream = getWorkspaceStream(missionId);
+    const unsub = stream.subscribeFsChanges((ev: FsChangeEvent) => {
+      const { repo, path } = ev;
+      for (const tab of tabsRef.current.values()) {
+        if (tab.kind !== "edit") continue;
+        if (tab.repoName !== repo || tab.filePath !== path) continue;
+        const dirty = tab.editValue !== tab.editBaseline;
+        if (dirty) {
+          setTabs((prev) => {
+            const cur = prev.get(tab.id);
+            if (!cur || cur.externallyModified) return prev;
+            const next = new Map(prev);
+            next.set(tab.id, { ...cur, externallyModified: true });
+            return next;
+          });
+        } else {
+          void refetchEditTab(tab.id);
         }
-        if (parsed.type !== "fs_change" || !parsed.repo || !parsed.path) return;
-        const repo = parsed.repo;
-        const path = parsed.path;
-        // Find all edit tabs matching this file.
-        for (const tab of tabsRef.current.values()) {
-          if (tab.kind !== "edit") continue;
-          if (tab.repoName !== repo || tab.filePath !== path) continue;
-          const dirty = tab.editValue !== tab.editBaseline;
-          if (dirty) {
-            setTabs((prev) => {
-              const cur = prev.get(tab.id);
-              if (!cur) return prev;
-              if (cur.externallyModified) return prev;
-              const next = new Map(prev);
-              next.set(tab.id, { ...cur, externallyModified: true });
-              return next;
-            });
-          } else {
-            void refetchEditTab(tab.id);
-          }
-        }
-      };
-      ws.onclose = () => {
-        if (cancelled) return;
-        window.setTimeout(connect, backoff);
-        backoff = Math.min(30_000, backoff * 2);
-      };
-      ws.onerror = () => {
-        try {
-          ws?.close();
-        } catch {
-          // ignore
-        }
-      };
-    };
-    connect();
-    return () => {
-      cancelled = true;
-      try {
-        ws?.close();
-      } catch {
-        // ignore
       }
-    };
+    });
+    return unsub;
   }, [missionId, refetchEditTab]);
 
   const runSearch = useCallback(async () => {
@@ -548,30 +519,28 @@ export function ChangesPanel({
     }
     setFindLoading(true);
     setFindError(null);
+    setFindHits([]);
+    setFindTruncated(false);
     try {
-      const API_BASE = getRuntimeApiBase();
-      const params = new URLSearchParams({
-        repo: findRepo,
-        q: findQuery,
-        limit: "200",
-      });
-      const res = await fetch(
-        `${API_BASE}/api/control/missions/${missionId}/search?${params.toString()}`,
-        { headers: { ...authHeader() } },
-      );
-      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-      const body: {
-        hits: RepoSearchHit[];
-        truncated: boolean;
-        unavailable: boolean;
-      } = await res.json();
-      setFindHits(body.hits);
-      setFindTruncated(body.truncated);
-      if (body.unavailable) setFindError("Pod unavailable");
+      const stream = getWorkspaceStream(missionId);
+      const done = await stream.stream<
+        { total: number; truncated: boolean },
+        SearchHitChunk
+      >(
+        "search",
+        { repo: findRepo, q: findQuery, limit: 200 },
+        {
+          onChunk: ({ hit }) => {
+            // Append hits as they arrive — the user sees the
+            // first match within milliseconds even on big repos.
+            setFindHits((prev) => [...prev, hit]);
+          },
+        },
+      ).result;
+      setFindTruncated(done.truncated);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setFindError(msg);
-      setFindHits([]);
     } finally {
       setFindLoading(false);
     }
@@ -758,7 +727,11 @@ export function ChangesPanel({
           fetch is in flight (`!data && loading`). Subsequent
           Refreshes flag the icon-spin but don't repaint this strip
           so the panel doesn't visually reset every time. */}
-      <ChangesLoadProgress active={!data && loading} />
+      <ChangesLoadProgress
+        active={loading}
+        loaded={loadProgress.loaded}
+        total={loadProgress.total}
+      />
 
       {error && (
         <div className="px-4 py-3 text-xs text-red-300 bg-red-500/10 border-b border-red-500/20">
@@ -1131,16 +1104,11 @@ function RepoTreeNode({
     setLoading(true);
     setError(null);
     try {
-      const params = new URLSearchParams();
-      params.set("repo", repoName);
-      if (rootPath) params.set("path", rootPath);
-      const API_BASE = getRuntimeApiBase();
-      const res = await fetch(
-        `${API_BASE}/api/control/missions/${missionId}/repo-tree?${params.toString()}`,
-        { headers: { ...authHeader() } },
+      const stream = getWorkspaceStream(missionId);
+      const data = await stream.call<{ entries: RepoTreeEntry[] }>(
+        "list_dir",
+        { repo: repoName, path: rootPath },
       );
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data: { entries: RepoTreeEntry[] } = await res.json();
       setEntries(data.entries);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1551,33 +1519,57 @@ function FindPanel({
  * When `active` flips false (load done or never started), the
  * bar fills to 100% with a brief animation, then fades out.
  */
-function ChangesLoadProgress({ active }: { active: boolean }) {
-  const [pct, setPct] = useState(0);
+/**
+ * Real progress bar. The streaming list_changes endpoint emits
+ * `progress { loaded, total }` events as each file's diff lands;
+ * we render that ratio. `total` is the number of changed files
+ * known from the initial `ready` event (which fires after a
+ * single `git status` call — sub-second on most repos). While
+ * we wait for `ready` (total=0), we fall back to a short
+ * indeterminate ramp so the bar isn't frozen at 0%.
+ */
+function ChangesLoadProgress({
+  active,
+  loaded,
+  total,
+}: {
+  active: boolean;
+  loaded: number;
+  total: number;
+}) {
   const [visible, setVisible] = useState(false);
+  const [warmupPct, setWarmupPct] = useState(0);
   const startRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (active) {
       setVisible(true);
-      setPct(2);
       startRef.current = Date.now();
-      const id = setInterval(() => {
-        const start = startRef.current ?? Date.now();
-        const elapsed = Date.now() - start;
-        // Asymptotic to 95%. Time constant 2200 ms tuned so the
-        // bar reaches ~50% at 1.5s, ~80% at 3.5s, ~95% at 7s.
-        const target = 2 + 93 * (1 - Math.exp(-elapsed / 2200));
-        setPct(target);
-      }, 90);
-      return () => clearInterval(id);
+      if (total === 0) {
+        // Pre-ready warmup ramp — covers the ~200 ms it takes to
+        // run `git status` and emit the file list.
+        const id = setInterval(() => {
+          const elapsed = Date.now() - (startRef.current ?? Date.now());
+          setWarmupPct(2 + 18 * (1 - Math.exp(-elapsed / 600)));
+        }, 80);
+        return () => clearInterval(id);
+      }
+      return;
     }
-    // Inactive: snap to 100%, then hide.
-    setPct(100);
     const fadeOut = window.setTimeout(() => setVisible(false), 300);
     return () => window.clearTimeout(fadeOut);
-  }, [active]);
+  }, [active, total]);
 
   if (!visible) return null;
+  // Real % once `total` is known. Before that, show the warmup
+  // ramp so the bar isn't stuck at 0.
+  const pct =
+    total > 0
+      ? active
+        ? Math.min(100, Math.round((loaded / total) * 100))
+        : 100
+      : Math.floor(warmupPct);
+  const label = total > 0 ? `${loaded}/${total}` : "…";
   return (
     <div
       className={cn(
@@ -1593,7 +1585,7 @@ function ChangesLoadProgress({ active }: { active: boolean }) {
         className="absolute right-2 -top-0.5 text-[9px] font-mono text-white/40 leading-none select-none pointer-events-none"
         style={{ textShadow: "0 0 4px rgba(0,0,0,0.6)" }}
       >
-        {Math.floor(pct)}%
+        {pct}% · {label}
       </span>
     </div>
   );
