@@ -521,3 +521,337 @@ pub async fn list_mission_repo_tree(
         unavailable: false,
     }))
 }
+
+#[derive(Debug, Deserialize)]
+pub struct RepoFileQuery {
+    pub repo: String,
+    pub path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RepoFileResponse {
+    pub content: String,
+    pub truncated: bool,
+    /// `true` when content looks binary (NUL byte in first 8KB or
+    /// non-UTF-8). The dashboard surfaces this as "binary file —
+    /// not editable" rather than rendering garbled text.
+    pub binary: bool,
+    pub unavailable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WriteFileRequest {
+    pub content: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WriteFileResponse {
+    pub ok: bool,
+}
+
+fn validate_repo_path(repo: &str, path: &str) -> Result<(), (StatusCode, String)> {
+    if repo.is_empty() || repo.contains('/') || repo.contains("..") {
+        return Err((StatusCode::BAD_REQUEST, "invalid repo".into()));
+    }
+    if path.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "empty path".into()));
+    }
+    if path.starts_with('/') {
+        return Err((StatusCode::BAD_REQUEST, "absolute path".into()));
+    }
+    for seg in path.split('/') {
+        if seg == ".." || seg.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "invalid path segment".into()));
+        }
+        if seg == ".git" {
+            return Err((StatusCode::BAD_REQUEST, ".git is read-only".into()));
+        }
+    }
+    Ok(())
+}
+
+/// `GET /api/control/missions/:id/file?repo=&path=` — fetch the raw
+/// content of a single file inside the per-mission pod, scoped to
+/// `/workspaces/repos/<repo>/<path>`. Used by the dashboard's
+/// file editor / project-wide find drill-down.
+///
+/// Truncates to MAX_DIFF_BYTES. Binary detection: peeks the first
+/// 8KB and flags `binary=true` if any NUL byte is found.
+pub async fn get_mission_file(
+    State(_state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    Query(q): Query<RepoFileQuery>,
+) -> Result<Json<RepoFileResponse>, (StatusCode, String)> {
+    validate_repo_path(&q.repo, &q.path)?;
+    let k8s = match crate::k8s_pod::global_client() {
+        Some(c) => c,
+        None => {
+            return Ok(Json(RepoFileResponse {
+                content: String::new(),
+                truncated: false,
+                binary: false,
+                unavailable: true,
+            }));
+        }
+    };
+    let full = format!("/workspaces/repos/{}/{}", q.repo, q.path);
+    // First byte-peek for binary detection (head -c 8192 | od -c | grep \0)
+    // — bounded; we then dump up to MAX_DIFF_BYTES.
+    let script = format!(
+        "set -e; \
+         f={}; \
+         [ -f \"$f\" ] || {{ echo __NOT_A_FILE__; exit 0; }}; \
+         head -c 8192 \"$f\" | od -An -c | grep -q '\\\\0' && echo __BINARY__ && exit 0; \
+         head -c {} \"$f\"",
+        shell_quote(&full),
+        MAX_DIFF_BYTES,
+    );
+    let out = match k8s
+        .exec_command(
+            mission_id,
+            None,
+            "/bin/bash",
+            &["-lc".to_string(), script],
+            &HashMap::new(),
+        )
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("exec failed: {e}"),
+            ));
+        }
+    };
+    if !out.status.success() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "read failed (exit {:?}): {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        ));
+    }
+    let mut content = String::from_utf8_lossy(&out.stdout).to_string();
+    if content.starts_with("__NOT_A_FILE__") {
+        return Err((StatusCode::NOT_FOUND, "not a file".into()));
+    }
+    let binary = content.starts_with("__BINARY__");
+    if binary {
+        content.clear();
+    }
+    // Find the actual file size to know if we truncated
+    let truncated = !binary && content.len() >= MAX_DIFF_BYTES;
+    Ok(Json(RepoFileResponse {
+        content,
+        truncated,
+        binary,
+        unavailable: false,
+    }))
+}
+
+/// `PUT /api/control/missions/:id/file?repo=&path=` — overwrite the
+/// content of a file inside the per-mission pod. Body: JSON
+/// `{ "content": "..." }`. Used by the dashboard's Save button.
+///
+/// We bound the payload size at 1 MiB so a runaway client can't
+/// blow up the pod. Path-traversal guard reuses
+/// `validate_repo_path`. The write is atomic: write to a tempfile
+/// in the same dir, then `mv` it over the target — avoids leaving
+/// the file half-written if the pod kills the exec mid-pipe.
+pub async fn write_mission_file(
+    State(_state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    Query(q): Query<RepoFileQuery>,
+    Json(body): Json<WriteFileRequest>,
+) -> Result<Json<WriteFileResponse>, (StatusCode, String)> {
+    validate_repo_path(&q.repo, &q.path)?;
+    const MAX_WRITE_BYTES: usize = 1024 * 1024; // 1 MiB
+    if body.content.len() > MAX_WRITE_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("content > {MAX_WRITE_BYTES} bytes"),
+        ));
+    }
+    let k8s = match crate::k8s_pod::global_client() {
+        Some(c) => c,
+        None => return Err((StatusCode::SERVICE_UNAVAILABLE, "pod unavailable".into())),
+    };
+    let full = format!("/workspaces/repos/{}/{}", q.repo, q.path);
+
+    // Stream the bytes via stdin to `tee` so we don't have to shell-quote
+    // arbitrary file contents. The script then `mv`s atomically.
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(body.content.as_bytes());
+    let script = format!(
+        "set -e; \
+         dst={}; \
+         dir=$(dirname \"$dst\"); \
+         [ -d \"$dir\" ] || {{ echo \"dir missing: $dir\" 1>&2; exit 1; }}; \
+         tmp=$(mktemp -p \"$dir\" .write.XXXXXX); \
+         printf '%s' {} | base64 -d > \"$tmp\"; \
+         mv -f \"$tmp\" \"$dst\";",
+        shell_quote(&full),
+        shell_quote(&b64),
+    );
+    let out = k8s
+        .exec_command(
+            mission_id,
+            None,
+            "/bin/bash",
+            &["-lc".to_string(), script],
+            &HashMap::new(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("exec failed: {e}")))?;
+    if !out.status.success() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "write failed (exit {:?}): {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        ));
+    }
+    Ok(Json(WriteFileResponse { ok: true }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RepoSearchQuery {
+    pub repo: String,
+    pub q: String,
+    /// Optional subpath within the repo. Empty → search the whole repo.
+    #[serde(default)]
+    pub path: String,
+    /// Cap on hits returned. Default 200, max 500.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RepoSearchHit {
+    pub file: String,
+    pub line: u32,
+    pub snippet: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RepoSearchResponse {
+    pub hits: Vec<RepoSearchHit>,
+    pub truncated: bool,
+    pub unavailable: bool,
+}
+
+/// `GET /api/control/missions/:id/search?repo=&q=&path=&limit=` —
+/// project-wide grep across a single repo. Uses `grep -rnIE` so
+/// the query is a POSIX regex and binary files are skipped. We
+/// pipe through `head -n <limit>` so a runaway pattern can't
+/// stream MB to the client. `.git` is excluded.
+pub async fn search_mission_repo(
+    State(_state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    Query(q): Query<RepoSearchQuery>,
+) -> Result<Json<RepoSearchResponse>, (StatusCode, String)> {
+    if q.repo.contains('/') || q.repo.contains("..") || q.repo.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "invalid repo".into()));
+    }
+    if q.q.is_empty() {
+        return Ok(Json(RepoSearchResponse {
+            hits: vec![],
+            truncated: false,
+            unavailable: false,
+        }));
+    }
+    for seg in q.path.split('/') {
+        if seg == ".." {
+            return Err((StatusCode::BAD_REQUEST, "invalid path".into()));
+        }
+    }
+    let limit = q.limit.unwrap_or(200).min(500).max(1);
+    let k8s = match crate::k8s_pod::global_client() {
+        Some(c) => c,
+        None => {
+            return Ok(Json(RepoSearchResponse {
+                hits: vec![],
+                truncated: false,
+                unavailable: true,
+            }));
+        }
+    };
+    let scope = if q.path.is_empty() {
+        format!("/workspaces/repos/{}", q.repo)
+    } else {
+        format!(
+            "/workspaces/repos/{}/{}",
+            q.repo,
+            q.path.trim_matches('/')
+        )
+    };
+    // grep returns exit 1 when there are no matches — we want to
+    // succeed with empty hits. `|| true` keeps the script status 0.
+    // `head -n` caps lines; we fetch limit+1 to detect truncation.
+    let script = format!(
+        "cd {} 2>/dev/null && \
+         grep -rnIE --color=never --exclude-dir=.git -- {} . 2>/dev/null | \
+         head -n {} || true",
+        shell_quote(&scope),
+        shell_quote(&q.q),
+        limit + 1,
+    );
+    let out = match k8s
+        .exec_command(
+            mission_id,
+            None,
+            "/bin/bash",
+            &["-lc".to_string(), script],
+            &HashMap::new(),
+        )
+        .await
+    {
+        Ok(o) => o,
+        Err(_) => {
+            return Ok(Json(RepoSearchResponse {
+                hits: vec![],
+                truncated: false,
+                unavailable: true,
+            }));
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut hits: Vec<RepoSearchHit> = Vec::new();
+    for line in stdout.lines() {
+        // grep -n format: `./path/to/file:LINE:rest...`
+        // Strip leading `./` for cleaner display.
+        let s = line.strip_prefix("./").unwrap_or(line);
+        let mut it = s.splitn(3, ':');
+        let file = match it.next() {
+            Some(v) => v.to_string(),
+            None => continue,
+        };
+        let lineno: u32 = match it.next().and_then(|v| v.parse().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let snippet = it.next().unwrap_or("").to_string();
+        hits.push(RepoSearchHit {
+            file,
+            line: lineno,
+            snippet,
+        });
+        if hits.len() >= limit {
+            break;
+        }
+    }
+    let truncated = stdout.lines().count() > limit;
+    Ok(Json(RepoSearchResponse {
+        hits,
+        truncated,
+        unavailable: false,
+    }))
+}

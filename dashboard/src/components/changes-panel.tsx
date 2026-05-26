@@ -13,17 +13,26 @@ import {
   Folder,
   FolderOpen,
   File as FileIcon,
+  Save,
+  Search,
+  Terminal as VimIcon,
+  Loader2,
+  AlertCircle,
+  Circle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { apiGet } from "@/lib/api/core";
 import { authHeader } from "@/lib/auth";
 import { getRuntimeApiBase } from "@/lib/settings";
+import { MonacoDiffViewer } from "./monaco/MonacoDiffViewer";
+import { MonacoFileEditor } from "./monaco/MonacoFileEditor";
 
 type DiffViewMode = "split" | "unified";
 
 const VIEW_MODE_STORAGE_KEY = "changes-panel.view-mode";
 const LEFT_WIDTH_STORAGE_KEY = "changes-panel.left-pct";
 const REPO_PANE_HEIGHT_STORAGE_KEY = "changes-panel.repo-pane-pct";
+const VIM_STORAGE_KEY = "changes-panel.vim";
 
 function readStoredViewMode(): DiffViewMode {
   if (typeof window === "undefined") return "split";
@@ -31,11 +40,49 @@ function readStoredViewMode(): DiffViewMode {
   return v === "unified" ? "unified" : "split";
 }
 
+function readStoredBool(key: string, fallback: boolean): boolean {
+  if (typeof window === "undefined") return fallback;
+  const v = window.localStorage.getItem(key);
+  if (v === "1" || v === "true") return true;
+  if (v === "0" || v === "false") return false;
+  return fallback;
+}
+
 function readStoredNumber(key: string, fallback: number, min: number, max: number) {
   if (typeof window === "undefined") return fallback;
   const v = Number(window.localStorage.getItem(key));
   if (!Number.isFinite(v)) return fallback;
   return Math.min(max, Math.max(min, v));
+}
+
+/** One tab open in the editor area. */
+interface OpenTab {
+  /** Stable id: `<repo>/<path>#<kind>`. Used as React key + Map key. */
+  id: string;
+  repoName: string;
+  filePath: string;
+  kind: "diff" | "edit";
+  /** Diff tabs: the changed-file payload. Loaded eagerly with the
+   *  changes response so we don't re-fetch per click. */
+  diff?: MissionChangedFile;
+  /** Edit tabs: the current value held in the editor. */
+  editValue?: string;
+  /** Edit tabs: the value last persisted to the pod (for dirty
+   *  detection). */
+  editBaseline?: string;
+  /** Edit tabs: load / save status. */
+  loading?: boolean;
+  saving?: boolean;
+  error?: string | null;
+  binary?: boolean;
+  /** Edit tabs: line to reveal once on first open (used by find). */
+  initialLine?: number;
+}
+
+interface RepoSearchHit {
+  file: string;
+  line: number;
+  snippet: string;
 }
 
 interface MissionChangedFile {
@@ -82,7 +129,6 @@ export function ChangesPanel({
   const [data, setData] = useState<MissionChangesResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<DiffViewMode>(() =>
     readStoredViewMode(),
   );
@@ -92,6 +138,25 @@ export function ChangesPanel({
   const [repoPanePct, setRepoPanePct] = useState<number>(() =>
     readStoredNumber(REPO_PANE_HEIGHT_STORAGE_KEY, 35, 15, 80),
   );
+  const [vimMode, setVimMode] = useState<boolean>(() =>
+    readStoredBool(VIM_STORAGE_KEY, false),
+  );
+
+  // Open tabs + which one is active. Map keyed by tab.id so we
+  // can update without index juggling. `tabOrder` keeps the
+  // visible order in the tab bar.
+  const [tabs, setTabs] = useState<Map<string, OpenTab>>(new Map());
+  const [tabOrder, setTabOrder] = useState<string[]>([]);
+  const [activeTabId, setActiveTabId] = useState<string | null>(null);
+
+  // Project-wide find: panel visibility + query + results.
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState("");
+  const [findRepo, setFindRepo] = useState<string | null>(null);
+  const [findHits, setFindHits] = useState<RepoSearchHit[]>([]);
+  const [findLoading, setFindLoading] = useState(false);
+  const [findError, setFindError] = useState<string | null>(null);
+  const [findTruncated, setFindTruncated] = useState(false);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -108,6 +173,10 @@ export function ChangesPanel({
       String(repoPanePct),
     );
   }, [repoPanePct]);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(VIM_STORAGE_KEY, vimMode ? "1" : "0");
+  }, [vimMode]);
 
   const reload = async () => {
     setLoading(true);
@@ -118,10 +187,9 @@ export function ChangesPanel({
         "Failed to load changes",
       );
       setData(res);
-      const first = res.repos[0]?.files[0];
-      setSelectedPath(
-        (cur) => cur ?? (first ? `${res.repos[0].name}/${first.path}` : null),
-      );
+      if (findRepo === null && res.repos.length > 0) {
+        setFindRepo(res.repos[0].name);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -139,17 +207,229 @@ export function ChangesPanel({
     [data],
   );
 
-  const selectedFile = useMemo(() => {
-    if (!data || !selectedPath) return null;
-    for (const repo of data.repos) {
-      for (const f of repo.files) {
-        if (`${repo.name}/${f.path}` === selectedPath) {
-          return { repo: repo.name, ...f };
+  // Tab handlers ───────────────────────────────────────────────
+  const activateTab = useCallback((id: string) => setActiveTabId(id), []);
+
+  const closeTab = useCallback((id: string) => {
+    setTabs((prev) => {
+      const next = new Map(prev);
+      next.delete(id);
+      return next;
+    });
+    setTabOrder((prev) => prev.filter((x) => x !== id));
+    setActiveTabId((curr) => {
+      if (curr !== id) return curr;
+      // Pick the next-best tab to activate (previous in order).
+      const idx = tabOrder.indexOf(id);
+      const fallback =
+        tabOrder[idx - 1] ?? tabOrder.find((x) => x !== id) ?? null;
+      return fallback;
+    });
+  }, [tabOrder]);
+
+  const openDiffTab = useCallback(
+    (repoName: string, file: MissionChangedFile) => {
+      const id = `${repoName}/${file.path}#diff`;
+      setTabs((prev) => {
+        if (prev.has(id)) return prev;
+        const next = new Map(prev);
+        next.set(id, {
+          id,
+          repoName,
+          filePath: file.path,
+          kind: "diff",
+          diff: file,
+        });
+        return next;
+      });
+      setTabOrder((prev) => (prev.includes(id) ? prev : [...prev, id]));
+      setActiveTabId(id);
+    },
+    [],
+  );
+
+  const openEditTab = useCallback(
+    async (repoName: string, filePath: string, initialLine?: number) => {
+      const id = `${repoName}/${filePath}#edit`;
+      // If already open, just focus it (and re-seek if line given).
+      let exists = false;
+      setTabs((prev) => {
+        if (prev.has(id)) {
+          exists = true;
+          if (initialLine !== undefined) {
+            const next = new Map(prev);
+            const cur = next.get(id)!;
+            next.set(id, { ...cur, initialLine });
+            return next;
+          }
+          return prev;
         }
+        const next = new Map(prev);
+        next.set(id, {
+          id,
+          repoName,
+          filePath,
+          kind: "edit",
+          loading: true,
+          initialLine,
+        });
+        return next;
+      });
+      setTabOrder((prev) => (prev.includes(id) ? prev : [...prev, id]));
+      setActiveTabId(id);
+      if (exists) return;
+
+      // Load file content from the backend.
+      try {
+        const API_BASE = getRuntimeApiBase();
+        const params = new URLSearchParams({ repo: repoName, path: filePath });
+        const res = await fetch(
+          `${API_BASE}/api/control/missions/${missionId}/file?${params.toString()}`,
+          { headers: { ...authHeader() } },
+        );
+        if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+        const body: {
+          content: string;
+          binary: boolean;
+          truncated: boolean;
+          unavailable: boolean;
+        } = await res.json();
+        setTabs((prev) => {
+          const cur = prev.get(id);
+          if (!cur) return prev;
+          const next = new Map(prev);
+          next.set(id, {
+            ...cur,
+            loading: false,
+            binary: body.binary,
+            editValue: body.content,
+            editBaseline: body.content,
+            error: body.unavailable ? "Pod unavailable" : null,
+          });
+          return next;
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setTabs((prev) => {
+          const cur = prev.get(id);
+          if (!cur) return prev;
+          const next = new Map(prev);
+          next.set(id, { ...cur, loading: false, error: msg });
+          return next;
+        });
       }
+    },
+    [missionId],
+  );
+
+  const updateEditValue = useCallback((id: string, value: string) => {
+    setTabs((prev) => {
+      const cur = prev.get(id);
+      if (!cur) return prev;
+      const next = new Map(prev);
+      next.set(id, { ...cur, editValue: value });
+      return next;
+    });
+  }, []);
+
+  const saveTab = useCallback(
+    async (id: string) => {
+      const tab = tabs.get(id);
+      if (!tab || tab.kind !== "edit" || tab.editValue === undefined) return;
+      if (tab.editValue === tab.editBaseline) return; // not dirty
+      setTabs((prev) => {
+        const cur = prev.get(id);
+        if (!cur) return prev;
+        const next = new Map(prev);
+        next.set(id, { ...cur, saving: true, error: null });
+        return next;
+      });
+      try {
+        const API_BASE = getRuntimeApiBase();
+        const params = new URLSearchParams({
+          repo: tab.repoName,
+          path: tab.filePath,
+        });
+        const res = await fetch(
+          `${API_BASE}/api/control/missions/${missionId}/file?${params.toString()}`,
+          {
+            method: "PUT",
+            headers: {
+              "Content-Type": "application/json",
+              ...authHeader(),
+            },
+            body: JSON.stringify({ content: tab.editValue }),
+          },
+        );
+        if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+        setTabs((prev) => {
+          const cur = prev.get(id);
+          if (!cur) return prev;
+          const next = new Map(prev);
+          next.set(id, {
+            ...cur,
+            saving: false,
+            editBaseline: cur.editValue,
+            error: null,
+          });
+          return next;
+        });
+        // Refresh the changes list — saving may have introduced a
+        // new diff entry or cleared a previous one. Best-effort.
+        void reload();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setTabs((prev) => {
+          const cur = prev.get(id);
+          if (!cur) return prev;
+          const next = new Map(prev);
+          next.set(id, { ...cur, saving: false, error: msg });
+          return next;
+        });
+      }
+    },
+    [missionId, tabs],
+  );
+
+  const activeTab = activeTabId ? tabs.get(activeTabId) ?? null : null;
+
+  const runSearch = useCallback(async () => {
+    if (!findQuery.trim() || !findRepo) {
+      setFindHits([]);
+      setFindError(null);
+      setFindTruncated(false);
+      return;
     }
-    return null;
-  }, [data, selectedPath]);
+    setFindLoading(true);
+    setFindError(null);
+    try {
+      const API_BASE = getRuntimeApiBase();
+      const params = new URLSearchParams({
+        repo: findRepo,
+        q: findQuery,
+        limit: "200",
+      });
+      const res = await fetch(
+        `${API_BASE}/api/control/missions/${missionId}/search?${params.toString()}`,
+        { headers: { ...authHeader() } },
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+      const body: {
+        hits: RepoSearchHit[];
+        truncated: boolean;
+        unavailable: boolean;
+      } = await res.json();
+      setFindHits(body.hits);
+      setFindTruncated(body.truncated);
+      if (body.unavailable) setFindError("Pod unavailable");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setFindError(msg);
+      setFindHits([]);
+    } finally {
+      setFindLoading(false);
+    }
+  }, [findQuery, findRepo, missionId]);
 
   // Drag-to-resize handler for the vertical divider between left
   // (file lists) and right (diff). Track in pct of container width
@@ -237,6 +517,55 @@ export function ChangesPanel({
               Unified
             </button>
           </div>
+          {/* Vim toggle. Persisted; active state pulses a faint
+              indigo so the user knows shortcuts are different now. */}
+          <button
+            type="button"
+            onClick={() => setVimMode((p) => !p)}
+            className={cn(
+              "flex items-center gap-1 px-2 py-0.5 text-[11px] rounded border transition-colors",
+              vimMode
+                ? "border-indigo-500/30 bg-indigo-500/15 text-indigo-200"
+                : "border-white/[0.06] bg-white/[0.02] text-white/50 hover:text-white/80",
+            )}
+            title={vimMode ? "Disable vim keys" : "Enable vim keys"}
+          >
+            <VimIcon className="h-3 w-3" />
+            VIM
+          </button>
+          {/* Project-wide find toggle */}
+          <button
+            type="button"
+            onClick={() => setFindOpen((p) => !p)}
+            className={cn(
+              "p-1 rounded transition-colors",
+              findOpen
+                ? "bg-indigo-500/15 text-indigo-300"
+                : "hover:bg-white/[0.06] text-white/40 hover:text-white/70",
+            )}
+            title="Find in project"
+          >
+            <Search className="h-3.5 w-3.5" />
+          </button>
+          {/* Save active edit tab. Shown only when the active tab
+              is an edit-mode file with a dirty buffer. */}
+          {activeTab?.kind === "edit" &&
+            activeTab.editValue !== activeTab.editBaseline && (
+              <button
+                type="button"
+                onClick={() => void saveTab(activeTab.id)}
+                disabled={activeTab.saving}
+                className="flex items-center gap-1 px-2 py-0.5 text-[11px] rounded border border-emerald-500/30 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/15 disabled:opacity-50"
+                title="Save (Cmd/Ctrl-S)"
+              >
+                {activeTab.saving ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <Save className="h-3 w-3" />
+                )}
+                Save
+              </button>
+            )}
           <button
             type="button"
             onClick={() => void reload()}
@@ -258,6 +587,26 @@ export function ChangesPanel({
           </button>
         </div>
       </div>
+
+      {/* Find panel — slides in between header and body when the
+          search icon is toggled. Repo dropdown + query input +
+          result list; clicking a result opens the file in an
+          edit tab at the matching line. */}
+      {findOpen && (
+        <FindPanel
+          repos={data?.repos.map((r) => r.name) ?? []}
+          activeRepo={findRepo}
+          setActiveRepo={setFindRepo}
+          query={findQuery}
+          setQuery={setFindQuery}
+          run={runSearch}
+          loading={findLoading}
+          error={findError}
+          hits={findHits}
+          truncated={findTruncated}
+          onHit={(repo, file, line) => void openEditTab(repo, file, line)}
+        />
+      )}
 
       {error && (
         <div className="px-4 py-3 text-xs text-red-300 bg-red-500/10 border-b border-red-500/20">
@@ -301,6 +650,7 @@ export function ChangesPanel({
                   repoName={repo.name}
                   rootPath=""
                   depth={0}
+                  onOpenFile={(r, p) => void openEditTab(r, p)}
                 />
               ))}
             </div>
@@ -337,8 +687,8 @@ export function ChangesPanel({
                 <ChangedFilesTree
                   key={repo.name}
                   repo={repo}
-                  selectedPath={selectedPath}
-                  onSelect={setSelectedPath}
+                  activeDiffTabId={activeTabId}
+                  onSelect={openDiffTab}
                 />
               ))}
             </div>
@@ -352,39 +702,31 @@ export function ChangesPanel({
           title="Drag to resize"
         />
 
-        {/* Diff viewer */}
+        {/* Editor area: tab bar + Monaco viewer/editor. */}
         <div className="flex-1 min-w-0 flex flex-col">
-          {selectedFile ? (
-            <>
-              <div className="flex items-center gap-2 px-4 py-2 border-b border-white/[0.06] text-sm bg-[#0d0d0d]/80">
-                <FileText className="h-4 w-4 text-white/40" />
-                <span className="font-mono text-white/80 truncate">
-                  {selectedFile.repo}/{selectedFile.path}
-                </span>
-                <StatusBadge status={selectedFile.status} />
-                {selectedFile.truncated && (
-                  <span className="ml-auto text-[10px] uppercase tracking-wide text-amber-400">
-                    truncated
-                  </span>
-                )}
+          <TabBar
+            tabs={tabOrder.map((id) => tabs.get(id)!).filter(Boolean)}
+            activeId={activeTabId}
+            onActivate={activateTab}
+            onClose={closeTab}
+          />
+          <div className="flex-1 min-h-0 flex flex-col bg-[#0d0d0d]">
+            {activeTab ? (
+              <ActiveTabBody
+                tab={activeTab}
+                splitView={viewMode === "split"}
+                vim={vimMode}
+                onChange={(v) => updateEditValue(activeTab.id, v)}
+                onSave={() => void saveTab(activeTab.id)}
+              />
+            ) : (
+              <div className="flex h-full items-center justify-center text-sm text-white/40">
+                {data && totalFiles > 0
+                  ? "Select a changed file or open one from Repos"
+                  : ""}
               </div>
-              {viewMode === "split" ? (
-                <SideBySideDiff
-                  head={selectedFile.head_content}
-                  worktree={selectedFile.worktree_content}
-                />
-              ) : (
-                <UnifiedDiff
-                  head={selectedFile.head_content}
-                  worktree={selectedFile.worktree_content}
-                />
-              )}
-            </>
-          ) : (
-            <div className="flex h-full items-center justify-center text-sm text-white/40">
-              {data && totalFiles > 0 ? "Select a file" : ""}
-            </div>
-          )}
+            )}
+          </div>
         </div>
       </div>
     </div>
@@ -419,352 +761,6 @@ function StatusBadge({ status }: { status: string }) {
     >
       {entry.label}
     </span>
-  );
-}
-
-// Tiny LCS-based line diff. Returns one Op per OUTPUT row.
-// `kind` semantics:
-//   "same"  → context (both panes show the line)
-//   "del"   → removed from head (left pane shows it red, right blank)
-//   "add"   → added to worktree (left blank, right shows green)
-// We render both panes by aligning del/add into the same row index
-// so vertical scrolling stays in lockstep.
-type DiffRow =
-  | { kind: "same"; left: string; right: string; leftNo: number; rightNo: number }
-  | { kind: "del"; left: string; leftNo: number }
-  | { kind: "add"; right: string; rightNo: number };
-
-function lineDiff(a: string[], b: string[]): DiffRow[] {
-  // Build LCS table — O(n*m). Files are capped at 256KB so worst
-  // case ~8k * 8k = 64M cells which is too slow; cap the diff
-  // calculation at 5k lines per side and treat overflow as
-  // unaligned (alternating add/del at the end).
-  const N = a.length;
-  const M = b.length;
-  const cap = 5000;
-  if (N > cap || M > cap) {
-    // Bail out of LCS: just stack head as "del" then worktree as
-    // "add". User can still read both files but loses alignment.
-    const rows: DiffRow[] = [];
-    for (let i = 0; i < N; i++) {
-      rows.push({ kind: "del", left: a[i], leftNo: i + 1 });
-    }
-    for (let j = 0; j < M; j++) {
-      rows.push({ kind: "add", right: b[j], rightNo: j + 1 });
-    }
-    return rows;
-  }
-  // Use Uint32Array for the table — far less GC pressure than Array<number>.
-  const stride = M + 1;
-  const lcs = new Uint32Array((N + 1) * stride);
-  for (let i = 1; i <= N; i++) {
-    const baseI = i * stride;
-    const baseIm1 = (i - 1) * stride;
-    for (let j = 1; j <= M; j++) {
-      if (a[i - 1] === b[j - 1]) {
-        lcs[baseI + j] = lcs[baseIm1 + j - 1] + 1;
-      } else {
-        const top = lcs[baseIm1 + j];
-        const left = lcs[baseI + j - 1];
-        lcs[baseI + j] = top >= left ? top : left;
-      }
-    }
-  }
-  // Backtrack to produce DiffRow[].
-  const rows: DiffRow[] = [];
-  let i = N;
-  let j = M;
-  while (i > 0 && j > 0) {
-    if (a[i - 1] === b[j - 1]) {
-      rows.push({
-        kind: "same",
-        left: a[i - 1],
-        right: b[j - 1],
-        leftNo: i,
-        rightNo: j,
-      });
-      i--;
-      j--;
-    } else if (lcs[(i - 1) * stride + j] >= lcs[i * stride + j - 1]) {
-      rows.push({ kind: "del", left: a[i - 1], leftNo: i });
-      i--;
-    } else {
-      rows.push({ kind: "add", right: b[j - 1], rightNo: j });
-      j--;
-    }
-  }
-  while (i > 0) {
-    rows.push({ kind: "del", left: a[i - 1], leftNo: i });
-    i--;
-  }
-  while (j > 0) {
-    rows.push({ kind: "add", right: b[j - 1], rightNo: j });
-    j--;
-  }
-  rows.reverse();
-  return rows;
-}
-
-function SideBySideDiff({
-  head,
-  worktree,
-}: {
-  head: string | null;
-  worktree: string | null;
-}) {
-  const headLines = useMemo(() => (head ?? "").split("\n"), [head]);
-  const wtLines = useMemo(() => (worktree ?? "").split("\n"), [worktree]);
-  // Trim trailing empty line that `split("\n")` introduces when the
-  // string ends in `\n` — otherwise every file shows an extra blank
-  // "same" row at the bottom.
-  const trim = (arr: string[]) =>
-    arr.length > 0 && arr[arr.length - 1] === ""
-      ? arr.slice(0, -1)
-      : arr;
-  const rows = useMemo(
-    () => lineDiff(trim(headLines), trim(wtLines)),
-    [headLines, wtLines],
-  );
-
-  // Sync scrolling between left and right panes.
-  const leftRef = useRef<HTMLDivElement | null>(null);
-  const rightRef = useRef<HTMLDivElement | null>(null);
-  const syncing = useRef(false);
-  useEffect(() => {
-    const onLeft = () => {
-      if (syncing.current || !leftRef.current || !rightRef.current) return;
-      syncing.current = true;
-      rightRef.current.scrollTop = leftRef.current.scrollTop;
-      requestAnimationFrame(() => (syncing.current = false));
-    };
-    const onRight = () => {
-      if (syncing.current || !leftRef.current || !rightRef.current) return;
-      syncing.current = true;
-      leftRef.current.scrollTop = rightRef.current.scrollTop;
-      requestAnimationFrame(() => (syncing.current = false));
-    };
-    const l = leftRef.current;
-    const r = rightRef.current;
-    l?.addEventListener("scroll", onLeft, { passive: true });
-    r?.addEventListener("scroll", onRight, { passive: true });
-    return () => {
-      l?.removeEventListener("scroll", onLeft);
-      r?.removeEventListener("scroll", onRight);
-    };
-  }, []);
-
-  return (
-    <div className="flex-1 min-h-0 grid grid-cols-2 divide-x divide-white/[0.06]">
-      <DiffPane
-        side="left"
-        rows={rows}
-        scrollRef={leftRef}
-        empty={head === null}
-        emptyLabel="(file was added — no HEAD version)"
-      />
-      <DiffPane
-        side="right"
-        rows={rows}
-        scrollRef={rightRef}
-        empty={worktree === null}
-        emptyLabel="(file was deleted — no worktree version)"
-      />
-    </div>
-  );
-}
-
-function DiffPane({
-  side,
-  rows,
-  scrollRef,
-  empty,
-  emptyLabel,
-}: {
-  side: "left" | "right";
-  rows: DiffRow[];
-  scrollRef: React.RefObject<HTMLDivElement | null>;
-  empty: boolean;
-  emptyLabel: string;
-}) {
-  if (empty) {
-    return (
-      <div className="flex items-center justify-center text-sm text-white/40 italic">
-        {emptyLabel}
-      </div>
-    );
-  }
-  return (
-    <div ref={scrollRef} className="overflow-auto">
-      <pre className="font-mono text-sm leading-snug">
-        {rows.map((row, i) => {
-          if (side === "left") {
-            if (row.kind === "add") {
-              // Empty row to keep alignment with the right pane's
-              // added line.
-              return (
-                <Row key={i} no="" cls="bg-white/[0.01]">
-                  {" "}
-                </Row>
-              );
-            }
-            const cls =
-              row.kind === "del"
-                ? "bg-red-500/10 text-red-200"
-                : "text-white/75";
-            return (
-              <Row key={i} no={String(row.leftNo)} cls={cls}>
-                {row.kind === "del" ? `-${row.left}` : ` ${row.left}`}
-              </Row>
-            );
-          } else {
-            if (row.kind === "del") {
-              return (
-                <Row key={i} no="" cls="bg-white/[0.01]">
-                  {" "}
-                </Row>
-              );
-            }
-            const cls =
-              row.kind === "add"
-                ? "bg-emerald-500/10 text-emerald-200"
-                : "text-white/75";
-            return (
-              <Row key={i} no={String(row.rightNo)} cls={cls}>
-                {row.kind === "add" ? `+${row.right}` : ` ${row.right}`}
-              </Row>
-            );
-          }
-        })}
-      </pre>
-    </div>
-  );
-}
-
-function Row({
-  no,
-  cls,
-  children,
-}: {
-  no: string;
-  cls: string;
-  children: React.ReactNode;
-}) {
-  // `min-w-max` makes the row track its content width instead of the
-  // overflow-auto viewport. Without it the row's bg (the green/red
-  // tint) only painted the visible portion — once the user scrolled
-  // right, the line continued as a bare strip with no highlight.
-  // `whitespace-pre` on the inner span preserves spaces but does not
-  // expand the parent, so the wrap-min has to come from the row.
-  return (
-    <div className={cn("flex min-w-max", cls)}>
-      <span className="sticky left-0 select-none w-12 shrink-0 text-right pr-2 text-white/30 border-r border-white/[0.04] bg-inherit">
-        {no}
-      </span>
-      <span className="flex-1 px-2 whitespace-pre">{children}</span>
-    </div>
-  );
-}
-
-/**
- * Unified diff view — single column with context + delete +
- * insert rows interleaved. Uses the same `lineDiff` LCS that the
- * split view uses but flattens the rows into one pane. Number
- * column shows BOTH sides (head | worktree).
- */
-function UnifiedDiff({
-  head,
-  worktree,
-}: {
-  head: string | null;
-  worktree: string | null;
-}) {
-  const headLines = useMemo(() => (head ?? "").split("\n"), [head]);
-  const wtLines = useMemo(() => (worktree ?? "").split("\n"), [worktree]);
-  const trim = (arr: string[]) =>
-    arr.length > 0 && arr[arr.length - 1] === "" ? arr.slice(0, -1) : arr;
-  const rows = useMemo(
-    () => lineDiff(trim(headLines), trim(wtLines)),
-    [headLines, wtLines],
-  );
-
-  if (head === null && worktree === null) {
-    return (
-      <div className="flex-1 flex items-center justify-center text-sm text-white/40">
-        (no content)
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex-1 min-h-0 overflow-auto">
-      <pre className="font-mono text-sm leading-snug">
-        {rows.map((row, i) => {
-          if (row.kind === "same") {
-            return (
-              <UnifiedRow
-                key={i}
-                leftNo={String(row.leftNo)}
-                rightNo={String(row.rightNo)}
-                cls="text-white/75"
-                prefix=" "
-                text={row.left}
-              />
-            );
-          }
-          if (row.kind === "del") {
-            return (
-              <UnifiedRow
-                key={i}
-                leftNo={String(row.leftNo)}
-                rightNo=""
-                cls="bg-red-500/10 text-red-200"
-                prefix="-"
-                text={row.left}
-              />
-            );
-          }
-          return (
-            <UnifiedRow
-              key={i}
-              leftNo=""
-              rightNo={String(row.rightNo)}
-              cls="bg-emerald-500/10 text-emerald-200"
-              prefix="+"
-              text={row.right}
-            />
-          );
-        })}
-      </pre>
-    </div>
-  );
-}
-
-function UnifiedRow({
-  leftNo,
-  rightNo,
-  cls,
-  prefix,
-  text,
-}: {
-  leftNo: string;
-  rightNo: string;
-  cls: string;
-  prefix: string;
-  text: string;
-}) {
-  return (
-    <div className={cn("flex min-w-max", cls)}>
-      <span className="sticky left-0 select-none flex shrink-0 bg-inherit border-r border-white/[0.04]">
-        <span className="w-12 text-right pr-2 text-white/30 border-r border-white/[0.04]">
-          {leftNo}
-        </span>
-        <span className="w-12 text-right pr-2 text-white/30">{rightNo}</span>
-      </span>
-      <span className="flex-1 px-2 whitespace-pre">
-        {prefix}
-        {text}
-      </span>
-    </div>
   );
 }
 
@@ -821,12 +817,12 @@ function buildTree(files: MissionChangedFile[]): TreeNode {
 
 function ChangedFilesTree({
   repo,
-  selectedPath,
+  activeDiffTabId,
   onSelect,
 }: {
   repo: MissionChangedRepo;
-  selectedPath: string | null;
-  onSelect: (path: string) => void;
+  activeDiffTabId: string | null;
+  onSelect: (repoName: string, file: MissionChangedFile) => void;
 }) {
   const tree = useMemo(() => buildTree(repo.files), [repo.files]);
   return (
@@ -842,7 +838,7 @@ function ChangedFilesTree({
             node={child}
             repoName={repo.name}
             depth={0}
-            selectedPath={selectedPath}
+            activeDiffTabId={activeDiffTabId}
             onSelect={onSelect}
           />
         ))}
@@ -855,14 +851,14 @@ function ChangedTreeRow({
   node,
   repoName,
   depth,
-  selectedPath,
+  activeDiffTabId,
   onSelect,
 }: {
   node: TreeNode;
   repoName: string;
   depth: number;
-  selectedPath: string | null;
-  onSelect: (path: string) => void;
+  activeDiffTabId: string | null;
+  onSelect: (repoName: string, file: MissionChangedFile) => void;
 }) {
   const isLeaf = !!node.file;
   // Auto-expand on first render so the tree is useful without clicks.
@@ -871,13 +867,13 @@ function ChangedTreeRow({
   const indent = { paddingLeft: 8 + depth * 12 };
 
   if (isLeaf && node.file) {
-    const key = `${repoName}/${node.file.path}`;
-    const isActive = key === selectedPath;
+    const tabId = `${repoName}/${node.file.path}#diff`;
+    const isActive = tabId === activeDiffTabId;
     return (
       <li>
         <button
           type="button"
-          onClick={() => onSelect(key)}
+          onClick={() => onSelect(repoName, node.file!)}
           style={indent}
           className={cn(
             "w-full flex items-center gap-1.5 pr-2 py-1 text-sm text-left hover:bg-white/[0.04]",
@@ -921,7 +917,7 @@ function ChangedTreeRow({
               node={child}
               repoName={repoName}
               depth={depth + 1}
-              selectedPath={selectedPath}
+              activeDiffTabId={activeDiffTabId}
               onSelect={onSelect}
             />
           ))}
@@ -949,11 +945,13 @@ function RepoTreeNode({
   repoName,
   rootPath,
   depth,
+  onOpenFile,
 }: {
   missionId: string;
   repoName: string;
   rootPath: string; // relative to /workspaces/repos/<repoName>
   depth: number;
+  onOpenFile: (repoName: string, filePath: string) => void;
 }) {
   // Root node (repoName) is opened by default; subdirs require a click.
   const isRoot = depth === 0;
@@ -1041,22 +1039,300 @@ function RepoTreeNode({
                   repoName={repoName}
                   rootPath={childPath}
                   depth={depth + 1}
+                  onOpenFile={onOpenFile}
                 />
               );
             }
             return (
-              <div
+              <button
+                type="button"
                 key={childPath}
+                onClick={() => onOpenFile(repoName, childPath)}
                 style={{ paddingLeft: 8 + (depth + 1) * 12 }}
-                className="flex items-center gap-1 pr-2 py-1 text-[12px] text-white/60"
+                className="w-full text-left flex items-center gap-1 pr-2 py-1 text-[12px] text-white/60 hover:bg-white/[0.04]"
                 title={childPath}
               >
                 <span className="h-3 w-3 shrink-0" aria-hidden="true" />
                 <FileIcon className="h-3 w-3 text-white/40 shrink-0" />
                 <span className="font-mono truncate">{entry.name}</span>
-              </div>
+              </button>
             );
           })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Editor tab bar. Each tab renders the file's basename + a kind
+ * pill (diff / edit), a dirty dot when an edit tab has unsaved
+ * changes, and an X to close. Horizontally scrollable so a long
+ * list of opens doesn't blow up the header.
+ */
+function TabBar({
+  tabs,
+  activeId,
+  onActivate,
+  onClose,
+}: {
+  tabs: OpenTab[];
+  activeId: string | null;
+  onActivate: (id: string) => void;
+  onClose: (id: string) => void;
+}) {
+  if (tabs.length === 0) {
+    return (
+      <div className="h-9 border-b border-white/[0.06] bg-[#0a0a0a] flex items-center px-3 text-[11px] text-white/30">
+        No file open
+      </div>
+    );
+  }
+  return (
+    <div className="h-9 flex items-center border-b border-white/[0.06] bg-[#0a0a0a] overflow-x-auto">
+      {tabs.map((tab) => {
+        const isActive = tab.id === activeId;
+        const dirty =
+          tab.kind === "edit" &&
+          tab.editValue !== undefined &&
+          tab.editValue !== tab.editBaseline;
+        const basename = tab.filePath.split("/").pop() ?? tab.filePath;
+        return (
+          <div
+            key={tab.id}
+            className={cn(
+              "shrink-0 group flex items-center gap-1.5 pl-3 pr-1 py-1 border-r border-white/[0.06] text-[12px] cursor-pointer transition-colors",
+              isActive
+                ? "bg-[#0d0d0d] text-white"
+                : "bg-transparent text-white/60 hover:bg-white/[0.03]",
+            )}
+            onClick={() => onActivate(tab.id)}
+            title={`${tab.repoName}/${tab.filePath}`}
+          >
+            {tab.kind === "diff" ? (
+              <GitBranch className="h-3 w-3 text-indigo-400 shrink-0" />
+            ) : (
+              <FileText className="h-3 w-3 text-emerald-400 shrink-0" />
+            )}
+            <span className="font-mono">{basename}</span>
+            {dirty && (
+              <Circle className="h-2 w-2 fill-amber-400 stroke-none shrink-0" />
+            )}
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onClose(tab.id);
+              }}
+              className="p-0.5 rounded text-white/40 hover:text-white hover:bg-white/[0.08]"
+              title="Close tab"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * Renders the body for the active tab. Either a Monaco DiffEditor
+ * (read-only side-by-side / inline) or a full Monaco editor for
+ * the file's worktree content (editable, with vim + save).
+ */
+function ActiveTabBody({
+  tab,
+  splitView,
+  vim,
+  onChange,
+  onSave,
+}: {
+  tab: OpenTab;
+  splitView: boolean;
+  vim: boolean;
+  onChange: (next: string) => void;
+  onSave: () => void;
+}) {
+  if (tab.kind === "diff" && tab.diff) {
+    return (
+      <>
+        <div className="flex items-center gap-2 px-4 py-1.5 border-b border-white/[0.06] text-[12px] bg-[#0d0d0d]/80">
+          <FileText className="h-3.5 w-3.5 text-white/40" />
+          <span className="font-mono text-white/80 truncate">
+            {tab.repoName}/{tab.filePath}
+          </span>
+          <StatusBadge status={tab.diff.status} />
+          {tab.diff.truncated && (
+            <span className="ml-auto text-[10px] uppercase tracking-wide text-amber-400">
+              truncated
+            </span>
+          )}
+        </div>
+        <MonacoDiffViewer
+          path={tab.filePath}
+          head={tab.diff.head_content}
+          worktree={tab.diff.worktree_content}
+          splitView={splitView}
+        />
+      </>
+    );
+  }
+  // Edit mode
+  if (tab.loading) {
+    return (
+      <div className="flex flex-1 items-center justify-center text-sm text-white/40">
+        <Loader2 className="h-4 w-4 animate-spin mr-2" />
+        Loading {tab.filePath}…
+      </div>
+    );
+  }
+  if (tab.error) {
+    return (
+      <div className="flex flex-1 flex-col items-center justify-center text-sm text-red-300 gap-2 p-4">
+        <AlertCircle className="h-5 w-5" />
+        <span className="font-mono text-xs">{tab.error}</span>
+      </div>
+    );
+  }
+  if (tab.binary) {
+    return (
+      <div className="flex flex-1 items-center justify-center text-sm text-white/40 italic">
+        Binary file — not editable
+      </div>
+    );
+  }
+  return (
+    <>
+      <div className="flex items-center gap-2 px-4 py-1.5 border-b border-white/[0.06] text-[12px] bg-[#0d0d0d]/80">
+        <FileText className="h-3.5 w-3.5 text-white/40" />
+        <span className="font-mono text-white/80 truncate">
+          {tab.repoName}/{tab.filePath}
+        </span>
+        {tab.editValue !== undefined && tab.editValue !== tab.editBaseline && (
+          <span className="text-[10px] uppercase tracking-wide text-amber-400">
+            modified
+          </span>
+        )}
+        {tab.saving && (
+          <span className="ml-auto flex items-center gap-1 text-[10px] text-emerald-300">
+            <Loader2 className="h-3 w-3 animate-spin" />
+            saving…
+          </span>
+        )}
+      </div>
+      <MonacoFileEditor
+        path={tab.filePath}
+        value={tab.editValue ?? ""}
+        vim={vim}
+        initialLine={tab.initialLine}
+        onChange={onChange}
+        onSave={onSave}
+      />
+    </>
+  );
+}
+
+/**
+ * Project-wide find panel. Lives between the header and the body
+ * when toggled. Repo scope dropdown + query box (Enter to run) +
+ * result list (clickable rows that open the matching file in an
+ * editor tab focused on the matching line).
+ */
+function FindPanel({
+  repos,
+  activeRepo,
+  setActiveRepo,
+  query,
+  setQuery,
+  run,
+  loading,
+  error,
+  hits,
+  truncated,
+  onHit,
+}: {
+  repos: string[];
+  activeRepo: string | null;
+  setActiveRepo: (r: string) => void;
+  query: string;
+  setQuery: (q: string) => void;
+  run: () => void;
+  loading: boolean;
+  error: string | null;
+  hits: RepoSearchHit[];
+  truncated: boolean;
+  onHit: (repo: string, file: string, line: number) => void;
+}) {
+  return (
+    <div className="border-b border-white/[0.06] bg-[#0c0c0c]">
+      <div className="flex items-center gap-2 px-3 py-2">
+        <Search className="h-3.5 w-3.5 text-white/40 shrink-0" />
+        <select
+          value={activeRepo ?? ""}
+          onChange={(e) => setActiveRepo(e.target.value)}
+          className="bg-black/30 border border-white/[0.06] rounded text-[12px] text-white/80 px-2 py-1 focus:outline-none focus:border-indigo-500/40"
+        >
+          {repos.map((r) => (
+            <option key={r} value={r} className="bg-[#0d0d0d]">
+              {r}
+            </option>
+          ))}
+        </select>
+        <input
+          type="text"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              run();
+            }
+          }}
+          placeholder="Regex or substring…"
+          className="flex-1 bg-black/30 border border-white/[0.06] rounded text-[12px] text-white/90 px-2 py-1 placeholder:text-white/30 focus:outline-none focus:border-indigo-500/40"
+        />
+        <button
+          type="button"
+          onClick={run}
+          disabled={loading || !activeRepo || !query.trim()}
+          className="px-3 py-1 text-[12px] rounded bg-indigo-500/20 text-indigo-200 border border-indigo-500/30 hover:bg-indigo-500/30 disabled:opacity-50"
+        >
+          {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : "Find"}
+        </button>
+      </div>
+      {(error || hits.length > 0 || (!loading && query.trim() && hits.length === 0)) && (
+        <div className="max-h-48 overflow-y-auto border-t border-white/[0.04]">
+          {error && (
+            <div className="px-3 py-2 text-[11px] text-red-300">{error}</div>
+          )}
+          {!error && hits.length === 0 && !loading && query.trim() && (
+            <div className="px-3 py-2 text-[11px] text-white/40">
+              No matches.
+            </div>
+          )}
+          {hits.map((hit, i) => (
+            <button
+              type="button"
+              key={`${hit.file}:${hit.line}:${i}`}
+              onClick={() => activeRepo && onHit(activeRepo, hit.file, hit.line)}
+              className="w-full flex items-baseline gap-2 px-3 py-1 text-left text-[12px] hover:bg-white/[0.04]"
+              title={`${hit.file}:${hit.line}`}
+            >
+              <span className="font-mono text-indigo-300 shrink-0">
+                {hit.file}
+                <span className="text-white/40">:{hit.line}</span>
+              </span>
+              <span className="font-mono text-white/60 truncate">
+                {hit.snippet}
+              </span>
+            </button>
+          ))}
+          {truncated && (
+            <div className="px-3 py-1 text-[10px] uppercase tracking-wide text-amber-400 border-t border-white/[0.04]">
+              Results truncated — refine your query
+            </div>
+          )}
         </div>
       )}
     </div>

@@ -1,0 +1,107 @@
+"use client";
+
+import type { Monaco } from "@monaco-editor/react";
+
+/**
+ * Monaco setup helpers shared by the diff viewer and the file
+ * editor. Keep `import("monaco-editor")` out of module scope so
+ * Next.js's server bundle never tries to load it (it's
+ * browser-only).
+ */
+
+/**
+ * Map a file extension (or shebang-driven hint) to a Monaco
+ * language id. Monaco ships a long list of built-in languages;
+ * unrecognised extensions fall back to `plaintext` rather than
+ * throwing.
+ */
+export function languageForPath(path: string): string {
+  const lower = path.toLowerCase();
+  // Filename special-cases — checked before extension so
+  // `Dockerfile` (no extension) still maps correctly.
+  const base = lower.split("/").pop() ?? "";
+  if (base === "dockerfile" || base.startsWith("dockerfile.")) return "dockerfile";
+  if (base === "makefile" || base === "gnumakefile") return "makefile";
+  if (base.endsWith(".gitignore") || base.endsWith(".gitattributes")) return "plaintext";
+
+  const ext = lower.includes(".") ? lower.slice(lower.lastIndexOf(".") + 1) : "";
+  const map: Record<string, string> = {
+    ts: "typescript",
+    tsx: "typescript",
+    js: "javascript",
+    jsx: "javascript",
+    mjs: "javascript",
+    cjs: "javascript",
+    py: "python",
+    rs: "rust",
+    go: "go",
+    rb: "ruby",
+    php: "php",
+    java: "java",
+    kt: "kotlin",
+    swift: "swift",
+    cs: "csharp",
+    c: "c",
+    h: "c",
+    cc: "cpp",
+    cpp: "cpp",
+    hpp: "cpp",
+    hxx: "cpp",
+    html: "html",
+    htm: "html",
+    css: "css",
+    scss: "scss",
+    less: "less",
+    json: "json",
+    jsonc: "jsonc",
+    yaml: "yaml",
+    yml: "yaml",
+    toml: "ini",
+    ini: "ini",
+    md: "markdown",
+    mdx: "markdown",
+    sh: "shell",
+    bash: "shell",
+    zsh: "shell",
+    sql: "sql",
+    graphql: "graphql",
+    gql: "graphql",
+    xml: "xml",
+    svg: "xml",
+    proto: "protobuf",
+  };
+  return map[ext] ?? "plaintext";
+}
+
+/**
+ * Register our dark theme on the Monaco instance once. We mirror
+ * the rest of the dashboard's palette (indigo accent, near-black
+ * background) rather than using `vs-dark` so the editor doesn't
+ * stand out from the surrounding modal.
+ */
+export function ensureTheme(monaco: Monaco) {
+  monaco.editor.defineTheme("forgecart-dark", {
+    base: "vs-dark",
+    inherit: true,
+    rules: [
+      { token: "comment", foreground: "6b7280", fontStyle: "italic" },
+      { token: "string", foreground: "a78bfa" },
+      { token: "number", foreground: "fbbf24" },
+      { token: "keyword", foreground: "818cf8" },
+      { token: "type", foreground: "34d399" },
+    ],
+    colors: {
+      "editor.background": "#0d0d0d",
+      "editor.foreground": "#e5e7eb",
+      "editorLineNumber.foreground": "#3f3f46",
+      "editorLineNumber.activeForeground": "#a5b4fc",
+      "editor.selectionBackground": "#312e8155",
+      "editor.lineHighlightBackground": "#18181b",
+      "editorCursor.foreground": "#a5b4fc",
+      "editorWhitespace.foreground": "#27272a",
+      "editorIndentGuide.background1": "#1f1f23",
+      "diffEditor.insertedTextBackground": "#10b98122",
+      "diffEditor.removedTextBackground": "#ef444422",
+    },
+  });
+}

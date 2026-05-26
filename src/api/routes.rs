@@ -754,6 +754,15 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(super::changes::list_mission_repo_tree),
         )
         .route(
+            "/api/control/missions/:id/file",
+            get(super::changes::get_mission_file)
+                .put(super::changes::write_mission_file),
+        )
+        .route(
+            "/api/control/missions/:id/search",
+            get(super::changes::search_mission_repo),
+        )
+        .route(
             "/api/control/missions/:id/tree",
             get(control::get_mission_tree),
         )
