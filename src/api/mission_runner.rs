@@ -14654,14 +14654,14 @@ pub async fn run_codex_turn(
                                 });
                             }
                             ExecutionEvent::Thinking { content }
-                            | ExecutionEvent::TextDelta { content } => {
-                                if !content.is_empty() {
-                                    let _ = events_tx.send(AgentEvent::SubagentText {
-                                        content,
-                                        mission_id: Some(mission_id),
-                                        parent_tool_use_id,
-                                    });
-                                }
+                            | ExecutionEvent::TextDelta { content }
+                                if !content.is_empty() =>
+                            {
+                                let _ = events_tx.send(AgentEvent::SubagentText {
+                                    content,
+                                    mission_id: Some(mission_id),
+                                    parent_tool_use_id,
+                                });
                             }
                             _ => {}
                         }
@@ -15200,14 +15200,14 @@ pub async fn run_gemini_turn(
                                 });
                             }
                             ExecutionEvent::Thinking { content }
-                            | ExecutionEvent::TextDelta { content } => {
-                                if !content.is_empty() {
-                                    let _ = events_tx.send(AgentEvent::SubagentText {
-                                        content,
-                                        mission_id: Some(mission_id),
-                                        parent_tool_use_id,
-                                    });
-                                }
+                            | ExecutionEvent::TextDelta { content }
+                                if !content.is_empty() =>
+                            {
+                                let _ = events_tx.send(AgentEvent::SubagentText {
+                                    content,
+                                    mission_id: Some(mission_id),
+                                    parent_tool_use_id,
+                                });
                             }
                             _ => {}
                         }
