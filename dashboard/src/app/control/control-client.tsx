@@ -1871,10 +1871,18 @@ function ThinkingGroupItem({
   );
 
   const hasActiveItem = items.some((item) => !item.done);
-  // Default-open: keep both active AND completed thinking visible.
-  // User asked for tool calls + thoughts to be open by default so
-  // they can scan a turn without having to click each row.
-  const [expanded, setExpanded] = useState(true);
+  // Default-open: thinking is short and worth scanning per turn.
+  // Streaming (text drafts) is noisy — the agent re-emits each
+  // delta, so a long turn spawns many "Draft" rows that scroll
+  // the chat. Collapse stream-only groups by default; keep
+  // anything containing actual thinking open.
+  const streamOnly = useMemo(
+    () =>
+      nonEmptyItems.length > 0 &&
+      nonEmptyItems.every((item) => item.kind === "stream"),
+    [nonEmptyItems],
+  );
+  const [expanded, setExpanded] = useState(!streamOnly);
 
   // Get the earliest start time and latest end time
   const startTime = Math.min(...items.map((item) => item.startTime));
