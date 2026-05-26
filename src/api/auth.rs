@@ -329,14 +329,45 @@ pub async fn require_auth(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
-    let token = auth_header
+    let mut token = auth_header
         .strip_prefix("Bearer ")
         .or_else(|| auth_header.strip_prefix("bearer "))
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
+
+    // Browser WebSocket can't set headers, so streaming routes
+    // (LSP / fs-events / workspace-stream) pass the bearer in the
+    // `?token=` query string instead. Accept that fallback ONLY
+    // when the request is a WS Upgrade — locks the query-string
+    // path to the surface it was added for and keeps regular API
+    // calls header-only.
+    if token.is_empty() {
+        let is_upgrade = req
+            .headers()
+            .get(axum::http::header::UPGRADE)
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false);
+        if is_upgrade {
+            if let Some(q) = req.uri().query() {
+                for pair in q.split('&') {
+                    if let Some(v) = pair.strip_prefix("token=") {
+                        if let Ok(decoded) = urlencoding::decode(v) {
+                            token = decoded.into_owned();
+                        } else {
+                            token = v.to_string();
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     if token.is_empty() {
         return (StatusCode::UNAUTHORIZED, "Missing Authorization header").into_response();
     }
+    let token: &str = &token;
 
     match verify_jwt(token, secret) {
         Ok(claims) => {
