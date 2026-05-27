@@ -4083,6 +4083,94 @@ function RestoreCheckpointModal({
   );
 }
 
+/**
+ * Horizontal tab strip pinned above the page header. One tab
+ * per non-terminal mission (filter out completed / failed /
+ * cancelled via `isFinishedStatus`). Active mission gets the
+ * indigo highlight. The X on each tab is a Cancel (not Delete);
+ * deleting from this strip would be too easy to fat-finger
+ * and the mission switcher already exposes the destructive op.
+ *
+ * Cmd-Shift-[ / Cmd-Shift-] cycle through this strip — handled
+ * by a global keydown listener in ControlClient.
+ */
+function MissionTabBar({
+  missions,
+  viewingMissionId,
+  runningMissions,
+  onSelect,
+  onCancel,
+}: {
+  missions: Mission[];
+  viewingMissionId: string | null;
+  runningMissions: RunningMissionInfo[];
+  onSelect: (id: string) => void;
+  onCancel: (id: string) => void;
+}) {
+  const tabs = useMemo(
+    () => missions.filter((m) => !isFinishedStatus(m.status)),
+    [missions],
+  );
+  const runningSet = useMemo(
+    () => new Set(runningMissions.map((r) => r.mission_id)),
+    [runningMissions],
+  );
+  if (tabs.length <= 1) return null;
+  return (
+    <div className="relative z-10 mb-2 -mx-3 sm:-mx-6 md:-mx-8 px-3 sm:px-6 md:px-8 overflow-x-auto border-b border-white/[0.06] bg-black/20 backdrop-blur-sm">
+      <div className="flex items-center gap-0.5 py-1">
+        {tabs.map((m) => {
+          const isActive = m.id === viewingMissionId;
+          const isRunning = runningSet.has(m.id);
+          const title = m.title?.trim() || getMissionShortName(m.id);
+          return (
+            <div
+              key={m.id}
+              role="tab"
+              aria-selected={isActive}
+              tabIndex={0}
+              onClick={() => onSelect(m.id)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  onSelect(m.id);
+                }
+              }}
+              className={cn(
+                "shrink-0 group flex items-center gap-1.5 pl-2.5 pr-1 py-1 rounded-md text-[12px] cursor-pointer transition-colors",
+                isActive
+                  ? "bg-indigo-500/20 text-indigo-100 border border-indigo-500/30"
+                  : "border border-transparent text-white/70 hover:bg-white/[0.04] hover:text-white",
+              )}
+              title={`${title} · ${m.status}`}
+            >
+              <span
+                className={cn(
+                  "h-1.5 w-1.5 rounded-full shrink-0",
+                  missionStatusDotClass(m.status, isRunning),
+                )}
+              />
+              <span className="max-w-[180px] truncate">{title}</span>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onCancel(m.id);
+                }}
+                className="opacity-0 group-hover:opacity-70 hover:!opacity-100 p-0.5 rounded text-white/50 hover:text-rose-300 hover:bg-rose-500/15 transition-opacity"
+                title="Cancel mission"
+                tabIndex={-1}
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function ChangesModal({
   open,
   missionId,
@@ -5943,6 +6031,49 @@ export default function ControlClient() {
   const [pendingFileRef, setPendingFileRef] = useState<
     { repo: string; path: string; line?: number } | null
   >(null);
+
+  // Cmd-Shift-[ / Cmd-Shift-] cycle through the mission tab bar
+  // (active non-terminal missions only). Skips when a modal is
+  // the topmost overlay or when focus is in a text input — we
+  // don't want to hijack the bracket keys in the composer or
+  // any modal form field.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || !e.shiftKey) return;
+      if (e.key !== "[" && e.key !== "]" && e.key !== "{" && e.key !== "}") {
+        return;
+      }
+      // `[`/`]` arrive as `{`/`}` on some layouts because Shift
+      // is held. Treat all four as the same control.
+      const dir = e.key === "[" || e.key === "{" ? -1 : 1;
+      // Bail when a modal is open. Monaco's own keybindings also
+      // claim Cmd-Shift-[ for fold, so we leave focus alone when
+      // the user is inside the editor.
+      if (document.querySelector('[role="dialog"][aria-modal="true"]')) {
+        return;
+      }
+      const tag = (document.activeElement?.tagName ?? "").toUpperCase();
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      // Skip Monaco — it has its own bracket-key bindings.
+      if (document.activeElement?.closest(".monaco-editor")) return;
+      e.preventDefault();
+      const tabs = recentMissions.filter(
+        (m) => !isFinishedStatus(m.status),
+      );
+      if (tabs.length === 0) return;
+      const cur = viewingMissionId
+        ? tabs.findIndex((m) => m.id === viewingMissionId)
+        : -1;
+      const next =
+        cur === -1
+          ? (dir === 1 ? 0 : tabs.length - 1)
+          : (cur + dir + tabs.length) % tabs.length;
+      handleViewMission(tabs[next].id);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recentMissions, viewingMissionId]);
 
   // Esc-Esc → checkpoint modal (Claude Code-style "restore
   // conversation to here"). lastEscRef holds the timestamp of
@@ -11484,6 +11615,21 @@ export default function ControlClient() {
               void loadHistoryEvents(activeMission.id);
             }
           }}
+        />
+
+        {/* Mission tab bar — horizontal strip pinned above the
+            header. Renders every NON-terminal mission (active,
+            pending, awaiting_user, blocked, interrupted, paused)
+            from `recentMissions`. Click switches the viewing
+            mission; X cancels (not deletes). Cmd-Shift-[/] cycle
+            through tab order — wired below with a global keydown
+            listener. */}
+        <MissionTabBar
+          missions={recentMissions}
+          viewingMissionId={viewingMissionId}
+          runningMissions={runningMissions}
+          onSelect={handleViewMission}
+          onCancel={handleCancelMission}
         />
 
         {/* Header */}
