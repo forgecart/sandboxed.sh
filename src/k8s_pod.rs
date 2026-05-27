@@ -454,6 +454,14 @@ impl K8sPodClient {
             "GIT_AUTHOR_EMAIL",
             "GIT_COMMITTER_NAME",
             "GIT_COMMITTER_EMAIL",
+            // Kubeconfig payload (base64-encoded YAML). When set on
+            // the control-plane deployment, bashenv.sh decodes it
+            // into /root/.kube/config inside every mission pod so
+            // the agent can run kubectl / terraform against the
+            // user's cluster. Workspace-supplied values still win
+            // (so a mission can override with a scoped kubeconfig
+            // if needed).
+            "KUBECONFIG_CONTENT",
         ];
         let mut merged: HashMap<String, String> = HashMap::new();
         for key in FORWARDED_FROM_CONTROL_PLANE {

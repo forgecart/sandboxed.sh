@@ -82,3 +82,39 @@ if [ -z "${SANDBOXED_BASHENV_DONE:-}" ] && command -v dockerd >/dev/null 2>&1; t
     unset __runlog
   fi
 fi
+
+# Materialise kubeconfig from the forwarded `KUBECONFIG_CONTENT`
+# env var so the agent can run kubectl / terraform against the
+# user's cluster. The control plane forwards this env from its
+# own deployment secret (see FORWARDED_FROM_CONTROL_PLANE in
+# src/k8s_pod.rs); workspace-supplied env_vars override.
+#
+# `KUBECONFIG_CONTENT` is base64-encoded YAML — keeps multi-line
+# config out of env-var quoting hell. Idempotent: a checksum-
+# keyed marker blocks re-decodes on every bash exec, which would
+# otherwise hammer the disk on every agent tool call. The
+# marker is keyed on the SHA-256 of the env value so rotating
+# the kubeconfig at the control plane forces a re-decode.
+if [ -n "${KUBECONFIG_CONTENT:-}" ] && [ -z "${SANDBOXED_KUBECONFIG_DONE:-}" ]; then
+  export SANDBOXED_KUBECONFIG_DONE=1
+  __kube_dir=/root/.kube
+  __kube_cfg="$__kube_dir/config"
+  __cksum=$(printf '%s' "$KUBECONFIG_CONTENT" | sha256sum | awk '{print $1}')
+  __marker="$__kube_dir/.sandboxed-kubeconfig-$__cksum"
+  if [ ! -f "$__marker" ]; then
+    mkdir -p "$__kube_dir"
+    if printf '%s' "$KUBECONFIG_CONTENT" | base64 -d > "$__kube_cfg.tmp" 2>/dev/null; then
+      mv -f "$__kube_cfg.tmp" "$__kube_cfg"
+      chmod 600 "$__kube_cfg" 2>/dev/null || true
+      rm -f "$__kube_dir"/.sandboxed-kubeconfig-* 2>/dev/null || true
+      touch "$__marker" 2>/dev/null || true
+    else
+      rm -f "$__kube_cfg.tmp" 2>/dev/null || true
+      if [ ! -f /tmp/.sandboxed-kubeconfig-warn ]; then
+        echo "[sandboxed] KUBECONFIG_CONTENT failed to base64-decode; kubectl/terraform won't be wired" >&2
+        touch /tmp/.sandboxed-kubeconfig-warn 2>/dev/null || true
+      fi
+    fi
+  fi
+  unset __kube_dir __kube_cfg __cksum __marker
+fi
