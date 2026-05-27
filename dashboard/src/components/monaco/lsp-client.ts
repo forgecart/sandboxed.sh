@@ -110,6 +110,28 @@ export async function createLspClient(opts: LspClientOptions): Promise<LspClient
   const openModels = new Map<string, { model: Monaco.editor.ITextModel; version: number; sub: Monaco.IDisposable }>();
   const providerDisposables: Monaco.IDisposable[] = [];
 
+  // typescript-language-server sometimes pulls configuration via
+  // a server→client request (`workspace/configuration`). If we
+  // don't answer, it falls back to defaults — which can miss
+  // things like the maxTsServerMemory setting. Mirror back the
+  // same shape we sent in `didChangeConfiguration`.
+  connection.onRequest("workspace/configuration", (params: { items: Array<{ section?: string }> }) => {
+    const cfg = {
+      tsserver: {
+        useSyntaxServer: "never",
+        maxTsServerMemory: 4096,
+      },
+      preferences: {
+        includePackageJsonAutoImports: "auto",
+        importModuleSpecifierPreference: "auto",
+      },
+    };
+    return (params.items ?? []).map((it) => {
+      if (it.section === "typescript" || it.section === "javascript") return cfg;
+      return {};
+    });
+  });
+
   // Diagnostics → setModelMarkers. The LSP can publish for any
   // open URI, including transitive imports the user never clicked
   // — we set markers on whichever model we have at that URI.
@@ -127,23 +149,85 @@ export async function createLspClient(opts: LspClientOptions): Promise<LspClient
   );
 
   // initialize → initialized.
+  //
+  // `initializationOptions` is what makes typescript-language-
+  // server behave like VSCode's TS extension. Without it, the
+  // server runs tsserver with its bundled TypeScript and a
+  // minimal set of preferences — and crucially, tsserver may
+  // not resolve workspace-level `compilerOptions.paths`
+  // mappings (NX monorepo `@myorg/...` style aliases), so
+  // Go-to-Definition lands on the import statement instead of
+  // the actual export. The shape below mirrors what
+  // microsoft/vscode-typescript-languageservice sends.
+  //
+  // `tsserver.useSyntaxServer: "never"` forces the semantic
+  // server for everything (definition / hover / completion);
+  // the syntax-only server doesn't know about path mappings.
+  //
+  // `tsserver.maxTsServerMemory: 4096` matches VSCode's
+  // "typescript.tsserver.maxTsServerMemory" default and gives
+  // tsserver room to load big monorepo project graphs.
+  //
+  // `preferences.includePackageJsonAutoImports: "auto"` makes
+  // tsserver index workspace packages so cross-package
+  // navigation works.
+  //
+  // `hostInfo: "monaco-dashboard"` is what tsserver uses to
+  // tag its log / telemetry; VSCode sends `hostInfo: "vscode"`.
+  // Some tsserver plugins gate behaviour on this value.
   const initParams = {
     processId: null,
     rootUri,
     rootPath: rootUri.replace(/^file:\/\//, ""),
     workspaceFolders: [{ uri: rootUri, name: "root" }],
+    initializationOptions: {
+      hostInfo: "monaco-dashboard",
+      tsserver: {
+        useSyntaxServer: "never",
+        maxTsServerMemory: 4096,
+        logVerbosity: "off",
+        logDirectory: "/tmp/tsserver-logs",
+      },
+      preferences: {
+        includePackageJsonAutoImports: "auto",
+        importModuleSpecifierPreference: "auto",
+        quotePreference: "auto",
+        allowIncompleteCompletions: true,
+        allowTextChangesInNewFiles: true,
+        includeCompletionsForModuleExports: true,
+        includeCompletionsForImportStatements: true,
+        includeCompletionsWithSnippetText: true,
+        includeCompletionsWithInsertText: true,
+      },
+    },
     capabilities: {
       textDocument: {
-        synchronization: { dynamicRegistration: false },
+        synchronization: {
+          dynamicRegistration: false,
+          willSave: false,
+          willSaveWaitUntil: false,
+          didSave: true,
+        },
         completion: {
-          completionItem: { snippetSupport: true, documentationFormat: ["markdown", "plaintext"] },
+          completionItem: {
+            snippetSupport: true,
+            documentationFormat: ["markdown", "plaintext"],
+            resolveSupport: { properties: ["documentation", "detail"] },
+          },
         },
         hover: { contentFormat: ["markdown", "plaintext"] },
-        definition: { dynamicRegistration: false },
+        definition: { dynamicRegistration: false, linkSupport: false },
+        typeDefinition: { dynamicRegistration: false, linkSupport: false },
+        implementation: { dynamicRegistration: false, linkSupport: false },
+        references: { dynamicRegistration: false },
         publishDiagnostics: { relatedInformation: true },
+        documentSymbol: { hierarchicalDocumentSymbolSupport: true },
       },
       workspace: {
         workspaceFolders: true,
+        configuration: true,
+        didChangeConfiguration: { dynamicRegistration: false },
+        didChangeWatchedFiles: { dynamicRegistration: false },
       },
     },
   };
@@ -152,6 +236,31 @@ export async function createLspClient(opts: LspClientOptions): Promise<LspClient
     initParams,
   );
   await connection.sendNotification("initialized", {});
+
+  // Push a workspace-configuration notification right after
+  // `initialized` so tsserver locks in the right preferences
+  // before any didOpen. typescript-language-server reads these
+  // from `workspace/didChangeConfiguration`.
+  void connection.sendNotification("workspace/didChangeConfiguration", {
+    settings: {
+      typescript: {
+        tsserver: {
+          useSyntaxServer: "never",
+          maxTsServerMemory: 4096,
+        },
+        preferences: {
+          includePackageJsonAutoImports: "auto",
+          importModuleSpecifierPreference: "auto",
+        },
+      },
+      javascript: {
+        preferences: {
+          includePackageJsonAutoImports: "auto",
+          importModuleSpecifierPreference: "auto",
+        },
+      },
+    },
+  });
 
   // Register Monaco providers for the languages TS LSP serves.
   // typescript-language-server handles ts, tsx, js, jsx by default.
