@@ -8,6 +8,15 @@ const nextConfig: NextConfig = {
   env: {
     NEXT_PUBLIC_APP_VERSION: version,
   },
+  // Ship source maps to the browser in production. Without this,
+  // every error in DevTools surfaces as a one-line trace through
+  // `_next/static/chunks/abc123.js:1:9876` — useless for
+  // debugging. With this, the browser remaps back to the
+  // original component file / line on the fly. The `.map` files
+  // are only fetched when DevTools is open, so end-user impact
+  // is the disk space of the build artifact (~30% bigger) and
+  // a slight bandwidth hit when the user has DevTools open.
+  productionBrowserSourceMaps: true,
   turbopack: {
     root: process.cwd(),
   },
