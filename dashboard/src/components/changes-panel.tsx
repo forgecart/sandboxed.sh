@@ -37,6 +37,9 @@ const VIEW_MODE_STORAGE_KEY = "changes-panel.view-mode";
 const LEFT_WIDTH_STORAGE_KEY = "changes-panel.left-pct";
 const REPO_PANE_HEIGHT_STORAGE_KEY = "changes-panel.repo-pane-pct";
 const VIM_STORAGE_KEY = "changes-panel.vim";
+const SECTION_COLLAPSED_PREFIX = "changes-panel.collapsed.";
+
+type LeftSection = "repos" | "changed" | "history";
 
 function readStoredViewMode(): DiffViewMode {
   if (typeof window === "undefined") return "split";
@@ -199,6 +202,31 @@ export function ChangesPanel({
   // checked-out mission rendered "No repos" even when the repos
   // existed on disk.
   const [allRepos, setAllRepos] = useState<string[] | null>(null);
+
+  // Per-section collapse state for the left column. Each header
+  // is a button with a chevron; clicking it toggles the body.
+  // History defaults closed because fetching git log per repo
+  // is an extra exec the user shouldn't pay for unless they
+  // want to browse.
+  const [sectionCollapsed, setSectionCollapsed] = useState<
+    Record<LeftSection, boolean>
+  >(() => ({
+    repos: readStoredBool(`${SECTION_COLLAPSED_PREFIX}repos`, false),
+    changed: readStoredBool(`${SECTION_COLLAPSED_PREFIX}changed`, false),
+    history: readStoredBool(`${SECTION_COLLAPSED_PREFIX}history`, true),
+  }));
+  const toggleSection = useCallback((s: LeftSection) => {
+    setSectionCollapsed((prev) => {
+      const next = { ...prev, [s]: !prev[s] };
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(
+          `${SECTION_COLLAPSED_PREFIX}${s}`,
+          next[s] ? "1" : "0",
+        );
+      }
+      return next;
+    });
+  }, []);
   const [findLoading, setFindLoading] = useState(false);
   const [findError, setFindError] = useState<string | null>(null);
   const [findTruncated, setFindTruncated] = useState(false);
@@ -361,6 +389,100 @@ export function ChangesPanel({
       setActiveTabId(id);
     },
     [],
+  );
+
+  // Open a diff tab for a specific commit's change to a file:
+  // diff between commit^ (parent) and commit. Reuses the same
+  // diff tab kind by synthesising a MissionChangedFile shape;
+  // the diff renderer doesn't care that head/worktree come from
+  // git refs instead of the worktree.
+  const openCommitDiffTab = useCallback(
+    async (
+      repoName: string,
+      filePath: string,
+      hash: string,
+      shortHash: string,
+      status: string,
+    ) => {
+      const tabId = `${repoName}/${filePath}#commit-${hash}`;
+      // Show a placeholder tab while content loads.
+      setTabs((prev) => {
+        if (prev.has(tabId)) return prev;
+        const next = new Map(prev);
+        next.set(tabId, {
+          id: tabId,
+          repoName,
+          filePath,
+          kind: "diff",
+          diff: {
+            path: filePath,
+            status,
+            diff: "",
+            head_content: null,
+            worktree_content: null,
+            truncated: false,
+          },
+        });
+        return next;
+      });
+      setTabOrder((prev) => (prev.includes(tabId) ? prev : [...prev, tabId]));
+      setActiveTabId(tabId);
+
+      try {
+        const stream = getWorkspaceStream(missionId);
+        const [parent, current] = await Promise.all([
+          stream
+            .call<{ content: string; binary: boolean; truncated: boolean }>(
+              "read_file",
+              {
+                repo: repoName,
+                path: filePath,
+                git_ref: `${hash}^`,
+              },
+            )
+            .catch(() => ({ content: "", binary: false, truncated: false })),
+          stream
+            .call<{ content: string; binary: boolean; truncated: boolean }>(
+              "read_file",
+              {
+                repo: repoName,
+                path: filePath,
+                git_ref: hash,
+              },
+            )
+            .catch(() => ({ content: "", binary: false, truncated: false })),
+        ]);
+        setTabs((prev) => {
+          const cur = prev.get(tabId);
+          if (!cur || cur.kind !== "diff" || !cur.diff) return prev;
+          const next = new Map(prev);
+          next.set(tabId, {
+            ...cur,
+            diff: {
+              ...cur.diff,
+              head_content: parent.content || null,
+              worktree_content: current.content || null,
+              truncated: parent.truncated || current.truncated,
+            },
+          });
+          return next;
+        });
+      } catch (e) {
+        setTabs((prev) => {
+          const cur = prev.get(tabId);
+          if (!cur) return prev;
+          const next = new Map(prev);
+          next.set(tabId, {
+            ...cur,
+            error: e instanceof Error ? e.message : String(e),
+          });
+          return next;
+        });
+      }
+      // shortHash kept as a future-use display hint
+      void shortHash;
+    },
+    [missionId],
   );
 
   const openEditTab = useCallback(
@@ -847,78 +969,79 @@ export function ChangesPanel({
       )}
 
       <div ref={containerRef} className="flex-1 min-h-0 flex">
-        {/* Left column: stacked repo browser (top) + changed-files
-            tree (bottom), separated by a horizontal drag handle. */}
+        {/* Left column: three stacked sections — Repos, Changed,
+            History — each with a chevron header. Sections share
+            flex space equally when expanded; a collapsed section
+            shrinks to its header. localStorage remembers
+            collapse state per section. */}
         <div
           ref={leftColumnRef}
           className="shrink-0 flex flex-col border-r border-white/[0.06] min-w-0"
           style={{ width: `${leftPct}%` }}
         >
-          {/* Repo browser pane */}
-          <div
-            className="flex flex-col min-h-0 border-b border-white/[0.06]"
-            style={{ height: `${repoPanePct}%` }}
+          {/* Repos */}
+          <SectionShell
+            icon={<Folder className="h-3 w-3" />}
+            title="Repos"
+            count={allRepos?.length}
+            collapsed={sectionCollapsed.repos}
+            onToggle={() => toggleSection("repos")}
           >
-            <div className="flex items-center gap-2 px-3 py-2 border-b border-white/[0.04] text-[11px] uppercase tracking-wide text-white/40">
-              <Folder className="h-3 w-3" />
-              Repos
-            </div>
-            <div className="flex-1 min-h-0 overflow-y-auto py-1">
-              {allRepos !== null && allRepos.length === 0 && (
-                <p className="px-3 py-2 text-xs text-white/40">
-                  No repos in <code>/workspaces/repos</code>.
-                </p>
-              )}
-              {allRepos?.map((repoName) => (
-                <RepoTreeNode
-                  key={repoName}
-                  missionId={missionId}
-                  repoName={repoName}
-                  rootPath=""
-                  depth={0}
-                  onOpenFile={(r, p) => void openEditTab(r, p)}
-                />
-              ))}
-            </div>
-          </div>
+            {allRepos !== null && allRepos.length === 0 && (
+              <p className="px-3 py-2 text-xs text-white/40">
+                No repos in <code>/workspaces/repos</code>.
+              </p>
+            )}
+            {allRepos?.map((repoName) => (
+              <RepoTreeNode
+                key={repoName}
+                missionId={missionId}
+                repoName={repoName}
+                rootPath=""
+                depth={0}
+                onOpenFile={(r, p) => void openEditTab(r, p)}
+              />
+            ))}
+          </SectionShell>
 
-          {/* Horizontal divider between repo pane and changed files */}
-          <div
-            onMouseDown={onRepoPaneResizeStart}
-            className="h-1 cursor-row-resize bg-white/[0.04] hover:bg-indigo-500/40 transition-colors shrink-0"
-            title="Drag to resize"
-          />
+          {/* Changed */}
+          <SectionShell
+            icon={<FileText className="h-3 w-3" />}
+            title="Changed"
+            count={totalFiles}
+            collapsed={sectionCollapsed.changed}
+            onToggle={() => toggleSection("changed")}
+          >
+            {data && totalFiles === 0 && !data.unavailable && (
+              <div className="p-3 text-sm text-white/40">
+                No uncommitted changes in any cloned repo.
+              </div>
+            )}
+            {data?.repos.map((repo) => (
+              <ChangedFilesTree
+                key={repo.name}
+                repo={repo}
+                activeDiffTabId={activeTabId}
+                onSelect={openDiffTab}
+              />
+            ))}
+          </SectionShell>
 
-          {/* Changed-files tree */}
-          <div className="flex-1 min-h-0 flex flex-col">
-            <div className="flex items-center gap-2 px-3 py-2 border-b border-white/[0.04] text-[11px] uppercase tracking-wide text-white/40">
-              <FileText className="h-3 w-3" />
-              Changed
-              {totalFiles > 0 && (
-                <span className="ml-1 text-white/30 font-mono">
-                  ({totalFiles})
-                </span>
-              )}
-            </div>
-            <div className="flex-1 min-h-0 overflow-y-auto py-1">
-              {/* Inline "Loading…" text dropped — the top progress
-                  bar already surfaces the initial-load state, and
-                  the Refresh icon spin handles subsequent fetches. */}
-              {data && totalFiles === 0 && !data.unavailable && (
-                <div className="p-3 text-sm text-white/40">
-                  No uncommitted changes in any cloned repo.
-                </div>
-              )}
-              {data?.repos.map((repo) => (
-                <ChangedFilesTree
-                  key={repo.name}
-                  repo={repo}
-                  activeDiffTabId={activeTabId}
-                  onSelect={openDiffTab}
-                />
-              ))}
-            </div>
-          </div>
+          {/* History */}
+          <SectionShell
+            icon={<GitBranch className="h-3 w-3" />}
+            title="History"
+            collapsed={sectionCollapsed.history}
+            onToggle={() => toggleSection("history")}
+          >
+            <HistoryPanel
+              missionId={missionId}
+              allRepos={allRepos ?? []}
+              onOpenCommitFile={(repo, file, hash, short, status) =>
+                void openCommitDiffTab(repo, file, hash, short, status)
+              }
+            />
+          </SectionShell>
         </div>
 
         {/* Vertical drag handle between left + right */}
@@ -1689,5 +1812,305 @@ function ChangesLoadProgress({
         {pct}% · {label}
       </span>
     </div>
+  );
+}
+
+/**
+ * Shared section wrapper for the left column. Renders a header
+ * with chevron + icon + title (+ optional count badge), and
+ * collapses the body when `collapsed` is true. When expanded
+ * the body grows to fill (flex: 1 1 0) so the sister sections
+ * share leftover space evenly.
+ */
+function SectionShell({
+  icon,
+  title,
+  count,
+  collapsed,
+  onToggle,
+  children,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  count?: number;
+  collapsed: boolean;
+  onToggle: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      className={cn(
+        "flex flex-col min-h-0 border-b border-white/[0.06]",
+        collapsed ? "shrink-0" : "flex-1",
+      )}
+    >
+      <button
+        type="button"
+        onClick={onToggle}
+        className="w-full flex items-center gap-2 px-3 py-2 border-b border-white/[0.04] text-[11px] uppercase tracking-wide text-white/40 hover:text-white/70 hover:bg-white/[0.02] transition-colors text-left"
+        title={collapsed ? `Expand ${title}` : `Collapse ${title}`}
+      >
+        {collapsed ? (
+          <ChevronRight className="h-3 w-3 shrink-0" />
+        ) : (
+          <ChevronDown className="h-3 w-3 shrink-0" />
+        )}
+        <span className="shrink-0">{icon}</span>
+        <span className="flex-1">{title}</span>
+        {typeof count === "number" && count > 0 && (
+          <span className="text-white/30 font-mono">({count})</span>
+        )}
+      </button>
+      {!collapsed && (
+        <div className="flex-1 min-h-0 overflow-y-auto py-1">{children}</div>
+      )}
+    </div>
+  );
+}
+
+interface GitCommit {
+  hash: string;
+  short_hash: string;
+  subject: string;
+  author: string;
+  timestamp: number;
+}
+
+interface CommitFile {
+  path: string;
+  status: string;
+}
+
+/**
+ * History panel — picks a repo from a dropdown, lists its
+ * recent commits, and on commit click expands inline to show
+ * the files that commit changed. Clicking a file opens a diff
+ * tab comparing parent vs commit.
+ *
+ * Commit list lazy-loads per repo (one `git log` exec on first
+ * select). Commit files lazy-load per commit (one `git
+ * diff-tree` per expansion).
+ */
+function HistoryPanel({
+  missionId,
+  allRepos,
+  onOpenCommitFile,
+}: {
+  missionId: string;
+  allRepos: string[];
+  onOpenCommitFile: (
+    repo: string,
+    path: string,
+    hash: string,
+    shortHash: string,
+    status: string,
+  ) => void;
+}) {
+  const [activeRepo, setActiveRepo] = useState<string | null>(null);
+  const [commits, setCommits] = useState<Record<string, GitCommit[]>>({});
+  const [loadingRepo, setLoadingRepo] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // Pick the first repo automatically. If allRepos changes
+  // (e.g. comes back from list_repos) and we haven't picked
+  // yet, set the default.
+  useEffect(() => {
+    if (activeRepo === null && allRepos.length > 0) {
+      setActiveRepo(allRepos[0]);
+    }
+  }, [allRepos, activeRepo]);
+
+  // Lazy-load commits for the active repo.
+  useEffect(() => {
+    if (!activeRepo || commits[activeRepo]) return;
+    let cancelled = false;
+    setLoadingRepo(activeRepo);
+    setError(null);
+    void (async () => {
+      try {
+        const stream = getWorkspaceStream(missionId);
+        const body = await stream.call<{ commits: GitCommit[] }>(
+          "list_commits",
+          { repo: activeRepo, limit: 100 },
+        );
+        if (!cancelled) {
+          setCommits((prev) => ({ ...prev, [activeRepo]: body.commits }));
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      } finally {
+        if (!cancelled) setLoadingRepo(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeRepo, commits, missionId]);
+
+  if (allRepos.length === 0) {
+    return (
+      <p className="px-3 py-2 text-xs text-white/40">
+        No repos in <code>/workspaces/repos</code>.
+      </p>
+    );
+  }
+  return (
+    <div>
+      <div className="px-3 py-2 border-b border-white/[0.04]">
+        <select
+          value={activeRepo ?? ""}
+          onChange={(e) => setActiveRepo(e.target.value)}
+          className="w-full bg-black/30 border border-white/[0.06] rounded text-[12px] text-white/80 px-2 py-1 focus:outline-none focus:border-indigo-500/40"
+        >
+          {allRepos.map((r) => (
+            <option key={r} value={r} className="bg-[#0d0d0d]">
+              {r}
+            </option>
+          ))}
+        </select>
+      </div>
+      {loadingRepo && (
+        <div className="px-3 py-2 text-[11px] text-white/40 flex items-center gap-2">
+          <Loader2 className="h-3 w-3 animate-spin" /> Loading commits…
+        </div>
+      )}
+      {error && (
+        <div className="px-3 py-2 text-[11px] text-red-300/80">{error}</div>
+      )}
+      {!loadingRepo && activeRepo && commits[activeRepo] && (
+        <ul className="divide-y divide-white/[0.04]">
+          {commits[activeRepo].map((cp) => (
+            <CommitRow
+              key={cp.hash}
+              missionId={missionId}
+              repo={activeRepo}
+              commit={cp}
+              onOpenCommitFile={onOpenCommitFile}
+            />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function CommitRow({
+  missionId,
+  repo,
+  commit,
+  onOpenCommitFile,
+}: {
+  missionId: string;
+  repo: string;
+  commit: GitCommit;
+  onOpenCommitFile: (
+    repo: string,
+    path: string,
+    hash: string,
+    shortHash: string,
+    status: string,
+  ) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [files, setFiles] = useState<CommitFile[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open || files !== null) return;
+    let cancelled = false;
+    setLoading(true);
+    setErr(null);
+    void (async () => {
+      try {
+        const stream = getWorkspaceStream(missionId);
+        const body = await stream.call<{ files: CommitFile[] }>(
+          "commit_files",
+          { repo, hash: commit.hash },
+        );
+        if (!cancelled) setFiles(body.files);
+      } catch (e) {
+        if (!cancelled) setErr(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, files, missionId, repo, commit.hash]);
+
+  const dateStr = new Date(commit.timestamp * 1000).toLocaleString(undefined, {
+    year: "2-digit",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={() => setOpen((p) => !p)}
+        className="w-full text-left px-2 py-1.5 hover:bg-white/[0.04] flex items-start gap-1.5"
+      >
+        {open ? (
+          <ChevronDown className="h-3 w-3 mt-1 shrink-0 text-white/40" />
+        ) : (
+          <ChevronRight className="h-3 w-3 mt-1 shrink-0 text-white/40" />
+        )}
+        <div className="flex-1 min-w-0">
+          <div className="flex items-baseline gap-2">
+            <span className="font-mono text-[10px] text-indigo-300 shrink-0">
+              {commit.short_hash}
+            </span>
+            <span className="text-[10px] text-white/30 shrink-0">{dateStr}</span>
+          </div>
+          <p className="text-[12px] text-white/85 truncate" title={commit.subject}>
+            {commit.subject}
+          </p>
+          <p className="text-[10px] text-white/40 truncate">{commit.author}</p>
+        </div>
+      </button>
+      {open && (
+        <div className="pl-6 pb-1">
+          {loading && (
+            <p className="px-2 py-1 text-[11px] text-white/40 flex items-center gap-1.5">
+              <Loader2 className="h-3 w-3 animate-spin" /> Loading files…
+            </p>
+          )}
+          {err && (
+            <p className="px-2 py-1 text-[11px] text-red-300/80">{err}</p>
+          )}
+          {files?.length === 0 && !loading && (
+            <p className="px-2 py-1 text-[11px] text-white/40">No files</p>
+          )}
+          {files?.map((f) => (
+            <button
+              type="button"
+              key={f.path}
+              onClick={() =>
+                onOpenCommitFile(
+                  repo,
+                  f.path,
+                  commit.hash,
+                  commit.short_hash,
+                  f.status,
+                )
+              }
+              className="w-full flex items-center gap-1.5 px-2 py-1 text-[12px] text-left hover:bg-white/[0.04]"
+              title={`${f.status} ${f.path}`}
+            >
+              <StatusBadge status={f.status} />
+              <FileIcon className="h-3 w-3 text-white/40 shrink-0" />
+              <span className="font-mono truncate text-white/75">{f.path}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </li>
   );
 }

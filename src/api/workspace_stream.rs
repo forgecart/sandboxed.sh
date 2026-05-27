@@ -186,6 +186,20 @@ async fn run(socket: WebSocket, mission_id: Uuid) -> anyhow::Result<()> {
                 });
                 tasks.lock().await.insert(id, h);
             }
+            "list_commits" => {
+                let h = tokio::spawn(async move {
+                    list_commits(&tx_t, &id_t, mid, params).await;
+                    tasks_t.lock().await.remove(&id_t);
+                });
+                tasks.lock().await.insert(id, h);
+            }
+            "commit_files" => {
+                let h = tokio::spawn(async move {
+                    commit_files(&tx_t, &id_t, mid, params).await;
+                    tasks_t.lock().await.remove(&id_t);
+                });
+                tasks.lock().await.insert(id, h);
+            }
             "cancel" => {
                 if let Some(target) = params.get("request_id").and_then(|v| v.as_str()) {
                     if let Some(h) = tasks.lock().await.remove(target) {
@@ -273,6 +287,12 @@ struct PathParams {
     repo: String,
     #[serde(default)]
     path: String,
+    /// Optional git ref (commit hash, branch, tag). When set,
+    /// `read_file` returns `git show <ref>:<path>` instead of
+    /// reading the worktree. Used by the history panel to show
+    /// file content at a specific commit.
+    #[serde(default)]
+    git_ref: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -386,13 +406,40 @@ async fn read_file(tx: &WsTx, id: &str, mission_id: Uuid, params: Value) {
         None => return send_error(tx, Some(id), "pod unavailable").await,
     };
     let full = format!("/workspaces/repos/{}/{}", p.repo, p.path);
-    let script = format!(
-        "set -e; f={}; [ -f \"$f\" ] || {{ echo __NOT_A_FILE__; exit 0; }}; \
-         head -c 8192 \"$f\" | od -An -c | grep -q '\\\\0' && echo __BINARY__ && exit 0; \
-         head -c {} \"$f\"",
-        shell_quote(&full),
-        MAX_FILE_BYTES,
-    );
+    let repo_dir = format!("/workspaces/repos/{}", p.repo);
+    let script = if let Some(git_ref) = p.git_ref.as_deref() {
+        // Validate ref: hex hash, branch / tag name. Reject
+        // anything with shell metas so we can't be tricked into
+        // `git show $(rm -rf …)`. Refs in practice are
+        // alphanumeric + `_`, `-`, `/`, `^`, `~`, `.`.
+        if !git_ref
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '^' | '~' | '.'))
+        {
+            return send_error(tx, Some(id), "invalid git_ref").await;
+        }
+        // `git show <ref>:<path>` returns the file content at
+        // that ref. If the file doesn't exist at the ref, git
+        // prints to stderr and exits non-zero — we surface as
+        // empty content rather than 500 since the diff viewer
+        // happily renders a one-sided diff.
+        format!(
+            "cd {} && \
+             git show {}:{} 2>/dev/null | head -c {} || true",
+            shell_quote(&repo_dir),
+            shell_quote(git_ref),
+            shell_quote(&p.path),
+            MAX_FILE_BYTES,
+        )
+    } else {
+        format!(
+            "set -e; f={}; [ -f \"$f\" ] || {{ echo __NOT_A_FILE__; exit 0; }}; \
+             head -c 8192 \"$f\" | od -An -c | grep -q '\\\\0' && echo __BINARY__ && exit 0; \
+             head -c {} \"$f\"",
+            shell_quote(&full),
+            MAX_FILE_BYTES,
+        )
+    };
     let out = match k8s
         .exec_command(
             mission_id,
@@ -538,6 +585,152 @@ done
         .filter(|s| !s.is_empty())
         .collect();
     send_done(tx, id, json!({ "repos": repos })).await;
+}
+
+#[derive(Deserialize)]
+struct ListCommitsParams {
+    repo: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// `git log` per repo. Returns one entry per commit:
+///   { hash, short_hash, subject, author, timestamp }
+/// `timestamp` is a Unix epoch in seconds (number, not string)
+/// so the client can format with `Date()`. Default limit 100;
+/// hard-capped at 500 to keep the response bounded on very old
+/// repos.
+async fn list_commits(tx: &WsTx, id: &str, mission_id: Uuid, params: Value) {
+    let p: ListCommitsParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return send_error(tx, Some(id), &format!("bad params: {e}")).await,
+    };
+    if p.repo.is_empty() || p.repo.contains('/') || p.repo.contains("..") {
+        return send_error(tx, Some(id), "invalid repo").await;
+    }
+    let limit = p.limit.unwrap_or(100).clamp(1, 500);
+    let k8s = match crate::k8s_pod::global_client() {
+        Some(c) => c,
+        None => return send_error(tx, Some(id), "pod unavailable").await,
+    };
+    let repo_dir = format!("/workspaces/repos/{}", p.repo);
+    // ASCII 0x1f (Unit Separator) between fields, 0x1e (Record
+    // Separator) between commits. These never appear in
+    // reasonable commit subjects, so we don't need shell-escape
+    // gymnastics on the parsing side.
+    let script = format!(
+        "cd {} 2>/dev/null && \
+         git log -n {} --pretty=format:'%H\\x1f%h\\x1f%s\\x1f%an\\x1f%at\\x1e' 2>/dev/null || true",
+        shell_quote(&repo_dir),
+        limit,
+    );
+    let out = match k8s
+        .exec_command(
+            mission_id,
+            None,
+            "/bin/bash",
+            &["-lc".to_string(), script],
+            &HashMap::new(),
+        )
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return send_error(tx, Some(id), &format!("exec: {e}")).await,
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut commits: Vec<Value> = Vec::new();
+    for record in stdout.split('\u{1e}') {
+        if record.trim().is_empty() {
+            continue;
+        }
+        // Allow a leading \n that `format:` leaves before the
+        // first record on some git versions.
+        let record = record.trim_start_matches('\n');
+        let mut it = record.splitn(5, '\u{1f}');
+        let hash = it.next().unwrap_or("").to_string();
+        let short = it.next().unwrap_or("").to_string();
+        let subject = it.next().unwrap_or("").to_string();
+        let author = it.next().unwrap_or("").to_string();
+        let ts: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        if hash.is_empty() {
+            continue;
+        }
+        commits.push(json!({
+            "hash": hash,
+            "short_hash": short,
+            "subject": subject,
+            "author": author,
+            "timestamp": ts,
+        }));
+    }
+    send_done(tx, id, json!({ "commits": commits })).await;
+}
+
+#[derive(Deserialize)]
+struct CommitFilesParams {
+    repo: String,
+    hash: String,
+}
+
+/// Files changed in a single commit. Returns
+/// `[{ path, status }]` where status is the git porcelain code
+/// (`M`, `A`, `D`, `R…`). Uses `git diff-tree` which is fast
+/// and doesn't materialise the whole diff.
+async fn commit_files(tx: &WsTx, id: &str, mission_id: Uuid, params: Value) {
+    let p: CommitFilesParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return send_error(tx, Some(id), &format!("bad params: {e}")).await,
+    };
+    if p.repo.is_empty() || p.repo.contains('/') || p.repo.contains("..") {
+        return send_error(tx, Some(id), "invalid repo").await;
+    }
+    if !p.hash.chars().all(|c| c.is_ascii_alphanumeric()) || p.hash.is_empty() {
+        return send_error(tx, Some(id), "invalid hash").await;
+    }
+    let k8s = match crate::k8s_pod::global_client() {
+        Some(c) => c,
+        None => return send_error(tx, Some(id), "pod unavailable").await,
+    };
+    let repo_dir = format!("/workspaces/repos/{}", p.repo);
+    // -r → recurse into trees; --no-commit-id → just the file
+    // lines, no commit-hash header; --name-status → one file per
+    // line with status code.
+    let script = format!(
+        "cd {} 2>/dev/null && \
+         git diff-tree --no-commit-id --name-status -r {} 2>/dev/null || true",
+        shell_quote(&repo_dir),
+        shell_quote(&p.hash),
+    );
+    let out = match k8s
+        .exec_command(
+            mission_id,
+            None,
+            "/bin/bash",
+            &["-lc".to_string(), script],
+            &HashMap::new(),
+        )
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return send_error(tx, Some(id), &format!("exec: {e}")).await,
+    };
+    let mut files: Vec<Value> = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        // Tab-separated: <STATUS>\t<path>[\t<path2>] (for
+        // renames). We only show the destination path for renames.
+        let mut parts = line.split('\t');
+        let status = parts.next().unwrap_or("").to_string();
+        let path = parts.last().unwrap_or("").to_string();
+        if status.is_empty() || path.is_empty() {
+            continue;
+        }
+        files.push(json!({ "path": path, "status": status }));
+    }
+    send_done(tx, id, json!({ "files": files })).await;
 }
 
 async fn list_changes_impl(tx: &WsTx, id: &str, mission_id: Uuid) {
