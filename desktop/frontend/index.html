@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Forgecart Code</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: #0a0a0a;
+        color: rgba(255, 255, 255, 0.6);
+        font: 14px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      .center {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        gap: 1rem;
+      }
+      a {
+        color: #818cf8;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="center">
+      <p>Loading Forgecart Code…</p>
+      <p>
+        Stuck on this screen?
+        <a href="https://code.forgecart.com" target="_blank" rel="noopener">
+          Open in browser
+        </a>
+      </p>
+    </div>
+    <script>
+      // The Tauri config sets the window URL to https://code.forgecart.com
+      // directly, so this stub should never be the visible page in normal
+      // operation. If it does load (e.g. offline / DNS failure), redirect
+      // out so the user always lands on the dashboard once the network
+      // comes back.
+      try {
+        window.location.replace("https://code.forgecart.com/");
+      } catch (e) {
+        // ignore — the link above is the fallback
+      }
+    </script>
+  </body>
+</html>

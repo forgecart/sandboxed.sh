@@ -1,0 +1,16 @@
+{
+  "name": "forgecart-code-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Tauri desktop wrapper for code.forgecart.com",
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "icons": "tauri icon ./src-tauri/icons/icon.png"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
