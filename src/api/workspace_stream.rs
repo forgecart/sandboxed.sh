@@ -179,6 +179,13 @@ async fn run(socket: WebSocket, mission_id: Uuid) -> anyhow::Result<()> {
                 });
                 tasks.lock().await.insert(id, h);
             }
+            "list_repos" => {
+                let h = tokio::spawn(async move {
+                    list_repos(&tx_t, &id_t, mid).await;
+                    tasks_t.lock().await.remove(&id_t);
+                });
+                tasks.lock().await.insert(id, h);
+            }
             "cancel" => {
                 if let Some(target) = params.get("request_id").and_then(|v| v.as_str()) {
                     if let Some(h) = tasks.lock().await.remove(target) {
@@ -491,6 +498,49 @@ async fn write_file(tx: &WsTx, id: &str, mission_id: Uuid, params: Value) {
 ///     each batch.
 ///  3. Final `done`.
 async fn list_changes(tx: &WsTx, id: &str, mission_id: Uuid) {
+    list_changes_impl(tx, id, mission_id).await;
+}
+
+/// Repo enumeration verb — returns every directory under
+/// `/workspaces/repos/` that has a `.git`, regardless of whether
+/// the worktree is clean. Used by the Repos pane in the editor
+/// so the user can browse + open files even when nothing's been
+/// modified. The previous behaviour fell back to the
+/// `list_changes` response, which filters out clean repos, so a
+/// freshly-checked-out mission looked empty.
+async fn list_repos(tx: &WsTx, id: &str, mission_id: Uuid) {
+    let k8s = match crate::k8s_pod::global_client() {
+        Some(c) => c,
+        None => return send_error(tx, Some(id), "pod unavailable").await,
+    };
+    let script = r#"
+for d in /workspaces/repos/*; do
+  [ -d "$d/.git" ] || continue
+  basename "$d"
+done
+"#;
+    let out = match k8s
+        .exec_command(
+            mission_id,
+            None,
+            "/bin/bash",
+            &["-lc".to_string(), script.to_string()],
+            &HashMap::new(),
+        )
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return send_error(tx, Some(id), &format!("repo enum: {e}")).await,
+    };
+    let repos: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    send_done(tx, id, json!({ "repos": repos })).await;
+}
+
+async fn list_changes_impl(tx: &WsTx, id: &str, mission_id: Uuid) {
     let k8s = match crate::k8s_pod::global_client() {
         Some(c) => c,
         None => return send_error(tx, Some(id), "pod unavailable").await,

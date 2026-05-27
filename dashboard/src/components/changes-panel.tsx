@@ -191,6 +191,14 @@ export function ChangesPanel({
   // can cancel the previous in-flight stream. Cleared when the
   // server emits `done` or `error`.
   const findCancelRef = useRef<(() => void) | null>(null);
+
+  // All repos under /workspaces/repos (with `.git`), independent
+  // of whether they have uncommitted changes. Drives the Repos
+  // browser pane. Previously the pane reused `data.repos` from
+  // list_changes, which filters out clean repos — so a freshly-
+  // checked-out mission rendered "No repos" even when the repos
+  // existed on disk.
+  const [allRepos, setAllRepos] = useState<string[] | null>(null);
   const [findLoading, setFindLoading] = useState(false);
   const [findError, setFindError] = useState<string | null>(null);
   const [findTruncated, setFindTruncated] = useState(false);
@@ -286,6 +294,27 @@ export function ChangesPanel({
   useEffect(() => {
     void reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [missionId]);
+
+  // Repo enumeration runs independently of list_changes so the
+  // Repos pane stays populated even when nothing's modified.
+  // Cheap: one `for d in /workspaces/repos/*; do [ -d "$d/.git" ];
+  // basename "$d"; done` kubectl-exec on mount.
+  useEffect(() => {
+    if (!missionId) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const stream = getWorkspaceStream(missionId);
+        const body = await stream.call<{ repos: string[] }>("list_repos", {});
+        if (!cancelled) setAllRepos(body.repos);
+      } catch {
+        if (!cancelled) setAllRepos([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [missionId]);
 
   const totalFiles = useMemo(
@@ -835,16 +864,16 @@ export function ChangesPanel({
               Repos
             </div>
             <div className="flex-1 min-h-0 overflow-y-auto py-1">
-              {data?.repos.length === 0 && !loading && (
+              {allRepos !== null && allRepos.length === 0 && (
                 <p className="px-3 py-2 text-xs text-white/40">
                   No repos in <code>/workspaces/repos</code>.
                 </p>
               )}
-              {data?.repos.map((repo) => (
+              {allRepos?.map((repoName) => (
                 <RepoTreeNode
-                  key={repo.name}
+                  key={repoName}
                   missionId={missionId}
-                  repoName={repo.name}
+                  repoName={repoName}
                   rootPath=""
                   depth={0}
                   onOpenFile={(r, p) => void openEditTab(r, p)}
