@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1.7
+#
+# DEV-mode overlay image for sandboxed.sh.
+#
+# Builds on top of the production :latest image and swaps the dashboard
+# runtime from the `.next/standalone` Node bundle to `next dev` running
+# from full source. Gives full HMR + error overlay + original file paths
+# in browser DevTools.
+#
+# The production image is untouched — :dev is a separate tag.
+#
+# Build:
+#   docker build -f Dockerfile.dev \
+#     --build-arg BASE_IMAGE=registry.forgecart.com/forgecart/sandboxed-sh:latest \
+#     -t registry.forgecart.com/forgecart/sandboxed-sh:dev .
+#
+# Deploy:
+#   kubectl -n sandboxed-sh set image deploy/sandboxed-sh \
+#     sandboxed-sh=registry.forgecart.com/forgecart/sandboxed-sh:dev
+
+ARG BASE_IMAGE=registry.forgecart.com/forgecart/sandboxed-sh:latest
+
+# Stage 1: Dashboard source + node_modules. No `bun run build` —
+# we want raw source for `next dev`.
+FROM oven/bun:1 AS dashboard-dev-src
+WORKDIR /build/dashboard
+COPY dashboard/package.json dashboard/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY dashboard/ .
+
+# Stage 2: Overlay on the prod runtime image.
+FROM ${BASE_IMAGE} AS dev
+
+# Full dashboard source + installed node_modules.
+COPY --from=dashboard-dev-src /build/dashboard /opt/dashboard-src
+
+# Swap entrypoint to the dev variant (runs `next dev` instead of `node server.js`).
+COPY docker/entrypoint-dev.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENV DASHBOARD_MODE=dev \
+    PATH="/opt/dashboard-src/node_modules/.bin:${PATH}"
