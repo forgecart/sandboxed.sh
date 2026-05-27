@@ -3837,6 +3837,252 @@ const PlanItem = memo(function PlanItem({
   );
 });
 
+/**
+ * Esc-Esc opens this modal. Lists past user/assistant turns
+ * (newest first); each row offers three actions like Claude
+ * Code's `/restore`:
+ *   • Restore conversation       — truncate events after this
+ *     point (active today)
+ *   • Restore conversation + code — also `git checkout` files
+ *     to the snapshot for this turn (disabled until per-turn
+ *     snapshots ship — backend returns 501)
+ *   • Summarise to here          — replace earlier turns with
+ *     an LLM-driven summary (disabled until backend lands)
+ *
+ * On Restore success the parent re-fetches events; the local
+ * state is otherwise stale because we just deleted DB rows.
+ */
+function RestoreCheckpointModal({
+  open,
+  items,
+  missionId,
+  onClose,
+  onRestored,
+}: {
+  open: boolean;
+  items: ChatItem[];
+  missionId: string | null;
+  onClose: () => void;
+  onRestored: () => void;
+}) {
+  const [mounted, setMounted] = useState(false);
+  const [pending, setPending] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+  useEffect(() => {
+    if (!open) {
+      setError(null);
+      setPending(null);
+      return;
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  // Collect user_message events with their immediate assistant
+  // reply preview. Newest first so the user sees what they just
+  // typed at the top.
+  const checkpoints = useMemo(() => {
+    type Cp = {
+      eventId: string;
+      timestamp: number;
+      userText: string;
+      replyPreview: string | null;
+    };
+    const out: Cp[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      if (it.kind !== "user") continue;
+      // Find the next assistant message (or another user — that
+      // means the agent never replied, still a valid checkpoint).
+      let preview: string | null = null;
+      for (let j = i + 1; j < items.length; j++) {
+        if (items[j].kind === "assistant") {
+          preview = (items[j] as Extract<ChatItem, { kind: "assistant" }>).content;
+          break;
+        }
+        if (items[j].kind === "user") break;
+      }
+      out.push({
+        eventId: it.id,
+        timestamp: it.timestamp,
+        userText: it.content,
+        replyPreview: preview ? preview.slice(0, 140) : null,
+      });
+    }
+    return out.reverse();
+  }, [items]);
+
+  const restore = useCallback(
+    async (eventId: string, mode: string) => {
+      if (!missionId) return;
+      setPending(eventId + mode);
+      setError(null);
+      try {
+        const API_BASE = getRuntimeApiBase();
+        const res = await fetch(
+          `${API_BASE}/api/control/missions/${missionId}/restore`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...authHeader(),
+            },
+            body: JSON.stringify({ event_id: eventId, mode }),
+          },
+        );
+        if (!res.ok) {
+          const txt = await res.text();
+          throw new Error(`HTTP ${res.status}: ${txt}`);
+        }
+        onRestored();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setPending(null);
+      }
+    },
+    [missionId, onRestored],
+  );
+
+  if (!mounted || !open || !missionId) return null;
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[85] flex items-stretch justify-center p-4 sm:p-6"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Restore conversation checkpoint"
+    >
+      <div
+        className="absolute inset-0 bg-black/70 backdrop-blur-sm animate-in fade-in duration-150"
+        onClick={onClose}
+      />
+      <div className="relative w-full max-w-3xl flex flex-col bg-[#101010] rounded-2xl border border-white/[0.06] shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-150 my-auto max-h-[85vh]">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-white/[0.06]">
+          <div className="flex items-center gap-2">
+            <RotateCcw className="h-4 w-4 text-indigo-400" />
+            <span className="text-sm font-medium text-white/90">
+              Restore checkpoint
+            </span>
+            <span className="text-xs text-white/40 font-mono">
+              ({checkpoints.length})
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="p-1 rounded hover:bg-white/[0.06] text-white/40 hover:text-white/70 transition-colors"
+            title="Close (Esc)"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        {error && (
+          <div className="px-4 py-2 text-xs text-red-300 bg-red-500/10 border-b border-red-500/20">
+            {error}
+          </div>
+        )}
+        <div className="flex-1 overflow-y-auto">
+          {checkpoints.length === 0 ? (
+            <p className="p-6 text-sm text-white/40 text-center">
+              No checkpoints yet — send a message first.
+            </p>
+          ) : (
+            <ul className="divide-y divide-white/[0.04]">
+              {checkpoints.map((cp) => {
+                const isLatest = cp.eventId === checkpoints[0].eventId;
+                return (
+                  <li key={cp.eventId} className="px-4 py-3">
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="text-[10px] uppercase tracking-wide text-white/40 font-mono">
+                        {new Date(cp.timestamp).toLocaleString(undefined, {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                          month: "short",
+                          day: "numeric",
+                        })}
+                        {isLatest && (
+                          <span className="ml-1 text-emerald-400/80">
+                            · current
+                          </span>
+                        )}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-sm text-white/85 line-clamp-3 whitespace-pre-wrap break-words">
+                      {cp.userText}
+                    </p>
+                    {cp.replyPreview && (
+                      <p className="mt-1 text-xs text-white/45 line-clamp-2 italic">
+                        ↳ {cp.replyPreview}
+                        {cp.replyPreview.length >= 140 && "…"}
+                      </p>
+                    )}
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={
+                          pending === cp.eventId + "conversation" || isLatest
+                        }
+                        onClick={() => void restore(cp.eventId, "conversation")}
+                        className={cn(
+                          "flex items-center gap-1 px-2.5 py-1 text-[11px] rounded border transition-colors",
+                          isLatest
+                            ? "border-white/[0.04] bg-white/[0.02] text-white/30 cursor-not-allowed"
+                            : "border-indigo-500/30 bg-indigo-500/10 text-indigo-200 hover:bg-indigo-500/15 disabled:opacity-50",
+                        )}
+                        title={
+                          isLatest
+                            ? "Already at this checkpoint"
+                            : "Drop all events after this point. Files untouched."
+                        }
+                      >
+                        {pending === cp.eventId + "conversation" ? (
+                          <Loader className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <RotateCcw className="h-3 w-3" />
+                        )}
+                        Restore conversation
+                      </button>
+                      <button
+                        type="button"
+                        disabled
+                        className="flex items-center gap-1 px-2.5 py-1 text-[11px] rounded border border-white/[0.04] bg-white/[0.02] text-white/30 cursor-not-allowed"
+                        title="Needs per-turn git snapshots — backend returns 501 until that ships."
+                      >
+                        <RotateCcw className="h-3 w-3" />
+                        Restore + code
+                      </button>
+                      <button
+                        type="button"
+                        disabled
+                        className="flex items-center gap-1 px-2.5 py-1 text-[11px] rounded border border-white/[0.04] bg-white/[0.02] text-white/30 cursor-not-allowed"
+                        title="LLM-driven compaction not wired yet."
+                      >
+                        Summarise to here
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+        <div className="px-4 py-2 border-t border-white/[0.06] text-[10px] text-white/40">
+          Tip: <kbd className="px-1 py-0.5 rounded bg-white/[0.06]">Esc</kbd>{" "}
+          <kbd className="px-1 py-0.5 rounded bg-white/[0.06]">Esc</kbd> to
+          open this menu.
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
 function ChangesModal({
   open,
   missionId,
@@ -5697,6 +5943,38 @@ export default function ControlClient() {
   const [pendingFileRef, setPendingFileRef] = useState<
     { repo: string; path: string; line?: number } | null
   >(null);
+
+  // Esc-Esc → checkpoint modal (Claude Code-style "restore
+  // conversation to here"). lastEscRef holds the timestamp of
+  // the previous Escape press; a second Escape within 500 ms
+  // opens the modal.
+  const [showRestoreModal, setShowRestoreModal] = useState(false);
+  const lastEscRef = useRef<number>(0);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // Suppress Esc-Esc when another modal is the topmost UI —
+      // first Esc closes that modal, second Esc shouldn't pop
+      // ours on top. The CSS scrim has z-[70+] / role="dialog";
+      // we look for either.
+      const overlay = document.querySelector(
+        '[role="dialog"][aria-modal="true"]',
+      );
+      if (overlay) {
+        lastEscRef.current = 0;
+        return;
+      }
+      const now = Date.now();
+      if (now - lastEscRef.current < 500) {
+        lastEscRef.current = 0;
+        setShowRestoreModal(true);
+      } else {
+        lastEscRef.current = now;
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
   // Bus subscription: when the chat dispatches a file-ref click,
   // open the editor modal and queue the target for ChangesPanel.
   useEffect(() => {
@@ -11190,6 +11468,22 @@ export default function ControlClient() {
           onClose={() => setShowChangesPanel(false)}
           pendingOpen={pendingFileRef}
           onPendingOpenConsumed={() => setPendingFileRef(null)}
+        />
+
+        {/* Esc-Esc → restore conversation to a past checkpoint */}
+        <RestoreCheckpointModal
+          open={showRestoreModal && !!activeMission}
+          items={items}
+          missionId={activeMission?.id ?? null}
+          onClose={() => setShowRestoreModal(false)}
+          onRestored={() => {
+            setShowRestoreModal(false);
+            // Force a hydrate from the server — events were
+            // truncated so the local items array is stale.
+            if (activeMission?.id) {
+              void loadHistoryEvents(activeMission.id);
+            }
+          }}
         />
 
         {/* Header */}
