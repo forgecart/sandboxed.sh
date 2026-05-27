@@ -732,9 +732,11 @@ async fn commit_files(tx: &WsTx, id: &str, mission_id: Uuid, params: Value) {
         }
         // Tab-separated: <STATUS>\t<path>[\t<path2>] (for
         // renames). We only show the destination path for renames.
+        // `next_back()` (DoubleEndedIterator) is O(1) here vs
+        // `last()` which would re-walk the whole iterator.
         let mut parts = line.split('\t');
         let status = parts.next().unwrap_or("").to_string();
-        let path = parts.last().unwrap_or("").to_string();
+        let path = parts.next_back().unwrap_or("").to_string();
         if status.is_empty() || path.is_empty() {
             continue;
         }

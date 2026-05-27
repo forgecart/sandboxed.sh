@@ -149,7 +149,7 @@ async fn run_lsp_bridge(socket: WebSocket, mission_id: Uuid) -> anyhow::Result<(
             match read_lsp_message(&mut stdout).await {
                 Ok(Some(body)) => {
                     msg_count += 1;
-                    if msg_count <= 3 || msg_count % 20 == 0 {
+                    if msg_count <= 3 || msg_count.is_multiple_of(20) {
                         tracing::info!(
                             count = msg_count,
                             len = body.len(),
@@ -196,7 +196,7 @@ async fn run_lsp_bridge(socket: WebSocket, mission_id: Uuid) -> anyhow::Result<(
             match msg {
                 Message::Text(s) => {
                     msg_count += 1;
-                    if msg_count <= 3 || msg_count % 20 == 0 {
+                    if msg_count <= 3 || msg_count.is_multiple_of(20) {
                         tracing::info!(
                             count = msg_count,
                             len = s.len(),
