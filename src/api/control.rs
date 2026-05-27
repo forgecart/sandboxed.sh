@@ -5192,6 +5192,105 @@ pub async fn resume_mission(
         .map_err(|e| (StatusCode::BAD_REQUEST, e))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RestoreMissionRequest {
+    /// The event_id of the last event that should remain. Every
+    /// event with a HIGHER sequence number is deleted.
+    pub event_id: String,
+    /// Restoration mode. Today only `conversation` is wired —
+    /// `conversation_and_code` and `summarise` return 501 so
+    /// the UI can disable them with a clear reason.
+    #[serde(default = "default_restore_mode")]
+    pub mode: String,
+}
+
+fn default_restore_mode() -> String {
+    "conversation".to_string()
+}
+
+/// `POST /api/control/missions/:id/restore` — drop every event
+/// after a chosen checkpoint so the chat re-anchors at that
+/// point. Also clears the mission's cached `session_id` so the
+/// next turn doesn't try to `claude --resume` against a now-
+/// nonexistent point in the agent's transcript.
+///
+/// Rejects the request when the mission is currently running —
+/// truncating events under a live agent would race the runner.
+pub async fn restore_mission(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    Json(body): Json<RestoreMissionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mode = body.mode.as_str();
+    if mode == "conversation_and_code" {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "conversation_and_code restore needs per-turn git snapshots — not wired yet".into(),
+        ));
+    }
+    if mode == "summarise" {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "summarise restore needs LLM-driven compaction — not wired yet".into(),
+        ));
+    }
+    if mode != "conversation" {
+        return Err((StatusCode::BAD_REQUEST, format!("unknown mode: {mode}")));
+    }
+
+    let control = control_for_user(&state, &user).await;
+    let running = get_running_missions(&control).await?;
+    if running.iter().any(|m| m.mission_id == mission_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Cannot restore a running mission. Stop it first.".to_string(),
+        ));
+    }
+
+    // Look up the event by id to find its sequence number; that's
+    // what the truncate call wants. We hit the store directly via
+    // a small full-events scan filtered to the matching event_id —
+    // missions even on the long side have <10k events so this is
+    // sub-100ms.
+    let store = control.mission_store.clone();
+    let events = store
+        .get_events(mission_id, None, None, None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let target_seq = events
+        .iter()
+        .find(|e| e.event_id.as_deref() == Some(body.event_id.as_str()))
+        .map(|e| e.sequence)
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "event_id not found for this mission".into(),
+        ))?;
+
+    let deleted = store
+        .truncate_events_after_sequence(mission_id, target_seq)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Reset cached session_id so the next turn starts a fresh
+    // `claude --resume` against the post-truncation transcript.
+    // We pass an empty string — the runner code treats empty /
+    // missing as "no prior session".
+    if let Err(e) = store.update_mission_session_id(mission_id, "").await {
+        tracing::warn!(
+            mission_id = %mission_id,
+            error = %e,
+            "restore_mission: failed to clear session_id (truncation still applied)"
+        );
+    }
+    drop(store);
+
+    Ok(Json(serde_json::json!({
+        "deleted": deleted,
+        "kept_sequence": target_seq,
+    })))
+}
+
 /// Delete a mission by ID.
 /// Only allows deleting missions that are not currently running.
 pub async fn delete_mission(

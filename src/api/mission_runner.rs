@@ -3121,6 +3121,33 @@ async fn run_mission_turn(
     // and the resolver bails with "claude not found".
     if workspace.workspace_type == crate::workspace::WorkspaceType::K8sPod {
         if let Some(k8s) = crate::k8s_pod::global_client() {
+            // Re-create the pod if it's missing. The original
+            // `spawn_mission_pod_bootstrap` only fires on mission
+            // create — after a control-plane redeploy the pod
+            // can be gone (e.g. evicted with the old control-
+            // plane pod) while the mission DB still reports
+            // pod_phase=ready. Without this guard, the first
+            // kubectl exec for command-availability checks would
+            // 404 and surface as "Claude Code CLI 'claude' not
+            // found and neither npm nor bun is available …",
+            // which is misleading. `create_mission_pod` is
+            // idempotent: it short-circuits when the pod
+            // already exists.
+            if let Err(e) = k8s
+                .create_mission_pod(
+                    mission_id,
+                    workspace.id,
+                    &workspace.env_vars,
+                    workspace.init_script.as_deref(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    error = %e,
+                    "create_mission_pod (ensure) failed; wait_for_ready will likely time out"
+                );
+            }
             tracing::info!(
                 mission_id = %mission_id,
                 workspace = %workspace.name,

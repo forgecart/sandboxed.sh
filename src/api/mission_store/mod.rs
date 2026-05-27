@@ -1258,6 +1258,25 @@ pub trait MissionStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Delete every event for `mission_id` with `sequence >
+    /// after_sequence`. Used by the dashboard's "Restore
+    /// conversation to here" action (Esc-Esc → checkpoint
+    /// modal). Returns the number of rows deleted; 0 is fine
+    /// (caller may pass a sequence that's already the tail).
+    ///
+    /// Callers must clear any cached agent session marker
+    /// (claudecode `.session_id`, etc.) so the next turn starts
+    /// a fresh `claude --resume` flow against the truncated
+    /// history.
+    async fn truncate_events_after_sequence(
+        &self,
+        mission_id: Uuid,
+        after_sequence: i64,
+    ) -> Result<usize, String> {
+        let _ = (mission_id, after_sequence);
+        Ok(0)
+    }
+
     /// Count events for a mission, optionally filtered by type.
     async fn count_events(
         &self,

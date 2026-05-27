@@ -4085,6 +4085,27 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn truncate_events_after_sequence(
+        &self,
+        mission_id: Uuid,
+        after_sequence: i64,
+    ) -> Result<usize, String> {
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<usize, String> {
+            let conn = conn.blocking_lock();
+            let deleted: usize = conn
+                .execute(
+                    "DELETE FROM mission_events WHERE mission_id = ?1 AND sequence > ?2",
+                    params![&mid, after_sequence],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(deleted)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn count_events(
         &self,
         mission_id: Uuid,
