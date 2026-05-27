@@ -19,10 +19,10 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use k8s_openapi::api::core::v1::{
-    ConfigMap, ConfigMapVolumeSource, Container, KeyToPath, LocalObjectReference,
+    ConfigMap, ConfigMapVolumeSource, Container, EnvFromSource, KeyToPath, LocalObjectReference,
     PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, Pod,
-    PodSecurityContext, PodSpec, ResourceRequirements, SecurityContext, Volume, VolumeMount,
-    VolumeResourceRequirements,
+    PodSecurityContext, PodSpec, ResourceRequirements, SecretEnvSource, SecurityContext, Volume,
+    VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -137,6 +137,14 @@ const STORAGE_CLASS: &str = "harvester";
 const WORKSPACES_VOLUME_SIZE: &str = "20Gi";
 const DOCKER_VOLUME_SIZE: &str = "20Gi";
 const PULL_SECRET_DEFAULT: &str = "nexus-registry";
+
+/// Kubernetes Secret consumed by every mission pod via
+/// `envFrom: secretRef`. Built by Terraform from
+/// `application/modules/deployments/sandboxed-sh/env.defaults`
+/// (plus the dynamically-generated KUBECONFIG_CONTENT). Edits to
+/// env.defaults + `terraform apply` reach every new mission pod
+/// without touching this file — that's the point.
+const MISSION_ENV_SECRET: &str = "sandboxed-sh-mission-env";
 
 /// Per-mission Pod / PVC / ConfigMap name. Keyed on mission_id, not
 /// workspace_id, since each mission gets its own pod. Prefix `m-`
@@ -435,52 +443,38 @@ impl K8sPodClient {
             });
         }
 
-        // Forward a curated set of env vars from the control plane
-        // into the workspace pod when the workspace doesn't already
-        // override them. This is what gives nested dockerd inside the
-        // pod the credentials it needs to pull from
-        // registry.forgecart.com / docker.io / ghcr.io, and the
-        // agent's `git clone`s a working GITHUB_TOKEN.
-        const FORWARDED_FROM_CONTROL_PLANE: &[&str] = &[
-            "FORGECART_REGISTRY_USERNAME",
-            "FORGECART_REGISTRY_TOKEN",
-            "DOCKERHUB_USERNAME",
-            "DOCKERHUB_TOKEN",
-            "GHCR_USERNAME",
-            "GH_TOKEN",
-            "GITHUB_TOKEN",
-            "GITHUB_USER",
-            "GIT_AUTHOR_NAME",
-            "GIT_AUTHOR_EMAIL",
-            "GIT_COMMITTER_NAME",
-            "GIT_COMMITTER_EMAIL",
-            // Kubeconfig payload (base64-encoded YAML). When set on
-            // the control-plane deployment, bashenv.sh decodes it
-            // into /root/.kube/config inside every mission pod so
-            // the agent can run kubectl / terraform against the
-            // user's cluster. Workspace-supplied values still win
-            // (so a mission can override with a scoped kubeconfig
-            // if needed).
-            "KUBECONFIG_CONTENT",
-        ];
-        let mut merged: HashMap<String, String> = HashMap::new();
-        for key in FORWARDED_FROM_CONTROL_PLANE {
-            if let Ok(value) = std::env::var(key) {
-                if !value.trim().is_empty() {
-                    merged.insert((*key).to_string(), value);
-                }
-            }
-        }
-        // Workspace-supplied env_vars take precedence (override
-        // forwarded defaults).
-        for (k, v) in env_vars {
-            merged.insert(k.clone(), v.clone());
-        }
-        let env_list = merged
-            .into_iter()
+        // The mission pod's full default env surface comes from
+        // `sandboxed-sh-mission-env` (built by HCL from
+        // application/modules/deployments/sandboxed-sh/env.defaults
+        // — see the `mission_env` local + `kubernetes_secret
+        // .sandboxed_sh_mission_env` resource). Attached via
+        // `envFrom: secretRef` so adding a key to env.defaults +
+        // terraform apply is the full path to make it available
+        // to every new mission pod; nothing here needs to change.
+        //
+        // Workspace-supplied env_vars below go in the container's
+        // `env:` list, which Kubernetes gives precedence over
+        // envFrom on key conflicts — workspaces can still override
+        // any value from the mission-env Secret.
+        // `optional: true` so a freshly-built control plane doesn't
+        // get stuck creating mission pods if the Secret hasn't been
+        // applied yet (e.g. the operator pushed code before
+        // `terraform apply`). Mission pods will start with only the
+        // workspace-supplied env until the Secret lands; on next
+        // pod recreation they pick it up.
+        let env_from = vec![EnvFromSource {
+            secret_ref: Some(SecretEnvSource {
+                name: MISSION_ENV_SECRET.to_string(),
+                optional: Some(true),
+            }),
+            ..Default::default()
+        }];
+
+        let env_list = env_vars
+            .iter()
             .map(|(k, v)| k8s_openapi::api::core::v1::EnvVar {
-                name: k,
-                value: Some(v),
+                name: k.clone(),
+                value: Some(v.clone()),
                 value_from: None,
             })
             .collect::<Vec<_>>();
@@ -499,6 +493,7 @@ impl K8sPodClient {
             // cached, every subsequent mission on that node skips the
             // 30-60s pull. First mission per node still pays the cost.
             image_pull_policy: Some("IfNotPresent".to_string()),
+            env_from: Some(env_from),
             env: if env_list.is_empty() {
                 None
             } else {
