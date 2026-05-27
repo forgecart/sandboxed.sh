@@ -2545,7 +2545,7 @@ function SubagentTabStrip({
     return "Sub-agent";
   };
   return (
-    <div className="flex items-center gap-1.5 px-4 py-2 border-b border-white/[0.06] bg-white/[0.01] overflow-x-auto">
+    <div className="flex items-center gap-1.5 px-4 py-2 border-b border-white/[0.06] bg-white/[0.01] overflow-x-auto overflow-y-hidden whitespace-nowrap">
       <button
         type="button"
         onClick={() => onSelect(null)}
@@ -4117,8 +4117,8 @@ function MissionTabBar({
   );
   if (tabs.length <= 1) return null;
   return (
-    <div className="relative z-10 mb-2 -mx-3 sm:-mx-6 md:-mx-8 px-3 sm:px-6 md:px-8 overflow-x-auto border-b border-white/[0.06] bg-black/20 backdrop-blur-sm">
-      <div className="flex items-center gap-0.5 py-1">
+    <div className="relative z-10 mb-2 -mx-3 sm:-mx-6 md:-mx-8 px-3 sm:px-6 md:px-8 overflow-x-auto overflow-y-hidden border-b border-white/[0.06] bg-black/20 backdrop-blur-sm">
+      <div className="flex items-center gap-0.5 py-1 whitespace-nowrap">
         {tabs.map((m) => {
           const isActive = m.id === viewingMissionId;
           const isRunning = runningSet.has(m.id);

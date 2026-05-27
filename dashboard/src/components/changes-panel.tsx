@@ -1447,7 +1447,7 @@ function TabBar({
     );
   }
   return (
-    <div className="h-9 flex items-center border-b border-white/[0.06] bg-[#0a0a0a] overflow-x-auto">
+    <div className="h-9 flex items-center border-b border-white/[0.06] bg-[#0a0a0a] overflow-x-auto overflow-y-hidden">
       {tabs.map((tab) => {
         const isActive = tab.id === activeId;
         const dirty =
