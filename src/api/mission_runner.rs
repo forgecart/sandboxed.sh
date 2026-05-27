@@ -378,6 +378,69 @@ pub async fn inject_dashboard_file_refs_into_pod_claude_md(
     }
 }
 
+/// Drop a `.claude/settings.json` next to `/workspaces/CLAUDE.md`
+/// disabling Claude Code's "Co-Authored-By: Claude" trailer on
+/// commits. The agent ends up making git commits as part of its
+/// work; without this, every commit it makes carries a
+/// Co-Authored-By line that the user doesn't want noise from.
+///
+/// Project-level settings (`<cwd>/.claude/settings.json`) win
+/// over user-level so we write here even though `/root/.claude/`
+/// is also writable inside the pod. Idempotent — writes the file
+/// only when missing or when the existing value disagrees with
+/// what we want.
+pub async fn inject_claude_settings_into_pod(
+    k8s: &std::sync::Arc<crate::k8s_pod::K8sPodClient>,
+    mission_id: Uuid,
+) {
+    let payload = "{\n  \"includeCoAuthoredBy\": false\n}\n";
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
+    // mkdir -p the .claude dir; only write if missing OR the
+    // existing file doesn't already disable the trailer.
+    let script = format!(
+        "set -e; \
+         dir=/workspaces/.claude; \
+         f=\"$dir/settings.json\"; \
+         mkdir -p \"$dir\"; \
+         if [ -f \"$f\" ] && grep -q 'includeCoAuthoredBy[[:space:]]*:[[:space:]]*false' \"$f\" 2>/dev/null; then exit 0; fi; \
+         printf '%s' '{b64}' | base64 -d > \"$f\"",
+        b64 = b64,
+    );
+    match k8s
+        .exec_command(
+            mission_id,
+            None,
+            "/bin/bash",
+            &["-lc".to_string(), script],
+            &std::collections::HashMap::new(),
+        )
+        .await
+    {
+        Ok(out) if out.status.success() => {
+            tracing::info!(
+                mission_id = %mission_id,
+                "Wrote /workspaces/.claude/settings.json (includeCoAuthoredBy: false)"
+            );
+        }
+        Ok(out) => {
+            tracing::warn!(
+                mission_id = %mission_id,
+                exit = ?out.status.code(),
+                stderr = %String::from_utf8_lossy(&out.stderr),
+                "claude settings inject exec non-zero"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                mission_id = %mission_id,
+                error = %e,
+                "claude settings inject exec failed"
+            );
+        }
+    }
+}
+
 pub fn inject_telegram_identity_into_claude_md(
     claude_md_path: &Path,
     user_message: &str,
@@ -3307,6 +3370,7 @@ async fn run_mission_turn(
     if workspace.workspace_type == crate::workspace::WorkspaceType::K8sPod {
         if let Some(k8s) = crate::k8s_pod::global_client() {
             inject_dashboard_file_refs_into_pod_claude_md(&k8s, mission_id).await;
+            inject_claude_settings_into_pod(&k8s, mission_id).await;
         } else {
             tracing::warn!(
                 mission_id = %mission_id,

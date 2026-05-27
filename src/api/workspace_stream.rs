@@ -684,7 +684,17 @@ async fn commit_files(tx: &WsTx, id: &str, mission_id: Uuid, params: Value) {
     if p.repo.is_empty() || p.repo.contains('/') || p.repo.contains("..") {
         return send_error(tx, Some(id), "invalid repo").await;
     }
-    if !p.hash.chars().all(|c| c.is_ascii_alphanumeric()) || p.hash.is_empty() {
+    // Same charset as `read_file`'s `git_ref` — accepts full or
+    // short hex hashes, but also refs like `HEAD`, `HEAD~1`,
+    // branch / tag names. Was previously pure-alphanumeric,
+    // which rejected anything carrying `~`, `^`, `/`, or `-`
+    // (legitimate ref chars) with a misleading "invalid hash".
+    if p.hash.is_empty()
+        || !p
+            .hash
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '^' | '~' | '.'))
+    {
         return send_error(tx, Some(id), "invalid hash").await;
     }
     let k8s = match crate::k8s_pod::global_client() {
