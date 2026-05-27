@@ -70,6 +70,7 @@ pub async fn lsp_bridge(
 }
 
 async fn run_lsp_bridge(socket: WebSocket, mission_id: Uuid) -> anyhow::Result<()> {
+    tracing::info!(mission_id = %mission_id, "LSP bridge: starting");
     let k8s = crate::k8s_pod::global_client()
         .ok_or_else(|| anyhow::anyhow!("k8s client unavailable (not running in cluster?)"))?;
 
@@ -84,9 +85,12 @@ async fn run_lsp_bridge(socket: WebSocket, mission_id: Uuid) -> anyhow::Result<(
     // workspace-base image installs it globally — we invoke the
     // bare binary so `--stdio` framing isn't disturbed by a shell
     // rc file.
+    tracing::info!(mission_id = %mission_id, "LSP bridge: spawning typescript-language-server --stdio");
     let mut child = k8s
         .spawn_streaming_exec(mission_id, "typescript-language-server", &["--stdio"])
         .await?;
+    let child_pid = child.id();
+    tracing::info!(mission_id = %mission_id, ?child_pid, "LSP bridge: child spawned");
     let stdin = child
         .stdin
         .take()
@@ -109,20 +113,26 @@ async fn run_lsp_bridge(socket: WebSocket, mission_id: Uuid) -> anyhow::Result<(
         let mut chunk = [0u8; 4096];
         loop {
             match reader.read(&mut chunk).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    tracing::info!("LSP bridge: child stderr EOF");
+                    break;
+                }
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
                     if let Some(nl) = buf.iter().rposition(|b| *b == b'\n') {
                         let line = String::from_utf8_lossy(&buf[..nl]).to_string();
                         for l in line.lines() {
                             if !l.trim().is_empty() {
-                                tracing::debug!(target: "lsp.stderr", "{l}");
+                                tracing::info!(target: "lsp.stderr", "{l}");
                             }
                         }
                         buf.drain(..=nl);
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, "LSP bridge: child stderr read err");
+                    break;
+                }
             }
         }
     });
@@ -134,9 +144,18 @@ async fn run_lsp_bridge(socket: WebSocket, mission_id: Uuid) -> anyhow::Result<(
     let ws_tx_out = ws_tx.clone();
     let to_ws = tokio::spawn(async move {
         let mut stdout = BufReader::new(stdout);
+        let mut msg_count = 0usize;
         loop {
             match read_lsp_message(&mut stdout).await {
                 Ok(Some(body)) => {
+                    msg_count += 1;
+                    if msg_count <= 3 || msg_count % 20 == 0 {
+                        tracing::info!(
+                            count = msg_count,
+                            len = body.len(),
+                            "LSP bridge: stdout msg → WS"
+                        );
+                    }
                     let s = match String::from_utf8(body) {
                         Ok(s) => s,
                         Err(e) => {
@@ -146,10 +165,14 @@ async fn run_lsp_bridge(socket: WebSocket, mission_id: Uuid) -> anyhow::Result<(
                     };
                     let mut tx = ws_tx_out.lock().await;
                     if tx.send(Message::Text(s)).await.is_err() {
+                        tracing::warn!("LSP bridge: WS send failed; terminating to_ws");
                         break;
                     }
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    tracing::info!(msg_count, "LSP bridge: stdout EOF; terminating to_ws");
+                    break;
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "LSP stdout read failed");
                     break;
@@ -161,6 +184,7 @@ async fn run_lsp_bridge(socket: WebSocket, mission_id: Uuid) -> anyhow::Result<(
     // Task B: read WS frames → frame with Content-Length → write to LSP stdin.
     let from_ws = tokio::spawn(async move {
         let mut stdin: ChildStdin = stdin;
+        let mut msg_count = 0usize;
         while let Some(msg) = ws_rx.next().await {
             let msg = match msg {
                 Ok(m) => m,
@@ -171,22 +195,33 @@ async fn run_lsp_bridge(socket: WebSocket, mission_id: Uuid) -> anyhow::Result<(
             };
             match msg {
                 Message::Text(s) => {
-                    if write_lsp_message(&mut stdin, s.as_bytes()).await.is_err() {
+                    msg_count += 1;
+                    if msg_count <= 3 || msg_count % 20 == 0 {
+                        tracing::info!(
+                            count = msg_count,
+                            len = s.len(),
+                            "LSP bridge: WS msg → stdin"
+                        );
+                    }
+                    if let Err(e) = write_lsp_message(&mut stdin, s.as_bytes()).await {
+                        tracing::warn!(error = %e, "LSP bridge: stdin write failed; terminating from_ws");
                         break;
                     }
                 }
                 Message::Binary(b) => {
-                    if write_lsp_message(&mut stdin, &b).await.is_err() {
+                    msg_count += 1;
+                    if let Err(e) = write_lsp_message(&mut stdin, &b).await {
+                        tracing::warn!(error = %e, "LSP bridge: stdin binary write failed; terminating from_ws");
                         break;
                     }
                 }
-                Message::Close(_) => break,
-                Message::Ping(_) | Message::Pong(_) => {
-                    // Axum auto-pongs; nothing to do.
+                Message::Close(_) => {
+                    tracing::info!(msg_count, "LSP bridge: WS close received");
+                    break;
                 }
+                Message::Ping(_) | Message::Pong(_) => {}
             }
         }
-        // Closing stdin signals the LSP to exit cleanly.
         let _ = stdin.shutdown().await;
     });
 
