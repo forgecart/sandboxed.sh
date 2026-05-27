@@ -21,6 +21,7 @@ on:
     branches: [master]
     paths:
       - "Dockerfile"
+      - "Dockerfile.dev"
       - "docker/**"
       - "src/**"
       - "Cargo.toml"
@@ -103,13 +104,64 @@ jobs:
           nexus-username: ${{ secrets.NEXUS_USERNAME }}
           nexus-password: ${{ secrets.NEXUS_PASSWORD }}
 
-  # Roll the freshly-built image to the live deployment. Mirrors the
-  # `deploy-test-server` / `deploy-dev` stages from shop-beta's dev-deploy.yml.
-  # The ARC runner pod's service account talks to the cluster via the
-  # in-pod kubernetes.default token — no kubeconfig is needed.
-  deploy:
-    name: Roll Out to Cluster
+  # Dev-mode overlay image. Layers full dashboard source + node_modules
+  # on top of :latest and swaps the entrypoint so the dashboard runs
+  # `next dev` (HMR + error overlay + original file paths in DevTools)
+  # instead of the standalone bundle. Single-tenant deploy, so the
+  # dev-mode CPU/memory overhead is acceptable in exchange for the
+  # debug ergonomics. Tag: `:dev`. Depends on `build` because Dockerfile.dev
+  # uses :latest as BASE_IMAGE.
+  build-dev:
+    name: Build & Publish :dev (next dev variant)
     needs: build
+    runs-on: arc-runner-set
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3.7.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435  # v3.11.1
+        with:
+          driver: remote
+          endpoint: tcp://buildkit.arc-runners.svc.cluster.local:1234
+
+      - name: Login to Nexus Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        with:
+          registry: ${{ env.NEXUS_REGISTRY }}
+          username: ${{ secrets.NEXUS_USERNAME }}
+          password: ${{ secrets.NEXUS_PASSWORD }}
+
+      - name: Build and push :dev
+        uses: docker/build-push-action@ee4ca427a2f43b6a16632044ca514c076267da23  # v6.19.0
+        with:
+          context: .
+          file: Dockerfile.dev
+          push: true
+          network: host
+          build-args: |
+            BASE_IMAGE=${{ env.NEXUS_REGISTRY }}/forgecart/sandboxed-sh:latest
+          tags: ${{ env.NEXUS_REGISTRY }}/forgecart/sandboxed-sh:dev
+          cache-from: type=registry,ref=${{ env.NEXUS_REGISTRY }}/forgecart/sandboxed-sh:buildcache-dev
+          cache-to: ${{ inputs.cache-write == false && '' || format('type=registry,ref={0}/forgecart/sandboxed-sh:buildcache-dev,mode=max', env.NEXUS_REGISTRY) }}
+          outputs: type=image,push=true,compression=zstd,force-compression=true
+
+  # Roll the freshly-built :dev image to the live deployment. Mirrors
+  # the deploy-test-server / deploy-dev stages from shop-beta's
+  # dev-deploy.yml. The ARC runner pod's service account talks to
+  # the cluster via the in-pod kubernetes.default token — no
+  # kubeconfig is needed.
+  #
+  # Why :dev (not :sha-<short>): the dashboard is a single-tenant
+  # admin UI and the operator wants permanent dev-mode ergonomics
+  # (HMR, error overlay, original file paths). :latest is still
+  # built as a production-shaped image for backup/emergency rollback;
+  # to switch back: `kubectl set image ... =:latest`.
+  deploy:
+    name: Roll :dev to Cluster
+    needs: [build, build-dev]
     if: ${{ inputs.skip-deploy != true }}
     runs-on: arc-runner-set
     env:
@@ -123,7 +175,11 @@ jobs:
       - name: Roll image
         run: |
           kubectl set image deployment/${{ env.TARGET_DEPLOYMENT }} \
-            ${{ env.TARGET_CONTAINER }}=${{ env.PUBLIC_REGISTRY }}/forgecart/sandboxed-sh:sha-${{ env.SHORT_SHA }} \
+            ${{ env.TARGET_CONTAINER }}=${{ env.PUBLIC_REGISTRY }}/forgecart/sandboxed-sh:dev \
+            -n ${{ env.TARGET_NAMESPACE }}
+          # Trigger a fresh pull even though the tag is unchanged — Kubernetes
+          # caches by tag, and :dev now points at a new digest.
+          kubectl rollout restart deployment/${{ env.TARGET_DEPLOYMENT }} \
             -n ${{ env.TARGET_NAMESPACE }}
 
       - name: Wait for rollout
