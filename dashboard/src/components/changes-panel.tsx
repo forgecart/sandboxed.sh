@@ -29,6 +29,7 @@ import {
   type SearchHitChunk,
 } from "@/lib/workspace-stream";
 import { MonacoDiffViewer } from "./monaco/MonacoDiffViewer";
+import { MonacoErrorBoundary } from "./monaco/MonacoErrorBoundary";
 import { MonacoFileEditor } from "./monaco/MonacoFileEditor";
 
 type DiffViewMode = "split" | "unified";
@@ -1062,6 +1063,18 @@ export function ChangesPanel({
           <div className="flex-1 min-h-0 flex flex-col bg-[#0d0d0d]">
             {activeTab ? (
               <ActiveTabBody
+                // Force a clean unmount/remount when the active
+                // tab id changes. Without this, React reuses the
+                // same component instance across tab switches —
+                // MonacoFileEditor's content just updates with
+                // new props, leaving the previous file's editor
+                // + vim adapter + LSP attachment overlapping with
+                // the new file's setup in the commit phase. That
+                // overlap is the source of the recurring "Cannot
+                // read properties of null (reading 'removeChild')"
+                // loop on file switch. See plan file:
+                //   ~/.claude/plans/ok-now-i-want-witty-raccoon.md
+                key={activeTab.id}
                 tab={activeTab}
                 missionId={missionId}
                 splitView={viewMode === "split"}
@@ -1533,12 +1546,14 @@ function ActiveTabBody({
             </span>
           )}
         </div>
-        <MonacoDiffViewer
-          path={tab.filePath}
-          head={tab.diff.head_content}
-          worktree={tab.diff.worktree_content}
-          splitView={splitView}
-        />
+        <MonacoErrorBoundary>
+          <MonacoDiffViewer
+            path={tab.filePath}
+            head={tab.diff.head_content}
+            worktree={tab.diff.worktree_content}
+            splitView={splitView}
+          />
+        </MonacoErrorBoundary>
       </>
     );
   }
@@ -1607,16 +1622,18 @@ function ActiveTabBody({
           </button>
         </div>
       )}
-      <MonacoFileEditor
-        path={tab.filePath}
-        missionId={missionId}
-        repoName={tab.repoName}
-        value={tab.editValue ?? ""}
-        vim={vim}
-        initialLine={tab.initialLine}
-        onChange={onChange}
-        onSave={onSave}
-      />
+      <MonacoErrorBoundary>
+        <MonacoFileEditor
+          path={tab.filePath}
+          missionId={missionId}
+          repoName={tab.repoName}
+          value={tab.editValue ?? ""}
+          vim={vim}
+          initialLine={tab.initialLine}
+          onChange={onChange}
+          onSave={onSave}
+        />
+      </MonacoErrorBoundary>
     </>
   );
 }
