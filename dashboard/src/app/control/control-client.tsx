@@ -52,6 +52,7 @@ import {
 import { NowTickProvider, useNow } from "@/lib/now-tick";
 import { startHealthBudgetWatcher } from "@/lib/health-budget";
 import { MissionDebugStats } from "./MissionDebugStats";
+import { MissionScope } from "./mission-scope";
 import { LazyCodeBlock } from "@/components/lazy-code-block";
 import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
 import { cn } from "@/lib/utils";
@@ -4195,7 +4196,15 @@ function ChangesModal({
   const [everOpened, setEverOpened] = useState(false);
   useEffect(() => {
     setMounted(true);
+    console.log("[ChangesModal] mount");
+    return () => console.log("[ChangesModal] unmount");
   }, []);
+  useEffect(() => {
+    console.log("[ChangesModal] missionId change", { missionId });
+  }, [missionId]);
+  useEffect(() => {
+    console.log("[ChangesModal] open change", { open });
+  }, [open]);
   useEffect(() => {
     if (open) setEverOpened(true);
   }, [open]);
@@ -4237,7 +4246,17 @@ function ChangesModal({
           open ? "opacity-100" : "opacity-0",
         )}
       >
+        {/* `key={missionId}` forces a clean unmount/remount when the
+            user switches missions. The preserve-state pattern (modal
+            stays mounted across open/close) is fine for one mission
+            because the children just rerender with the same props, but
+            switching missions re-binds Monaco's editors / LSP attach
+            to a different /workspaces/repos tree; without a key the
+            old Monaco DOM nodes get re-used with stale parent refs and
+            React throws "Cannot read properties of null (reading
+            'removeChild')" during the commit phase. */}
         <ChangesPanel
+          key={missionId ?? "none"}
           missionId={missionId}
           onClose={onClose}
           pendingOpen={pendingOpen}
@@ -5668,11 +5687,17 @@ export default function ControlClient() {
   );
   const setViewingMissionId = useCallback(
     (next: string | null | ((prev: string | null) => string | null)) => {
-      setViewingMissionSlice((prev) => ({
-        ...prev,
-        viewingMissionId:
-          typeof next === "function" ? next(prev.viewingMissionId) : next,
-      }));
+      setViewingMissionSlice((prev) => {
+        const resolved =
+          typeof next === "function" ? next(prev.viewingMissionId) : next;
+        if (resolved !== prev.viewingMissionId) {
+          console.log("[mission-switch]", {
+            from: prev.viewingMissionId,
+            to: resolved,
+          });
+        }
+        return { ...prev, viewingMissionId: resolved };
+      });
     },
     [setViewingMissionSlice],
   );
@@ -11594,6 +11619,7 @@ export default function ControlClient() {
             right-column sidecar; promoted to a modal so the diff
             pane gets the full viewport. Esc / backdrop / X close. */}
         <ChangesModal
+          key={`changes-modal-${activeMission?.id ?? "none"}`}
           open={showChangesPanel && !!activeMission}
           missionId={activeMission?.id ?? null}
           onClose={() => setShowChangesPanel(false)}
@@ -11603,6 +11629,7 @@ export default function ControlClient() {
 
         {/* Esc-Esc → restore conversation to a past checkpoint */}
         <RestoreCheckpointModal
+          key={`restore-modal-${activeMission?.id ?? "none"}`}
           open={showRestoreModal && !!activeMission}
           items={items}
           missionId={activeMission?.id ?? null}
@@ -11631,6 +11658,19 @@ export default function ControlClient() {
           onSelect={handleViewMission}
           onCancel={handleCancelMission}
         />
+
+        {/* Mission-scoped subtree boundary. See
+            `mission-scope.tsx` for rationale. Phase 0 of the
+            refactor outlined in
+            ~/.claude/plans/ok-now-i-want-witty-raccoon.md
+            replaces a plain `<div key=…>` wrapper with this
+            component as a structural pass-through; subsequent
+            phases lift mission-bound hooks into it so they
+            naturally unmount on switch. */}
+        <MissionScope
+          key={viewingMissionId ?? "no-mission"}
+          missionId={viewingMissionId}
+        >
 
         {/* Header */}
         <div className="relative z-10 mb-3 sm:mb-6 flex items-center justify-between gap-2 lg:gap-4">
@@ -12484,7 +12524,18 @@ export default function ControlClient() {
               </div>
             )}
             {/* Messages */}
+            {/* `key={viewingMissionId}` forces the entire chat
+                scroll container — virtualizer, ToolCallItem
+                expansions, ThinkingGroups, SubagentChatView,
+                etc. — to unmount and remount when the user
+                switches missions. Without this, components hold
+                refs / lifecycle state tied to the previous
+                mission while React rebinds them to the new
+                mission's items, producing "Cannot read
+                properties of null (reading 'removeChild')"
+                during commit. */}
             <div
+              key={viewingMissionId ?? "no-mission"}
               ref={containerRef}
               data-testid="chat-scroll-container"
               className="flex-1 overflow-y-auto p-3 sm:p-4 md:p-6"
@@ -13098,6 +13149,7 @@ export default function ControlClient() {
             >
               {showWorkbenchPanel && (
                 <MissionWorkbenchPanel
+                  key={`workbench-${activeMission?.id ?? "none"}`}
                   mission={activeMission}
                   workspaceLabel={activeWorkspaceLabel}
                   role={activeMissionRole}
@@ -13227,6 +13279,7 @@ export default function ControlClient() {
             </div>
           )}
         </div>
+        </MissionScope>
       </div>
     </NowTickProvider>
   );
