@@ -58,3 +58,38 @@ export function modelUriFor(
 ): string {
   return `file:///workspaces/repos/${repoName}/${filePath}`;
 }
+
+/**
+ * Dispose every LSP client whose key starts with the given
+ * mission id. Called from `MissionScope` cleanup on mission
+ * switch so the previous mission's WebSockets, model
+ * subscriptions, and Monaco provider registrations all
+ * shut down — otherwise they accumulate across switches and
+ * the editor ends up talking to dead clients.
+ *
+ * Non-throwing: a single client's `.dispose()` failure can't
+ * block the rest. Failed promises are deleted before
+ * `.dispose()` ever resolves so they don't get awaited.
+ */
+export function disposeForMission(missionId: string): void {
+  const prefix = `${missionId}:`;
+  for (const [key, promise] of clients) {
+    if (!key.startsWith(prefix)) continue;
+    clients.delete(key);
+    void promise
+      .then((c) => {
+        try {
+          c.dispose();
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[lsp-pool] dispose failed for ${key}`,
+            e,
+          );
+        }
+      })
+      .catch(() => {
+        // The promise itself failed earlier; nothing to dispose.
+      });
+  }
+}

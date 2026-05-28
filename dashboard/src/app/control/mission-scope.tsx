@@ -1,6 +1,7 @@
 "use client";
 
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
+import { disposeForMission } from "@/components/monaco/lsp-pool";
 
 /**
  * Mission-scoped subtree boundary.
@@ -42,6 +43,18 @@ interface MissionScopeProps {
   children: ReactNode;
 }
 
-export function MissionScope({ children }: MissionScopeProps) {
+export function MissionScope({ missionId, children }: MissionScopeProps) {
+  // On unmount (mission switch, since this component is keyed by
+  // missionId) close every LSP client that belongs to this mission.
+  // Without this, the previous mission's WebSockets stay open and
+  // accumulate across switches — eventually Monaco talks to dead
+  // clients and the editor's hover / go-to-def / autocomplete
+  // silently break.
+  useEffect(() => {
+    return () => {
+      if (missionId) disposeForMission(missionId);
+    };
+  }, [missionId]);
+
   return <>{children}</>;
 }
