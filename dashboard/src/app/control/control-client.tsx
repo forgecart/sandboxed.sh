@@ -6578,13 +6578,65 @@ export default function ControlClient() {
     setThinkingPanelManuallyHidden(false);
   }, [setThinkingPanelManuallyHidden, viewingMissionId]);
 
-  // Reset the sub-agent tab focus whenever the viewed mission
-  // changes so a sub-agent from mission A doesn't stay focused
-  // when the user switches to mission B.
+  // Mission switch — wipe every state slice that's mission-bound
+  // but lives in this parent component (state slices INSIDE the
+  // `<MissionScope key={missionId}>` subtree get reset automatically
+  // via React unmount; this effect covers the slices that haven't
+  // been lifted yet — see ~/.claude/plans/ok-now-i-want-witty-raccoon.md
+  // Phases 2–7).
+  //
+  // Goal: no DOM/observable/event/state from the previous mission
+  // survives into the new one. The existing draft swap effect at
+  // line 6773 (saves old composer draft, loads new) handles input.
+  // This handler adds: items (Zustand store), subagent state,
+  // expanded tool groups, pending file refs, modal flags, streaming
+  // delta buffers, flush timers.
   useEffect(() => {
+    // Sub-agent focus
     setActiveSubagentTab(null);
+    setSubagentActivityByParent({});
+
+    // Modal / panel flags
     setShowChangesPanel(false);
-  }, [viewingMissionId]);
+    setShowRestoreModal(false);
+
+    // Tool-group expansion state
+    setExpandedToolGroups(new Set());
+
+    // Pending file-open request from the chat linkifier
+    setPendingFileRef(null);
+
+    // Items list (Zustand store) — old mission's events were
+    // server-side-filtered already on the SSE side, but the
+    // store itself is module-level and survives. Reset eagerly
+    // so the new mission's initial load doesn't briefly render
+    // the previous mission's tail.
+    setItems([]);
+    itemsRef.current = [];
+
+    // Streaming delta buffers + flush timers (already cleared
+    // by the master draft-swap effect at 6802-6819; duplicated
+    // here so the intent is in one place — both clears are
+    // idempotent).
+    if (thinkingFlushTimeoutRef.current) {
+      clearTimeout(thinkingFlushTimeoutRef.current);
+      thinkingFlushTimeoutRef.current = null;
+    }
+    if (thinkingFlushRafRef.current !== null) {
+      cancelAnimationFrame(thinkingFlushRafRef.current);
+      thinkingFlushRafRef.current = null;
+    }
+    if (streamFlushTimeoutRef.current) {
+      clearTimeout(streamFlushTimeoutRef.current);
+      streamFlushTimeoutRef.current = null;
+    }
+    if (streamFlushRafRef.current !== null) {
+      cancelAnimationFrame(streamFlushRafRef.current);
+      streamFlushRafRef.current = null;
+    }
+    pendingThinkingRef.current = null;
+    pendingStreamRef.current = null;
+  }, [viewingMissionId, setItems]);
 
   // Tell the backend the user opened this mission. The server records
   // `first_viewed_at` on the first call (starting the 1h ack grace timer
