@@ -82,6 +82,7 @@ export function MonacoFileEditor({
   const language = languageForPath(path);
 
   const onMount: OnMount = (ed, monaco: Monaco) => {
+    console.log("[MonacoFileEditor] onMount", { path, missionId, repoName });
     ensureTheme(monaco);
     ensureTypeScriptDefaults(monaco);
     ensureEditorOpener(monaco);
@@ -148,20 +149,63 @@ export function MonacoFileEditor({
   }, [vim]);
 
   // Unmount cleanup for the vim adapter + LSP document.
+  //
+  // Ordering matters here — these run during React's commit phase
+  // while the editor's host DOM node is being detached:
+  //
+  //   1. LSP closeModel FIRST. It's pure protocol: a JSON-RPC
+  //      notification on the WebSocket plus a Map.delete. No DOM
+  //      access. Safe to run synchronously regardless of where
+  //      React is in the commit cycle. Doing it first guarantees
+  //      the language server is told the doc is gone before any
+  //      stale completion / hover request races back.
+  //
+  //   2. Vim dispose DEFERRED to a microtask. monaco-vim attaches
+  //      keystroke listeners + status-bar DOM hooks to the editor
+  //      container. If we dispose synchronously here, vim's
+  //      teardown can try `removeChild` on a node whose parent
+  //      React has already detached — error: "Cannot read
+  //      properties of null (reading 'removeChild')". Worse, the
+  //      error fires inside React's deletion-effect pass, which
+  //      keeps retrying the same fiber and loops forever. The
+  //      microtask runs *after* the current commit, when the
+  //      DOM is settled.
+  //
+  // Each step is wrapped in try/catch — even if a single dispose
+  // throws, the others still run and the error never escapes to
+  // React's commit queue.
   useEffect(() => {
+    console.log("[MonacoFileEditor] mount (effect)", { path });
     return () => {
-      vimRef.current?.dispose();
-      vimRef.current = null;
+      console.log("[MonacoFileEditor] unmount (effect)", { path });
+
+      // 1. LSP first.
       const attach = lspAttachRef.current;
+      lspAttachRef.current = null;
       if (attach) {
         try {
           attach.client.closeModel(attach.uri);
-        } catch {
-          // ignore — client may already be disposed
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.warn("[MonacoFileEditor] LSP closeModel failed", e);
         }
-        lspAttachRef.current = null;
+      }
+
+      // 2. Vim, deferred.
+      const vim = vimRef.current;
+      vimRef.current = null;
+      if (vim) {
+        queueMicrotask(() => {
+          try {
+            vim.dispose();
+          } catch (e) {
+            // eslint-disable-next-line no-console
+            console.warn("[MonacoFileEditor] vim dispose failed", e);
+          }
+        });
       }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // When attached to an LSP we use the real workspace URI so the
