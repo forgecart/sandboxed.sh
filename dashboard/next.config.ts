@@ -8,6 +8,19 @@ const nextConfig: NextConfig = {
   env: {
     NEXT_PUBLIC_APP_VERSION: version,
   },
+  // StrictMode previously surfaced a recurring "Cannot read
+  // properties of null (reading 'removeChild')" loop on mission
+  // switch — caused by mission-bound state surviving across
+  // missionId changes (Monaco editor instances, Zustand items
+  // store, SSE handler refs all carrying through). Phase 0 of the
+  // state-isolation refactor introduced `<MissionScope key={missionId}>`
+  // around the mission-scoped subtree (mission-scope.tsx), and a
+  // companion reset useEffect wipes parent-level state slices on
+  // switch (control-client.tsx:6584). With both in place,
+  // StrictMode's double-render no longer races — the mission
+  // teardown is now idempotent. Re-enable for early detection of
+  // future cleanup races.
+  reactStrictMode: true,
   // Ship source maps to the browser in production. Without this,
   // every error in DevTools surfaces as a one-line trace through
   // `_next/static/chunks/abc123.js:1:9876` — useless for
