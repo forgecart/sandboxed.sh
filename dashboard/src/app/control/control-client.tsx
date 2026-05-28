@@ -2205,6 +2205,8 @@ const ThinkingPanel = memo(function ThinkingPanel({
       return row.item.kind === "stream" ? 140 : 112;
     },
     overscan: 6,
+    // See chatVirtualizer for rationale (React 19 flushSync race).
+    useFlushSync: false,
   });
   // See `chatVirtualizer` below for rationale.
   thoughtsVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () =>
@@ -6472,6 +6474,14 @@ export default function ControlClient() {
       return 100;
     },
     overscan: 8,
+    // Disable internal flushSync. TanStack Virtual calls flushSync
+    // inside lifecycle methods (scroll, measure, unmount) which
+    // React 19 flags as illegal — and during an unmount commit
+    // the synchronous re-render races with React's deletion
+    // traversal, producing the "Cannot read properties of null
+    // (reading 'removeChild')" loop on navigation away from this
+    // page. See TanStack/virtual#1094 + kubetail-org/kubetail#1003.
+    useFlushSync: false,
   });
   // Suppress tanstack-virtual's automatic scroll-offset compensation.
   // Default behavior: every time an item above the viewport measures and

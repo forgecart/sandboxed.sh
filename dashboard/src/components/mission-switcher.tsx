@@ -925,6 +925,11 @@ export function MissionSwitcher({
     getScrollElement: () => listRef.current,
     estimateSize: (index) => (renderedRows[index]?.kind === 'section' ? 34 : 72),
     overscan: 8,
+    // Disable internal flushSync — see TanStack/virtual#1094.
+    // React 19 flags flushSync-inside-lifecycle, and during the
+    // unmount of this command palette the resulting micro-task
+    // races with React's deletion traversal.
+    useFlushSync: false,
   });
 
   // Bosses whose worker rows are visually present right now. When the user

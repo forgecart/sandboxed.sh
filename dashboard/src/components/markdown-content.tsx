@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useEffect, useMemo, useRef, memo } from "react";
 import { createRoot } from "react-dom/client";
+import { flushSync } from "react-dom";
 import Markdown, { Components, defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { LazyCodeBlock } from "./lazy-code-block";
@@ -304,8 +305,35 @@ function showFilePreviewModal(
   const root = createRoot(container);
 
   const cleanup = () => {
-    root.unmount();
-    container.remove();
+    // React 19: root.unmount() returns synchronously but schedules
+    // the actual unmount commit onto the next React tick — a bare
+    // setTimeout(0) detaches the container BEFORE that commit has
+    // finished walking the fiber tree, producing:
+    //   "Cannot read properties of null (reading 'removeChild')"
+    //   at commitDeletionEffectsOnFiber → unmountHoistable
+    // and React retries the deletion forever (only a page reload
+    // clears the loop).
+    //
+    // flushSync forces the unmount commit to run synchronously.
+    // After flushSync returns, every fiber in the manual root has
+    // been deleted and every removeChild has fired. THEN we can
+    // safely detach the container from document.body.
+    //
+    // See React issue #16586 and the research at
+    // ~/.claude/plans/ok-now-i-want-witty-raccoon.md.
+    try {
+      flushSync(() => {
+        root.unmount();
+      });
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn("[markdown-content] flushSync unmount failed", e);
+    }
+    try {
+      container.remove();
+    } catch {
+      // Container may already have been removed by React.
+    }
   };
 
   root.render(
