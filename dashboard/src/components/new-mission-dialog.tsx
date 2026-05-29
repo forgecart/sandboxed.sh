@@ -16,7 +16,7 @@ const KNOWN_BACKEND_IDS = ['opencode', 'claudecode', 'codex', 'gemini', 'grok'] 
 // settings via `initialValues`.
 const DEFAULT_NEW_MISSION_BACKEND = 'claudecode' as const;
 const DEFAULT_NEW_MISSION_MODEL_EFFORT: ModelEffort = 'max';
-const DEFAULT_NEW_MISSION_MODEL_OVERRIDE = 'claude-opus-4-7' as const;
+const DEFAULT_NEW_MISSION_MODEL_OVERRIDE = 'claude-opus-4-8' as const;
 
 // Kept in sync with src/api/control.rs `normalize_model_effort_for_backend`.
 // Codex only accepts the three baseline levels; claudecode also accepts
@@ -475,7 +475,7 @@ export function NewMissionDialog({
 
     // Model override / effort: prefer `initialValues` (edit mode or current-
     // mission carry-over). In create mode without explicit values, prime with
-    // the New-Mission defaults (claude-opus-4-7 / max). The
+    // the New-Mission defaults (claude-opus-4-8 / max). The
     // backend-switch effect downstream will clear these if the user picks a
     // different backend that doesn't support them.
     if (initialValues?.modelOverride) {
@@ -938,7 +938,7 @@ export function NewMissionDialog({
               <p className="text-xs text-white/30 mt-1.5">
                 {selectedBackend === 'opencode'
                     ? 'Use provider/model format (e.g., openai/gpt-5-codex).'
-                    : 'Use the raw model ID (e.g., gpt-5-codex or claude-opus-4-7).'}
+                    : 'Use the raw model ID (e.g., gpt-5-codex or claude-opus-4-8).'}
               </p>
             </div>
 

@@ -35,25 +35,27 @@ const DATA_ATTR = "data-favicon-status";
 /**
  * Dynamically overlays a coloured status dot on the favicon.
  *
- * Creates its own <link> element and removes Next.js-managed favicon links
- * to ensure Chrome picks up the dynamic version. Restores originals on
- * unmount or when status is null.
+ * Appends its own `<link rel="icon">` element to document.head. Browsers
+ * (Chrome, Firefox, Safari, Edge) pick the last `<link rel="icon">` in
+ * head, so our managed link takes precedence over Next.js's static
+ * favicon without touching any Next.js-owned DOM nodes.
+ *
+ * Earlier versions of this hook removed the Next.js-managed favicon
+ * links from document.head and stored them in a ref to re-append on
+ * unmount. That created a React 19 commit-phase race: when the
+ * component unmounted, React's deletion fiber tried to removeChild on
+ * the detached Next.js `<link>` (whose parentNode was now null),
+ * throwing `Cannot read properties of null (reading 'removeChild')`
+ * and putting React's commit queue into a retry loop. The fix here is
+ * "append-only" — we never detach a node we don't own.
  */
 export function useFaviconStatus(status: MissionStatus | null, isRunning: boolean) {
   const cachedImg = useRef<HTMLImageElement | null>(null);
-  const removedLinks = useRef<HTMLLinkElement[]>([]);
 
   useEffect(() => {
-    // No active mission → ensure originals are restored and our link removed
+    // No active mission → remove our managed link and stop. Next.js's
+    // own favicon links remain in place and reassert themselves.
     if (!status) {
-      // Restore any previously removed links
-      removedLinks.current.forEach((link) => {
-        if (!document.head.contains(link)) {
-          document.head.appendChild(link);
-        }
-      });
-      removedLinks.current = [];
-      // Remove our managed link
       document.querySelector(`link[${DATA_ATTR}]`)?.remove();
       return;
     }
@@ -84,18 +86,9 @@ export function useFaviconStatus(status: MissionStatus | null, isRunning: boolea
 
       const dataUrl = canvas.toDataURL("image/png");
 
-      // Remove all existing Next.js favicon links (store refs to restore later)
-      const existingLinks = document.querySelectorAll<HTMLLinkElement>(
-        `link[rel="icon"]:not([${DATA_ATTR}])`
-      );
-      existingLinks.forEach((link) => {
-        if (!removedLinks.current.includes(link)) {
-          removedLinks.current.push(link);
-        }
-        link.remove();
-      });
-
-      // Create or update our managed link
+      // Create or update our managed link. We never remove
+      // Next.js-managed favicon links — appending ours last is
+      // enough; the browser uses the last <link rel="icon">.
       let managed = document.querySelector<HTMLLinkElement>(`link[${DATA_ATTR}]`);
       if (!managed) {
         managed = document.createElement("link");
@@ -104,9 +97,10 @@ export function useFaviconStatus(status: MissionStatus | null, isRunning: boolea
       }
       managed.type = "image/png";
       managed.href = dataUrl;
-      if (!document.head.contains(managed)) {
-        document.head.appendChild(managed);
-      }
+      // Always append (or re-append) last so we win the
+      // "last-link-wins" tiebreak. appendChild is a no-op if the
+      // node is already the last child.
+      document.head.appendChild(managed);
     };
 
     let cancelled = false;
@@ -141,15 +135,11 @@ export function useFaviconStatus(status: MissionStatus | null, isRunning: boolea
     };
   }, [status, isRunning]);
 
-  // Cleanup on full unmount: restore originals, remove managed link
+  // Cleanup on full unmount: remove our managed link only. Never touch
+  // Next.js-owned <link> elements — letting React's commit phase delete
+  // them is what the static head is for.
   useEffect(() => {
     return () => {
-      removedLinks.current.forEach((link) => {
-        if (!document.head.contains(link)) {
-          document.head.appendChild(link);
-        }
-      });
-      removedLinks.current = [];
       document.querySelector(`link[${DATA_ATTR}]`)?.remove();
     };
   }, []);

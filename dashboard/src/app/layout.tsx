@@ -33,7 +33,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className="dark">
+    <html lang="en" className="dark" suppressHydrationWarning>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
@@ -44,9 +44,6 @@ export default function RootLayout({
             <LibraryProvider>
               <MissionSwitcherProvider>
                 <Sidebar />
-                {/* Sidebar is now an auto-hide overlay (slides in from
-                    the left on hover); main reclaims the full width
-                    so chats / tool calls get more horizontal space. */}
                 <main className="min-h-screen">{children}</main>
               </MissionSwitcherProvider>
             </LibraryProvider>

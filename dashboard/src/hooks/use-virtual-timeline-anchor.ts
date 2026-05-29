@@ -30,6 +30,17 @@ export function useVirtualTimelineAnchor<TScrollElement extends HTMLElement>({
   const [isAtBottom, setIsAtBottom] = useState(true);
   const isAtBottomRef = useRef(true);
   const rafRef = useRef<number | null>(null);
+  // Timestamp (ms) until which scroll events are ignored for the
+  // purposes of `isAtBottomRef` bookkeeping. `scrollToBottom` sets
+  // this so that the intermediate scroll events fired during an
+  // animated scroll-to-end don't flip `isAtBottomRef` to `false`
+  // mid-animation — that race used to make the subsequent layout
+  // effect (which is what actually issues the scroll to the new
+  // last item after a `setItems` commit) skip its work because
+  // it'd see the ref as `false`. Window only needs to cover the
+  // animation; 600 ms is enough for a smooth scroll across the
+  // viewport even on long lists.
+  const anchorLockUntilRef = useRef(0);
 
   const cancelPendingScroll = useCallback(() => {
     if (rafRef.current !== null) {
@@ -65,6 +76,7 @@ export function useVirtualTimelineAnchor<TScrollElement extends HTMLElement>({
   const updateAnchorFromScroll = useCallback(() => {
     const el = scrollElementRef.current;
     if (!el) return;
+    if (Date.now() < anchorLockUntilRef.current) return;
 
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
     const atBottom = distanceFromBottom <= bottomThreshold;
@@ -77,6 +89,7 @@ export function useVirtualTimelineAnchor<TScrollElement extends HTMLElement>({
       if (itemCount <= 0) return;
       isAtBottomRef.current = true;
       setIsAtBottom(true);
+      anchorLockUntilRef.current = Date.now() + 600;
       virtualizer.scrollToIndex(itemCount - 1, {
         align: "end",
         behavior,

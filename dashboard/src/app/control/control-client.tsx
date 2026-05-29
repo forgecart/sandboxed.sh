@@ -2,7 +2,6 @@
 
 import type React from "react";
 import {
-  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -45,7 +44,6 @@ import {
   useControlItemsStore,
   useControlQueueStore,
   useControlStreamingDiagnosticsStore,
-  useControlThinkingStore,
   useControlViewingMissionStore,
   type StreamDiagnosticsState,
 } from "./control-stores";
@@ -53,6 +51,7 @@ import { NowTickProvider, useNow } from "@/lib/now-tick";
 import { startHealthBudgetWatcher } from "@/lib/health-budget";
 import { MissionDebugStats } from "./MissionDebugStats";
 import { MissionScope } from "./mission-scope";
+
 import { LazyCodeBlock } from "@/components/lazy-code-block";
 import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
 import { cn } from "@/lib/utils";
@@ -88,6 +87,7 @@ import {
   getRunningMissions,
   isNetworkError,
   cancelMission,
+  deleteMission,
   autoGenerateMissionTitle,
   listWorkspaces,
   getHealth,
@@ -401,8 +401,6 @@ import {
   normalizeMetadataText,
 } from "@/components/mission-switcher";
 import { ChangesPanel } from "@/components/changes-panel";
-import { WorkerPanel } from "@/components/worker-panel";
-import { WorkersStrip } from "@/components/workers-strip";
 import {
   SubagentsPanel,
   type SubagentEntry,
@@ -438,49 +436,6 @@ const LiveDuration = memo(function LiveDuration({
   return <>{formatDuration(seconds)}</>;
 });
 
-/**
- * Returns the previous reference when `arr` is element-wise `Object.is` to
- * the last value. Used to keep derived array props reference-stable so a
- * memoized child can skip re-rendering when its slice of the world hasn't
- * actually changed.
- *
- * The motivating case: `thinkingItems` falls out of the same `useMemo` as
- * `groupedItems`, so any `setItems` (e.g. a `text_delta` on the assistant
- * message) bumps both references. The thinking subset usually hasn't
- * changed, but `ThinkingPanel` would still re-render on every chat tick.
- * Wrapping the array through this hook + `React.memo` on the panel cuts
- * those redundant renders.
- */
-// `useMemoCompare`-style identity helper. The React Compiler lint plugin
-// forbids ref access during render to keep auto-memoization safe, but this
-// hook is itself the memoization primitive — it must compare against the
-// last render to decide what to return. Local rule disable is intentional.
-/* eslint-disable react-hooks/refs */
-function useStableShallowArray<T>(arr: readonly T[]): readonly T[] {
-  const ref = useRef<readonly T[]>(arr);
-  const prev = ref.current;
-  let stable: readonly T[];
-  if (prev === arr) {
-    stable = prev;
-  } else if (prev.length !== arr.length) {
-    stable = arr;
-  } else {
-    let equal = true;
-    for (let i = 0; i < arr.length; i++) {
-      if (!Object.is(prev[i], arr[i])) {
-        equal = false;
-        break;
-      }
-    }
-    stable = equal ? prev : arr;
-  }
-  useEffect(() => {
-    ref.current = stable;
-  }, [stable]);
-  return stable;
-}
-/* eslint-enable react-hooks/refs */
-
 type ToolGroup = {
   kind: "tool_group";
   groupId: string;
@@ -510,12 +465,6 @@ type ItemViews = {
   chatDisplayItems: ChatItem[];
   /** The last non-queued item; used by a few pinned UI bits. */
   lastNonQueuedItem: ChatItem | undefined;
-  /** Thinking + streaming items, for the side panel. */
-  thinkingItems: SidePanelItem[];
-  /** Completed (de-duplicated by content) + in-flight thinking count. */
-  thinkingItemsCount: number;
-  /** Any in-flight (not done) thinking item present. */
-  hasActiveThinking: boolean;
   /** `chatDisplayItems` collapsed into tool / thinking groups. */
   groupedItems: GroupedItem[];
 };
@@ -526,15 +475,12 @@ type ItemViews = {
  * looped over `items` independently — on a 5 000-item mission with a
  * 10 Hz SSE stream that was ~35 000 ops/sec just to keep views in
  * sync. Merging into one traversal is O(n) in `items.length` and runs
- * exactly once per `(items, showThinkingPanel)` change.
+ * exactly once per `items` change.
  *
  * Keep this pure — it's called from a `useMemo` and must not touch
  * React state or refs.
  */
-function deriveItemViews(
-  items: ChatItem[],
-  showThinkingPanel: boolean,
-): ItemViews {
+function deriveItemViews(items: ChatItem[]): ItemViews {
   // Pass 1: dedup by id (last occurrence wins, preserve original order).
   // Record the last index per id, then emit items whose index matches.
   // O(n) with a single map allocation.
@@ -563,31 +509,13 @@ function deriveItemViews(
     });
   }
 
-  // Pass 2: split queued user messages off the end, collect thinking
-  // items, find lastNonQueued — all in one sweep.
+  // Pass 2: detect queued user messages (move them to the end below).
   let hasQueuedUser = false;
-  let thinkingItems: SidePanelItem[] = [];
-  let hasActiveThinking = false;
   for (const item of dedupedItems) {
     if (item.kind === "user" && item.queued) {
       hasQueuedUser = true;
+      break;
     }
-    if (item.kind === "thinking" || item.kind === "stream") {
-      thinkingItems.push(item as SidePanelItem);
-      if (!item.done) hasActiveThinking = true;
-    }
-  }
-  const lastThinkingIndexByContent = new Map<string, number>();
-  for (let i = 0; i < thinkingItems.length; i++) {
-    const key = thinkingItems[i].content.trim();
-    if (key) lastThinkingIndexByContent.set(key, i);
-  }
-  if (lastThinkingIndexByContent.size > 0) {
-    thinkingItems = thinkingItems.filter((item, index) => {
-      const key = item.content.trim();
-      return !key || lastThinkingIndexByContent.get(key) === index;
-    });
-    hasActiveThinking = thinkingItems.some((item) => !item.done);
   }
 
   let displayItems: ChatItem[];
@@ -622,22 +550,6 @@ function deriveItemViews(
     lastNonQueuedItem = displayItems[displayItems.length - 1];
   }
 
-  // Thinking-count dedup by content (matches the panel's own rule).
-  const seenThinkContent = new Set<string>();
-  let completedThinking = 0;
-  let activeThinking = 0;
-  for (const t of thinkingItems) {
-    if (!t.done) {
-      activeThinking += 1;
-      continue;
-    }
-    const trimmed = t.content.trim();
-    if (!trimmed || seenThinkContent.has(trimmed)) continue;
-    seenThinkContent.add(trimmed);
-    completedThinking += 1;
-  }
-  const thinkingItemsCount = completedThinking + activeThinking;
-
   // Pass 3: group consecutive tool/thinking blocks for collapsed display.
   const groupedItems: GroupedItem[] = [];
   let currentToolGroup: ToolItem[] = [];
@@ -669,10 +581,8 @@ function deriveItemViews(
       flushThinkingGroup();
       currentToolGroup.push(item);
     } else if (item.kind === "thinking" || item.kind === "stream") {
-      // Thoughts always render inline in the main chat now — the
-      // side `ThinkingPanel` was removed per UX request. Break the
-      // current tool group so ordering renders as
-      // tool → thinking → tool in the chat.
+      // Thoughts render inline in the main chat. Break the current
+      // tool group so ordering renders as tool → thinking → tool.
       flushToolGroup();
       currentThinkingGroup.push(item as SidePanelItem);
     } else {
@@ -689,9 +599,6 @@ function deriveItemViews(
     displayItems,
     chatDisplayItems,
     lastNonQueuedItem,
-    thinkingItems,
-    thinkingItemsCount,
-    hasActiveThinking,
     groupedItems,
   };
 }
@@ -2004,349 +1911,6 @@ function ThinkingGroupItem({
   );
 }
 
-// Thinking panel item - simplified version for side panel
-// Threshold for collapsing long thoughts (in characters)
-const THOUGHT_COLLAPSE_THRESHOLD = 800;
-
-const ThinkingPanelItem = memo(function ThinkingPanelItem({
-  item,
-  isActive,
-  basePath,
-  workspaceId,
-  missionId,
-}: {
-  item: SidePanelItem;
-  isActive: boolean;
-  basePath?: string;
-  workspaceId?: string;
-  missionId?: string;
-}) {
-  // P1-#7 / re-render fix: only active items live-tick via `<LiveDuration>`.
-  // Done items render a fixed string and never subscribe to `useNow()`, so
-  // visible done cards no longer commit once per second forever.
-  const [isExpanded, setIsExpanded] = useState(!item.done);
-
-  const doneDuration =
-    item.done && item.endTime
-      ? formatDuration(Math.floor((item.endTime - item.startTime) / 1000))
-      : null;
-
-  const activeLabel = item.kind === "stream" ? "Streaming" : "Thinking";
-  const pastLabel = item.kind === "stream" ? "Draft" : "Thought";
-
-  // For completed items, check if content is long enough to collapse
-  const isLongContent =
-    !isActive && item.content.length > THOUGHT_COLLAPSE_THRESHOLD;
-  const shouldTruncate = isLongContent && !isExpanded;
-
-  // Get truncated content for display
-  const displayContent = shouldTruncate
-    ? item.content.slice(0, THOUGHT_COLLAPSE_THRESHOLD) + "..."
-    : item.content;
-
-  return (
-    <div
-      className={cn(
-        "rounded-lg border p-3",
-        // Unified styling - subtle border highlight for active, same base appearance
-        isActive
-          ? "border-indigo-500/30 bg-white/[0.02]"
-          : "border-white/[0.06] bg-white/[0.02]",
-      )}
-    >
-      <div className="flex items-center gap-2 mb-2">
-        <Brain
-          className={cn(
-            "h-3.5 w-3.5 shrink-0",
-            isActive ? "animate-pulse text-indigo-400" : "text-white/40",
-          )}
-        />
-        <span
-          className={cn(
-            "text-xs font-medium",
-            isActive ? "text-indigo-400" : "text-white/50",
-          )}
-        >
-          {isActive ? (
-            <>
-              {activeLabel} for <LiveDuration startTime={item.startTime} />
-            </>
-          ) : (
-            `${pastLabel} for ${doneDuration ?? "<1s"}`
-          )}
-        </span>
-      </div>
-      {/* Content area - no internal scroll, unified text color */}
-      <div className="text-xs leading-relaxed text-white/60">
-        {item.content ? (
-          <>
-            <StreamingMarkdown
-              content={displayContent}
-              isStreaming={isActive}
-              className="text-xs [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1"
-              basePath={basePath}
-              workspaceId={workspaceId}
-              missionId={missionId}
-            />
-            {/* Expand/collapse button for long content */}
-            {isLongContent && (
-              <button
-                onClick={() => setIsExpanded(!isExpanded)}
-                className="mt-2 text-[10px] text-indigo-400/70 hover:text-indigo-400 transition-colors flex items-center gap-1"
-              >
-                {isExpanded ? (
-                  <>
-                    <ChevronUp className="h-3 w-3" />
-                    Show less
-                  </>
-                ) : (
-                  <>
-                    <ChevronDown className="h-3 w-3" />
-                    Show more (
-                    {Math.round(
-                      (item.content.length - THOUGHT_COLLAPSE_THRESHOLD) / 100,
-                    ) * 100}
-                    + chars)
-                  </>
-                )}
-              </button>
-            )}
-          </>
-        ) : (
-          <span className="italic text-white/30">Processing...</span>
-        )}
-      </div>
-    </div>
-  );
-});
-
-// Thinking side panel component.
-//
-// `React.memo` short-circuits when props are reference-stable, so the panel
-// no longer re-renders on chat-only updates. The two non-trivial inputs:
-//   - `items`: kept reference-stable upstream via `useStableShallowArray`
-//   - `onClose`: already wrapped in `useCallback`
-// `className` is built from primitive string literals at the call site;
-// `basePath` and `missionId` come from memoized values / the store.
-const ThinkingPanel = memo(function ThinkingPanel({
-  items,
-  onClose,
-  className,
-  basePath,
-  missionId,
-}: {
-  items: SidePanelItem[];
-  onClose: () => void;
-  className?: string;
-  basePath?: string;
-  missionId?: string | null;
-}) {
-  const hasOpenModalOverlay = useCallback((): boolean => {
-    const overlays = Array.from(
-      document.querySelectorAll("body > div.fixed.inset-0"),
-    );
-    return overlays.some((overlay) => {
-      const classText = overlay.className;
-      if (
-        !classText.includes("items-center") &&
-        !classText.includes("items-start")
-      ) {
-        return false;
-      }
-      const zIndex = Number.parseInt(
-        window.getComputedStyle(overlay).zIndex || "0",
-        10,
-      );
-      return Number.isFinite(zIndex) && zIndex >= 50;
-    });
-  }, []);
-
-  const activeItems = useMemo(() => items.filter((t) => !t.done), [items]);
-  const hasActiveThinking = activeItems.some((i) => i.kind === "thinking");
-  const hasActiveStream = activeItems.some((i) => i.kind === "stream");
-
-  // Performance: limit visible thoughts, load more on demand
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const panelRows = useMemo(() => {
-    const seenDoneContent = new Set<string>();
-    return items
-      .filter((item) => {
-        const trimmed = item.content.trim();
-        if (!item.done) return true;
-        if (!trimmed) return false;
-        if (seenDoneContent.has(trimmed)) return false;
-        seenDoneContent.add(trimmed);
-        return true;
-      })
-      .map((item) => ({ item }));
-  }, [items]);
-  const thoughtsAnchorKey = useMemo(
-    () =>
-      panelRows
-        .slice(-8)
-        .map(
-          ({ item }) =>
-            `${item.id}:${item.done ? "done" : "active"}:${item.content.length}`,
-        )
-        .join("|"),
-    [panelRows],
-  );
-  const thoughtsVirtualizer = useVirtualizer({
-    count: panelRows.length,
-    getScrollElement: () => scrollRef.current,
-    getItemKey: (index) => {
-      const row = panelRows[index];
-      if (!row) return index;
-      return row.item.id;
-    },
-    estimateSize: (index) => {
-      const row = panelRows[index];
-      if (!row) return 96;
-      return row.item.kind === "stream" ? 140 : 112;
-    },
-    overscan: 6,
-    // See chatVirtualizer for rationale (React 19 flushSync race).
-    useFlushSync: false,
-  });
-  // See `chatVirtualizer` below for rationale.
-  thoughtsVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () =>
-    false;
-  const {
-    isAtBottom: isThoughtsAtBottom,
-    scrollToBottom: scrollThoughtsToBottom,
-  } = useVirtualTimelineAnchor({
-    scrollElementRef: scrollRef,
-    virtualizer: thoughtsVirtualizer,
-    itemCount: panelRows.length,
-    changeKey: thoughtsAnchorKey,
-    resetKey: missionId ?? null,
-  });
-  useEffect(() => {
-    if (panelRows.length > 1) return;
-    const forceBottom = () => {
-      scrollThoughtsToBottom("auto");
-      const el = scrollRef.current;
-      if (el) el.scrollTop = el.scrollHeight;
-    };
-    const frame = requestAnimationFrame(forceBottom);
-    const timeout = window.setTimeout(forceBottom, 250);
-    return () => {
-      cancelAnimationFrame(frame);
-      window.clearTimeout(timeout);
-    };
-  }, [panelRows.length, scrollThoughtsToBottom, thoughtsAnchorKey]);
-
-  // Handle Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        if (hasOpenModalOverlay()) return;
-        onClose();
-      }
-    };
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [hasOpenModalOverlay, onClose]);
-
-  return (
-    <div
-      className={cn(
-        "w-full h-full flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden animate-slide-in-right",
-        className,
-      )}
-    >
-      {/* Header */}
-      <div className="flex items-center justify-between border-b border-white/[0.06] px-4 py-3">
-        <div className="flex items-center gap-2">
-          <Brain
-            className={cn(
-              "h-4 w-4",
-              activeItems.length > 0
-                ? "animate-pulse text-indigo-400"
-                : "text-white/40",
-            )}
-          />
-          <span className="text-sm font-medium text-white">
-            {hasActiveThinking
-              ? "Thinking"
-              : hasActiveStream
-                ? "Streaming"
-                : "Thoughts"}
-          </span>
-          {panelRows.length > 0 && (
-            <span className="text-xs text-white/30">({panelRows.length})</span>
-          )}
-        </div>
-        <button
-          onClick={onClose}
-          className="flex h-6 w-6 items-center justify-center rounded-lg text-white/40 hover:bg-white/[0.04] hover:text-white transition-colors"
-        >
-          <X className="h-3.5 w-3.5" />
-        </button>
-      </div>
-
-      {/* Content - flex-col with overflow, scrolls up for history */}
-      <div
-        ref={scrollRef}
-        data-testid="thoughts-scroll-container"
-        className="relative flex-1 overflow-y-auto p-3"
-      >
-        {items.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full text-center p-4">
-            <Brain className="h-8 w-8 text-white/20 mb-3" />
-            <p className="text-sm text-white/40">No thoughts yet</p>
-            <p className="text-xs text-white/30 mt-1">
-              Agent reasoning will appear here
-            </p>
-          </div>
-        ) : (
-          <>
-            <div
-              className="relative w-full"
-              style={{
-                height: `${thoughtsVirtualizer.getTotalSize()}px`,
-                minHeight: "100%",
-              }}
-            >
-              {thoughtsVirtualizer.getVirtualItems().map((virtualRow) => {
-                const row = panelRows[virtualRow.index];
-                if (!row) return null;
-                return (
-                  <div
-                    key={virtualRow.key}
-                    ref={thoughtsVirtualizer.measureElement}
-                    data-index={virtualRow.index}
-                    className="absolute left-0 top-0 w-full pb-3"
-                    style={{
-                      transform: `translateY(${virtualRow.start}px)`,
-                    }}
-                  >
-                    <ThinkingPanelItem
-                      item={row.item}
-                      isActive={!row.item.done}
-                      basePath={basePath}
-                      missionId={missionId ?? undefined}
-                    />
-                  </div>
-                );
-              })}
-            </div>
-            {!isThoughtsAtBottom && (
-              <button
-                type="button"
-                onClick={() => scrollThoughtsToBottom()}
-                className="absolute bottom-3 right-3 flex h-8 w-8 items-center justify-center rounded-full border border-white/[0.1] bg-black/50 text-white/60 shadow-lg transition-colors hover:bg-white/[0.08] hover:text-white"
-                title="Scroll to bottom"
-              >
-                <ArrowDown className="h-4 w-4" />
-              </button>
-            )}
-          </>
-        )}
-      </div>
-    </div>
-  );
-});
 
 // Live pod-boot progress for the K8sPod backend. The control plane
 // emits a `mission_pod_startup` event for every phase transition while
@@ -2801,14 +2365,22 @@ interface MissionUsageStats {
  *
  * Used for the workbench progress gauge so "% of memory left" is
  * meaningful per model. The `[1m]` suffix is Anthropic's 1M-token
- * context variant; we treat it as the bigger window. We default to
- * the 200K Sonnet/Opus baseline when the model is unknown — better
- * to under-report headroom than fabricate it.
+ * context variant for older models. Opus 4.7+, Opus 4.8, and
+ * Sonnet 4.6 ship with a 1M window natively — no suffix required.
+ * We default to the 200K Sonnet/Opus baseline when the model is
+ * unknown — better to under-report headroom than fabricate it.
  */
 function modelContextWindow(model: string | null): number {
   if (!model) return 200_000;
   const m = model.toLowerCase();
   if (m.includes("[1m]")) return 1_000_000;
+  if (
+    m.includes("opus-4-7") ||
+    m.includes("opus-4-8") ||
+    m.includes("sonnet-4-6")
+  ) {
+    return 1_000_000;
+  }
   if (m.includes("opus") || m.includes("sonnet") || m.includes("haiku")) {
     return 200_000;
   }
@@ -2900,7 +2472,6 @@ function MissionWorkbenchPanel({
   workspaceLabel,
   role,
   isRunning,
-  childMissions,
   onClose,
   onResume,
   onCancel,
@@ -2917,7 +2488,6 @@ function MissionWorkbenchPanel({
   workspaceLabel?: string;
   role: ReturnType<typeof inferMissionRole>;
   isRunning: boolean;
-  childMissions: Mission[];
   onClose: () => void;
   onResume: () => void;
   onCancel: (missionId: string) => void;
@@ -3161,10 +2731,18 @@ function MissionWorkbenchPanel({
                     <div className="flex items-center justify-between">
                       <span className="text-white/40">Cache hit</span>
                       <span className="font-mono text-white/80">
-                        {usage.latestInput > 0
+                        {usage.totalCacheRead +
+                          usage.totalCacheCreate +
+                          usage.totalInput >
+                        0
                           ? `${Math.round(
                               (usage.totalCacheRead /
-                                Math.max(1, usage.totalCacheRead + usage.totalInput)) *
+                                Math.max(
+                                  1,
+                                  usage.totalCacheRead +
+                                    usage.totalCacheCreate +
+                                    usage.totalInput,
+                                )) *
                                 100,
                             )}%`
                           : "—"}
@@ -3275,38 +2853,6 @@ function MissionWorkbenchPanel({
               </div>
             </section>
 
-            {childMissions.length > 0 && (
-              <section className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <p className="text-[10px] uppercase tracking-wide text-white/30">
-                    Worker Missions
-                  </p>
-                  <span className="text-[10px] tabular-nums text-white/30">
-                    {childMissions.length}
-                  </span>
-                </div>
-                <div className="space-y-1.5">
-                  {childMissions.slice(0, 6).map((child) => (
-                    <button
-                      key={child.id}
-                      onClick={() => onViewMission(child.id)}
-                      className="flex w-full items-center gap-2 rounded-md border border-white/[0.05] bg-white/[0.02] px-2.5 py-2 text-left hover:bg-white/[0.04]"
-                    >
-                      <span
-                        className={cn(
-                          "h-2 w-2 rounded-full",
-                          missionStatusDotClass(child.status),
-                        )}
-                      />
-                      <span className="min-w-0 flex-1 truncate text-xs text-white/70">
-                        {child.title?.trim() || getMissionShortName(child.id)}
-                      </span>
-                      <ChevronRight className="h-3 w-3 text-white/30" />
-                    </button>
-                  ))}
-                </div>
-              </section>
-            )}
           </>
         )}
       </div>
@@ -4120,8 +3666,9 @@ function MissionTabBar({
   );
   if (tabs.length <= 1) return null;
   return (
-    <div className="relative z-10 mb-2 -mx-3 sm:-mx-6 md:-mx-8 px-3 sm:px-6 md:px-8 overflow-x-auto overflow-y-hidden border-b border-white/[0.06] bg-black/20 backdrop-blur-sm">
-      <div className="flex items-center gap-0.5 py-1 whitespace-nowrap">
+    <div className="relative z-10 mb-2 -mx-2 sm:-mx-4 lg:-mx-6 border-b border-white/[0.06] bg-black/20 backdrop-blur-sm">
+      <div className="overflow-x-auto px-2 sm:px-4 lg:px-6 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+        <div className="flex items-center gap-0.5 py-1 whitespace-nowrap">
         {tabs.map((m) => {
           const isActive = m.id === viewingMissionId;
           const isRunning = runningSet.has(m.id);
@@ -4169,6 +3716,7 @@ function MissionTabBar({
             </div>
           );
         })}
+        </div>
       </div>
     </div>
   );
@@ -5938,24 +5486,15 @@ export default function ControlClient() {
     [],
   );
   const [showMissionSwitcher, setShowMissionSwitcher] = useState(false);
-  const [showWorkerPanel, setShowWorkerPanel] = useState(false);
-  // Sub-agents panel (in-mission Agent tool calls) has its own
-  // open/closed state — was sharing `showWorkerPanel` which made
-  // closing the Subagents drawer also kill the Workers drawer and
-  // vice versa. Per-mission dismissal so a fresh sub-agent doesn't
-  // auto-reopen after the user closed it.
+  // Sub-agents panel (in-mission Agent / Task / spawn_agent tool calls)
+  // has its own open/closed state. Per-mission dismissal so a fresh
+  // sub-agent doesn't auto-reopen after the user closed it.
   const [showSubagentsPanel, setShowSubagentsPanel] = useState(true);
   const subagentsPanelDismissedRef = useRef<Set<string>>(new Set());
   // Agent-tasks panel (TodoWrite list) — separate sidebar instead
   // of being baked into the workbench card.
   const [showAgentTasksPanel, setShowAgentTasksPanel] = useState(true);
   const agentTasksPanelDismissedRef = useRef<Set<string>>(new Set());
-  // Per-mission record of which missions the user has explicitly dismissed
-  // the worker panel for. Used so the auto-open effect doesn't keep reopening
-  // the panel after the user closes it while a streaming boss keeps spawning
-  // sub-agents.
-  const workerPanelDismissedRef = useRef<Set<string>>(new Set());
-  const workerPanelAutoOpenedForRef = useRef<string | null>(null);
   const [highlightedItemId, setHighlightedItemId] = useState<string | null>(
     null,
   );
@@ -6013,37 +5552,6 @@ export default function ControlClient() {
     null,
   );
 
-  // Thinking panel state. Defaults to closed; the auto-show effect below
-  // (`hasActiveThinking && !thinkingPanelManuallyHidden → setShowThinkingPanel(true)`)
-  // is the canonical path that opens the panel when thinking content
-  // actually starts streaming. Defaulting to open made every cold-load of
-  // an old mission (often with no thinking content at all) render the
-  // panel by default.
-  const [thinkingSlice, setThinkingSlice] = useControlThinkingStore();
-  const showThinkingPanel = thinkingSlice.panelOpen;
-  const setShowThinkingPanel = useCallback(
-    (next: boolean | ((prev: boolean) => boolean)) => {
-      setThinkingSlice((prev) => ({
-        ...prev,
-        panelOpen: typeof next === "function" ? next(prev.panelOpen) : next,
-      }));
-    },
-    [setThinkingSlice],
-  );
-  // Deferred mirror used by the heavy chat-list regrouping memo so the toggle
-  // click stays interactive even on long missions.
-  const deferredShowThinkingPanel = useDeferredValue(showThinkingPanel);
-  const thinkingPanelManuallyHidden = thinkingSlice.manuallyHidden;
-  const setThinkingPanelManuallyHidden = useCallback(
-    (next: boolean | ((prev: boolean) => boolean)) => {
-      setThinkingSlice((prev) => ({
-        ...prev,
-        manuallyHidden:
-          typeof next === "function" ? next(prev.manuallyHidden) : next,
-      }));
-    },
-    [setThinkingSlice],
-  );
   const [showWorkbenchPanel, setShowWorkbenchPanel] = useState(
     () => searchParams.get("workbench") === "1",
   );
@@ -6141,19 +5649,6 @@ export default function ControlClient() {
       setShowChangesPanel(true);
     });
   }, []);
-  const handleToggleThinkingPanel = useCallback(() => {
-    setShowThinkingPanel((prev) => {
-      const next = !prev;
-      setThinkingPanelManuallyHidden(!next);
-      return next;
-    });
-  }, [setShowThinkingPanel, setThinkingPanelManuallyHidden]);
-
-  const handleCloseThinkingPanel = useCallback(() => {
-    setShowThinkingPanel(false);
-    setThinkingPanelManuallyHidden(true);
-  }, [setShowThinkingPanel, setThinkingPanelManuallyHidden]);
-
   const adjustVisibleItemsLimit = useCallback((historyItems: ChatItem[]) => {
     let lastAssistantIdx = -1;
     for (let i = historyItems.length - 1; i >= 0; i--) {
@@ -6427,33 +5922,15 @@ export default function ControlClient() {
   // Single O(n) pass derives every downstream view. Replaces 7 separate
   // `useMemo` hooks that each looped over `items` (see `deriveItemViews`
   // for the rationale).
-  const {
-    lastNonQueuedItem,
-    thinkingItems: rawThinkingItems,
-    thinkingItemsCount,
-    hasActiveThinking,
-    groupedItems,
-  } = useMemo(
-    // `showThinkingPanel` reroutes thinking items between the inline chat
-    // and the side panel, which flips the structure of `groupedItems` and
-    // forces React to reconcile every chat row. On long missions that can
-    // block the main thread for several seconds, so feed it through
-    // `useDeferredValue`: the toggle button + panel mount react instantly
-    // while the chat-list regrouping is treated as a non-urgent transition.
+  const { lastNonQueuedItem, groupedItems } = useMemo(
     () =>
       perfBus.time("replay:group", () => {
-        const views = deriveItemViews(items, deferredShowThinkingPanel);
+        const views = deriveItemViews(items);
         perfBus.updateDiagnostics({ renderCount: views.groupedItems.length });
         return views;
       }),
-    [items, deferredShowThinkingPanel],
+    [items],
   );
-  // `deriveItemViews` produces a fresh `thinkingItems` array on every change
-  // to `items`, even when the chat update was unrelated to thoughts (e.g. a
-  // `text_delta` on the assistant message). Reuse the previous reference
-  // when the thinking subset is unchanged so `React.memo(ThinkingPanel)`
-  // can skip the re-render.
-  const thinkingItems = useStableShallowArray(rawThinkingItems) as SidePanelItem[];
 
   const containerRef = useRef<HTMLDivElement>(null);
   const chatVirtualizer = useVirtualizer({
@@ -6496,6 +5973,15 @@ export default function ControlClient() {
   // This is an instance field on the Virtualizer, not part of
   // `useVirtualizer`'s typed options — hence the direct assignment.
   chatVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
+  const showAgentWorkingIndicator = useMemo(() => {
+    if (items.length === 0) return false;
+    if (items[items.length - 1]?.kind === "assistant") return false;
+    return !items.some(
+      (it) =>
+        ((it.kind === "thinking" || it.kind === "stream") && !it.done) ||
+        it.kind === "phase",
+    );
+  }, [items]);
   const chatAnchorKey = useMemo(
     () =>
       groupedItems
@@ -6548,8 +6034,8 @@ export default function ControlClient() {
           }
           return key;
         })
-        .join("|"),
-    [groupedItems],
+        .join("|") + `|w:${showAgentWorkingIndicator ? 1 : 0}`,
+    [groupedItems, showAgentWorkingIndicator],
   );
   const { isAtBottom, scrollToBottom } = useVirtualTimelineAnchor({
     scrollElementRef: containerRef,
@@ -6558,16 +6044,6 @@ export default function ControlClient() {
     changeKey: chatAnchorKey,
     resetKey: viewingMissionId,
   });
-
-  const showAgentWorkingIndicator = useMemo(() => {
-    if (items.length === 0) return false;
-    if (items[items.length - 1]?.kind === "assistant") return false;
-    return !items.some(
-      (it) =>
-        ((it.kind === "thinking" || it.kind === "stream") && !it.done) ||
-        it.kind === "phase",
-    );
-  }, [items]);
 
   useEffect(() => {
     desktopSessionsRef.current = desktopSessions;
@@ -6580,13 +6056,6 @@ export default function ControlClient() {
   useEffect(() => {
     hasDesktopSessionRef.current = hasDesktopSession;
   }, [hasDesktopSession]);
-
-  // (Auto-show ThinkingPanel effect removed — thinking now renders
-  // inline in the main chat thread, no side panel involved.)
-
-  useEffect(() => {
-    setThinkingPanelManuallyHidden(false);
-  }, [setThinkingPanelManuallyHidden, viewingMissionId]);
 
   // Mission switch — wipe every state slice that's mission-bound
   // but lives in this parent component (state slices INSIDE the
@@ -6602,32 +6071,14 @@ export default function ControlClient() {
   // expanded tool groups, pending file refs, modal flags, streaming
   // delta buffers, flush timers.
   useEffect(() => {
-    // Sub-agent focus
     setActiveSubagentTab(null);
     setSubagentActivityByParent({});
-
-    // Modal / panel flags
     setShowChangesPanel(false);
     setShowRestoreModal(false);
-
-    // Tool-group expansion state
     setExpandedToolGroups(new Set());
-
-    // Pending file-open request from the chat linkifier
     setPendingFileRef(null);
-
-    // Items list (Zustand store) — old mission's events were
-    // server-side-filtered already on the SSE side, but the
-    // store itself is module-level and survives. Reset eagerly
-    // so the new mission's initial load doesn't briefly render
-    // the previous mission's tail.
     setItems([]);
     itemsRef.current = [];
-
-    // Streaming delta buffers + flush timers (already cleared
-    // by the master draft-swap effect at 6802-6819; duplicated
-    // here so the intent is in one place — both clears are
-    // idempotent).
     if (thinkingFlushTimeoutRef.current) {
       clearTimeout(thinkingFlushTimeoutRef.current);
       thinkingFlushTimeoutRef.current = null;
@@ -8442,6 +7893,27 @@ export default function ControlClient() {
       toast.error("Failed to cancel mission");
     }
   };
+
+  const handleDeleteMission = useCallback(
+    async (missionId: string, label: string) => {
+      if (
+        !window.confirm(
+          `Delete mission "${label}"? This permanently removes its events, snapshots, and pod. This cannot be undone.`,
+        )
+      ) {
+        return;
+      }
+      try {
+        await deleteMission(missionId);
+        toast.success("Mission deleted");
+        router.push("/");
+      } catch (err) {
+        console.error("Failed to delete mission:", err);
+        toast.error("Failed to delete mission");
+      }
+    },
+    [router],
+  );
 
   // Track the mission ID being fetched to prevent race conditions
   const fetchingMissionIdRef = useRef<string | null>(null);
@@ -10943,6 +10415,13 @@ export default function ControlClient() {
       enhancedInputRef.current?.clear();
       setInput("");
       saveControlDraftForMission("", targetMissionId);
+      // Force-scroll to bottom on send. The user explicitly submitted, so
+      // they want to see their own message + the "Agent is working…"
+      // indicator + the streaming response, regardless of where they had
+      // scrolled to read older context. `scrollToBottom` flips the
+      // hook's `isAtBottomRef` to true so the layout-effect auto-scroll
+      // (triggered by the new item) actually fires.
+      scrollToBottom();
 
       // Sync mission state before sending (backend needs current_mission set correctly).
       // This now happens after the optimistic row so slow mission sync does not
@@ -11030,7 +10509,13 @@ export default function ControlClient() {
         submittingRef.current = false;
       }
     },
-    [items, isBusy, applyDesktopSessionState, missionHistoryToItems],
+    [
+      items,
+      isBusy,
+      applyDesktopSessionState,
+      missionHistoryToItems,
+      scrollToBottom,
+    ],
   );
 
   const handleStop = async () => {
@@ -11388,7 +10873,9 @@ export default function ControlClient() {
     ? missionStatusLabel(activeMission.status, viewingMissionIsRunning)
     : null;
 
-  // Update favicon with mission status dot
+  // Update favicon with mission status dot. The hook is append-only —
+  // it never detaches Next.js-owned <link> elements, so the React 19
+  // commit-phase `removeChild` race on unmount is impossible.
   useFaviconStatus(activeMission?.status ?? null, viewingMissionIsRunning);
 
   // Derive the last resolved model from assistant messages (for the debug dropdown)
@@ -11400,44 +10887,14 @@ export default function ControlClient() {
     return null;
   }, [items]);
 
-  // Derive child (worker) missions from the route's current mission, not the
-  // viewed worker, so the worker strip stays visible after selecting a chip.
-  const childMissions = useMemo(() => {
-    if (!currentMission) return [];
-    return recentMissions.filter(
-      (m) => m.parent_mission_id === currentMission.id,
-    );
-  }, [currentMission, recentMissions]);
-
-  // When the viewed mission is itself a worker, surface its parent (boss) and
-  // sibling workers in the strip so the user can navigate back without going
-  // hunting in the workbench dropdown.
-  const viewingParentMission = useMemo<Mission | null>(() => {
-    const parentId = viewingMission?.parent_mission_id;
-    if (!parentId) return null;
-    return recentMissions.find((m) => m.id === parentId) ?? null;
-  }, [viewingMission?.parent_mission_id, recentMissions]);
-  const siblingMissions = useMemo(() => {
-    const parentId = viewingMission?.parent_mission_id;
-    if (!parentId) return [];
-    return recentMissions.filter((m) => m.parent_mission_id === parentId);
-  }, [viewingMission?.parent_mission_id, recentMissions]);
-  // For the strip: on a worker view, use siblings; on the boss view, use
-  // children. A single source so the strip stays self-contained.
-  const stripMissions = viewingParentMission ? siblingMissions : childMissions;
   const activeMissionRole = activeMission
     ? inferMissionRole(activeMission)
     : null;
 
   // In-mission sub-agents: Claude Code's in-process `Task` /
-  // `background_task` / `spawn_agent`. These run inside the harness
-  // process and never produce a separate mission record, so the
-  // child-mission `WorkerPanel` can't represent them — this panel does.
-  //
-  // Orchestrator MCP worker tools (`mcp__orchestrator__create_worker_mission`,
-  // `batch_create_workers`, `retask_worker`) DO produce real child missions
-  // with `parent_mission_id`; they are rendered by `WorkerPanel` instead so
-  // the same delegation isn't shown twice.
+  // `background_task` / `spawn_agent` / workflow-runtime subagents.
+  // These run inside the harness process and never produce a separate
+  // mission record — workflows orchestrate them.
   const inMissionSubagents = useMemo<SubagentEntry[]>(() => {
     const out: SubagentEntry[] = [];
     for (const item of items) {
@@ -11536,34 +10993,6 @@ export default function ControlClient() {
   }, [items]);
 
   const hasInMissionSubagents = runningSubagents.length > 0;
-  const isBossMission =
-    childMissions.length > 0 ||
-    activeMissionRole === "boss" ||
-    hasInMissionSubagents;
-
-  // Auto-show the workers/sub-agents panel ONCE per mission, the first time
-  // the active mission acquires workers or sub-agents. Tracked with a ref so
-  // a streaming mission spawning a new worker doesn't keep reopening the
-  // panel after the user has closed it.
-  useEffect(() => {
-    const missionId = activeMission?.id;
-    if (!missionId) return;
-    if (childMissions.length === 0 && !hasInMissionSubagents) return;
-    if (workerPanelDismissedRef.current.has(missionId)) return;
-    if (workerPanelAutoOpenedForRef.current === missionId) return;
-    workerPanelAutoOpenedForRef.current = missionId;
-    setShowWorkerPanel(true);
-  }, [activeMission?.id, childMissions.length, hasInMissionSubagents]);
-
-  // Stable callback: closing the panel marks the current mission as dismissed
-  // so the auto-open effect above doesn't immediately reopen it.
-  const handleCloseWorkerPanel = useCallback(() => {
-    const missionId = activeMission?.id;
-    if (missionId) {
-      workerPanelDismissedRef.current.add(missionId);
-    }
-    setShowWorkerPanel(false);
-  }, [activeMission?.id]);
 
   const handleCloseSubagentsPanel = useCallback(() => {
     const missionId = activeMission?.id;
@@ -11626,13 +11055,13 @@ export default function ControlClient() {
           narrow viewports where every pixel counts. */}
       <div className="flex h-screen flex-col p-2 sm:p-4 lg:p-6">
         {/* Always-on debug overlay so any OOM-style crash leaves a trail
-          we can reconstruct from sessionStorage after reload. Cheap:
-          a polling tick every 2s that reads performance.memory and
-          publishes a CustomEvent the parent listens to for shedding. */}
+            we can reconstruct from sessionStorage after reload. Cheap:
+            a polling tick every 2s that reads performance.memory and
+            publishes a CustomEvent the parent listens to for shedding. */}
         <MissionDebugStats items={items} visibleItems={visibleItemsLimit} />
 
         {/* Opt-in perf overlay — `?debug=perf` only. Mounts no work in normal
-          sessions; the bus and observer self-disable when the flag is off. */}
+            sessions; the bus and observer self-disable when the flag is off. */}
         <PerfOverlay />
 
         {/* Hidden file input */}
@@ -11839,57 +11268,6 @@ export default function ControlClient() {
               </button>
             )}
 
-            {/* Thinking panel toggle */}
-            <button
-              onClick={handleToggleThinkingPanel}
-              className={cn(
-                "flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-sm transition-colors",
-                showThinkingPanel
-                  ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-400"
-                  : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
-                hasActiveThinking &&
-                  !showThinkingPanel &&
-                  "border-indigo-500/50 animate-pulse-subtle",
-              )}
-              title={
-                showThinkingPanel
-                  ? "Hide thinking panel"
-                  : "Show thinking panel"
-              }
-            >
-              <Brain
-                className={cn("h-4 w-4", hasActiveThinking && "animate-pulse")}
-              />
-              <span className="hidden lg:inline">Thinking</span>
-              {thinkingItemsCount > 0 && (
-                <span className="text-xs opacity-60">{thinkingItemsCount}</span>
-              )}
-            </button>
-
-            {/* Worker panel toggle - only shown for boss missions */}
-            {isBossMission && (
-              <button
-                onClick={() => setShowWorkerPanel((prev) => !prev)}
-                className={cn(
-                  "flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-sm transition-colors",
-                  showWorkerPanel
-                    ? "border-violet-500/30 bg-violet-500/10 text-violet-400"
-                    : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
-                )}
-                title={
-                  showWorkerPanel ? "Hide worker panel" : "Show worker panel"
-                }
-              >
-                <Users className="h-4 w-4" />
-                <span className="hidden lg:inline">Workers</span>
-                {childMissions.length > 0 && (
-                  <span className="text-xs opacity-60">
-                    {childMissions.length}
-                  </span>
-                )}
-              </button>
-            )}
-
             {/* Agent tasks toggle — visible whenever the agent has emitted
                 at least one TodoWrite for this mission. Closing the panel
                 stays closed (per-mission dismiss state); this button is the
@@ -11914,6 +11292,25 @@ export default function ControlClient() {
                 <span className="text-xs opacity-60">
                   {latestAgentTodos.length}
                 </span>
+              </button>
+            )}
+
+            {/* Delete mission — destructive, confirms before firing.
+                Hidden until we have an activeMission to act on. */}
+            {activeMission && (
+              <button
+                onClick={() =>
+                  handleDeleteMission(
+                    activeMission.id,
+                    activeMission.title?.trim() ||
+                      getMissionShortName(activeMission.id),
+                  )
+                }
+                className="flex items-center gap-1.5 rounded-lg border border-rose-500/20 bg-rose-500/5 px-2.5 py-2 text-sm text-rose-300/80 transition-colors hover:border-rose-500/40 hover:bg-rose-500/10 hover:text-rose-300"
+                title="Delete this mission (cannot be undone)"
+              >
+                <Trash2 className="h-4 w-4" />
+                <span className="hidden lg:inline">Delete</span>
               </button>
             )}
 
@@ -12333,92 +11730,6 @@ export default function ControlClient() {
                       </div>
                     )}
 
-                    {/* Orchestrator: Boss with workers */}
-                    {(childMissions.length > 0 ||
-                      activeMissionRole === "boss") && (
-                      <div className="mt-2 pt-2 border-t border-white/[0.06] space-y-1 text-xs">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Role</span>
-                          <span className="font-mono text-[11px] text-violet-400">
-                            Boss
-                          </span>
-                        </div>
-                        <div className="flex items-center justify-between gap-2 mb-1">
-                          <span className="text-white/40">Workers</span>
-                          <span className="font-mono text-[11px] text-white/60">
-                            {childMissions.length}
-                          </span>
-                        </div>
-                        {childMissions.length > 0 && (
-                          <div className="space-y-0.5 max-h-[120px] overflow-y-auto">
-                            {childMissions.map((w) => (
-                              <a
-                                key={w.id}
-                                href={`/control?mission=${w.id}`}
-                                className="flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-white/[0.04] transition-colors"
-                              >
-                                <span
-                                  className={cn(
-                                    "h-1.5 w-1.5 rounded-full shrink-0",
-                                    w.status === "active" && "bg-indigo-400",
-                                    w.status === "completed" &&
-                                      "bg-emerald-400",
-                                    w.status === "failed" && "bg-red-400",
-                                    w.status === "interrupted" &&
-                                      "bg-amber-400",
-                                    w.status === "not_feasible" &&
-                                      "bg-rose-400",
-                                    ![
-                                      "active",
-                                      "completed",
-                                      "failed",
-                                      "interrupted",
-                                      "not_feasible",
-                                    ].includes(w.status) && "bg-white/30",
-                                  )}
-                                />
-                                <span className="font-mono text-[11px] text-white/70 truncate">
-                                  {w.title || w.id.slice(0, 8)}
-                                </span>
-                              </a>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    {/* Orchestrator: Worker info */}
-                    {activeMission?.parent_mission_id && (
-                      <div className="mt-2 pt-2 border-t border-white/[0.06] space-y-0.5 text-xs">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Role</span>
-                          <span className="font-mono text-[11px] text-cyan-400">
-                            Worker
-                          </span>
-                        </div>
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Boss</span>
-                          <a
-                            href={`/control?mission=${activeMission.parent_mission_id}`}
-                            className="font-mono text-[11px] text-cyan-400 hover:text-cyan-300 transition-colors select-all"
-                          >
-                            {activeMission.parent_mission_id.slice(0, 8)}
-                          </a>
-                        </div>
-                        {activeMission.working_directory && (
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-white/40">Worktree</span>
-                            <span
-                              className="font-mono text-[11px] text-white/60 truncate max-w-[160px]"
-                              title={activeMission.working_directory}
-                            >
-                              {activeMission.working_directory.split("/").pop()}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    )}
-
                     {/* Stream Status */}
                     <div
                       className={cn(
@@ -12547,19 +11858,6 @@ export default function ControlClient() {
               showDesktopStream && "flex-[2]",
             )}
           >
-            {/* Active workers strip — sticky above the scrolling messages so the
-            boss can see and hop into delegated workers without opening a side
-            panel. On a worker view it shows a "Back to Boss" pill plus sibling
-            workers so the user can navigate up or sideways without digging
-            through the workbench dropdown. Self-hides when there's nothing to
-            show. */}
-            <WorkersStrip
-              childMissions={stripMissions}
-              runningMissions={runningMissions}
-              viewingMissionId={viewingMissionId}
-              parentMission={viewingParentMission}
-              onSelectWorker={handleViewMission}
-            />
             {/* Tab strip above the chat — combines the sub-agent
                 chips (when any are running) and a `Changes` pill
                 that opens the git-diff drawer. Always renders for
@@ -13190,7 +12488,6 @@ export default function ControlClient() {
               not this column. */}
           {(showWorkbenchPanel ||
             showDesktopStream ||
-            (showWorkerPanel && isBossMission) ||
             (showSubagentsPanel && hasInMissionSubagents) ||
             (showAgentTasksPanel &&
               latestAgentTodos &&
@@ -13216,7 +12513,6 @@ export default function ControlClient() {
                   workspaceLabel={activeWorkspaceLabel}
                   role={activeMissionRole}
                   isRunning={viewingMissionIsRunning}
-                  childMissions={childMissions}
                   onClose={() => setShowWorkbenchPanel(false)}
                   onResume={handleResumeMission}
                   onCancel={handleCancelMission}
@@ -13254,45 +12550,18 @@ export default function ControlClient() {
                 />
               )}
 
-              {/* Worker Panel — real child missions (parent_mission_id) */}
-              {showWorkerPanel && isBossMission && (
-                <WorkerPanel
-                  childMissions={childMissions}
-                  runningMissions={runningMissions}
-                  bossMissionId={activeMission?.id ?? ""}
-                  viewingMissionId={viewingMissionId}
-                  onSelectWorker={(missionId) => handleViewMission(missionId)}
-                  onClose={handleCloseWorkerPanel}
-                  className={cn(
-                    // Equal vertical split with siblings instead of fixed
-                    // max-height caps. `min-h-0` is required for the inner
-                    // `overflow-y-auto` to clip rather than push the flex
-                    // child to its content height.
-                    showWorkbenchPanel ||
-                      showDesktopStream ||
-                      hasInMissionSubagents
-                      ? "flex-1 min-h-0"
-                      : "flex-1",
-                  )}
-                />
-              )}
-
-              {/* Sub-agents Panel — in-mission Task / orchestrator workers.
-                  Has its own `showSubagentsPanel` state so the user
-                  can close just this panel (was sharing the
-                  Workers-panel state which made the X button kill
-                  the wrong sidebar). Per-mission dismiss tracking
-                  via `subagentsPanelDismissedRef` so re-opening
-                  the same mission respects an explicit close. */}
+              {/* Sub-agents Panel — Claude Code's in-process Task /
+                  spawn_agent / workflow-runtime subagents. Per-mission
+                  dismiss tracking via `subagentsPanelDismissedRef` so
+                  re-opening the same mission respects an explicit
+                  close. */}
               {showSubagentsPanel && hasInMissionSubagents && (
                 <SubagentsPanel
                   subagents={inMissionSubagents}
                   onFocusItem={focusChatItem}
                   onClose={handleCloseSubagentsPanel}
                   className={cn(
-                    showWorkbenchPanel ||
-                      showDesktopStream ||
-                      childMissions.length > 0
+                    showWorkbenchPanel || showDesktopStream
                       ? "flex-1 min-h-0"
                       : "flex-1",
                   )}
@@ -13312,7 +12581,6 @@ export default function ControlClient() {
                     className={cn(
                       showWorkbenchPanel ||
                         showDesktopStream ||
-                        (showWorkerPanel && isBossMission) ||
                         (showSubagentsPanel && hasInMissionSubagents)
                         ? "flex-1 min-h-0"
                         : "flex-1",
@@ -13325,12 +12593,7 @@ export default function ControlClient() {
 
               {/* Desktop Stream Panel */}
               {showDesktopStream && (
-                <div
-                  className={cn(
-                    "min-h-0",
-                    showThinkingPanel ? "flex-1" : "flex-1",
-                  )}
-                >
+                <div className="min-h-0 flex-1">
                   <DesktopStream
                     displayId={desktopDisplayId}
                     className="h-full"

@@ -43,18 +43,26 @@ function createSliceStore<T>(initialValue: T) {
 function useSliceStore<T>(
   store: ReturnType<typeof createSliceStore<T>>,
 ): [T, (next: SetState<T>) => void] {
-  return [useSyncExternalStore(store.subscribe, store.getSnapshot), store.set];
+  return [
+    useSyncExternalStore(
+      store.subscribe,
+      store.getSnapshot,
+      // Server snapshot — needed when the component renders on
+      // the server (App Router prerender). The store's snapshot
+      // is the same value on server and client because it's
+      // initialized to a fixed default at module load. Without
+      // this fn React warns and reverts to client rendering,
+      // which used to be invisible because `<AuthGate>` always
+      // forced client render — that gate is currently bisected
+      // away so this matters.
+      store.getSnapshot,
+    ),
+    store.set,
+  ];
 }
 
 export const controlItemsStore = createSliceStore<ChatItem[]>([]);
 export const controlQueueStore = createSliceStore(0);
-export const controlThinkingStore = createSliceStore<{
-  manuallyHidden: boolean;
-  panelOpen: boolean;
-}>({
-  manuallyHidden: false,
-  panelOpen: false,
-});
 export const controlStreamingDiagnosticsStore =
   createSliceStore<StreamDiagnosticsState>({
     phase: "idle",
@@ -82,10 +90,6 @@ export function useControlItemsStore() {
 
 export function useControlQueueStore() {
   return useSliceStore(controlQueueStore);
-}
-
-export function useControlThinkingStore() {
-  return useSliceStore(controlThinkingStore);
 }
 
 export function useControlStreamingDiagnosticsStore() {

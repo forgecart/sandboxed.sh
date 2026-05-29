@@ -74,7 +74,6 @@ export function startHealthBudgetWatcher(getMissionId: () => string | null, getE
     };
     void fetch(apiUrl("/api/control/telemetry/perf"), {
       method: "POST",
-      credentials: "include",
       headers: {
         "Content-Type": "application/json",
         ...authHeader(),
