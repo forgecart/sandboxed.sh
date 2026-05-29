@@ -663,7 +663,7 @@ impl K8sPodClient {
             "k8s_pod exec_command done"
         );
 
-        let status = ExitStatus::from_raw((exit_code as i32) << 8);
+        let status = ExitStatus::from_raw(exit_code << 8);
         Ok(Output {
             status,
             stdout: output.stdout,

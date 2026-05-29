@@ -2615,7 +2615,9 @@ mod tests {
         // Sanity: a value below 60s would render the safety useless given
         // typical agent retry behavior. If you genuinely need to lower
         // this, change the test deliberately.
-        assert!(DEPLOY_DEBOUNCE_SECS >= 60);
+        // `const _: () = assert!(...)` evaluates at compile time, so the
+        // optimizer can't drop it the way it can drop a runtime `assert!(true)`.
+        const _: () = assert!(DEPLOY_DEBOUNCE_SECS >= 60);
     }
 
     // ─── Pre-existing helpers ───────────────────────────────────────────────

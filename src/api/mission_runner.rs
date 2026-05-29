@@ -5488,9 +5488,10 @@ pub fn run_claudecode_turn<'a>(
         // Without this, the watcher has no way to learn which tasks
         // exist and the 10-min sub-agent classifier never fires.
         // Maps tool_use_id -> (command, description, started_at).
-        let mut pending_bg_bashes:
-            HashMap<String, (String, Option<String>, chrono::DateTime<chrono::Utc>)> =
-            HashMap::new();
+        let mut pending_bg_bashes: HashMap<
+            String,
+            (String, Option<String>, chrono::DateTime<chrono::Utc>),
+        > = HashMap::new();
         let mut total_cost_usd: Option<f64> = None;
         let mut total_input_tokens: u64 = 0;
         let mut total_output_tokens: u64 = 0;
@@ -6995,13 +6996,8 @@ fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> 
     if haystack.len() < needle.len() || needle.is_empty() {
         return None;
     }
-
-    for idx in 0..=haystack.len() - needle.len() {
-        if starts_with_ascii_case_insensitive(&haystack[idx..], needle) {
-            return Some(idx);
-        }
-    }
-    None
+    (0..=haystack.len() - needle.len())
+        .find(|&idx| starts_with_ascii_case_insensitive(&haystack[idx..], needle))
 }
 
 #[inline]

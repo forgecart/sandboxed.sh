@@ -16,16 +16,14 @@
 //! DONE?`:
 //!
 //! - `<id>.ts`        — per-modify log: `"<file_size>\t<ISO8601>\n"`
-//!                       appended each time the output file grows. Gives
-//!                       the classifier our observed arrival timestamps
-//!                       (we can't get the program's own wall-clock
-//!                       timestamps without wrapping the command).
+//!   appended each time the output file grows. Gives the classifier our
+//!   observed arrival timestamps (we can't get the program's own
+//!   wall-clock timestamps without wrapping the command).
 //! - `<id>.pid`       — single line: the Linux PID that owns the
-//!                       output-file FD (via lsof on first create).
-//!                       Backend uses this for `ps -o ...`.
+//!   output-file FD (via lsof on first create). Backend uses this for
+//!   `ps -o ...`.
 //! - `<id>.complete`  — empty marker, touched on IN_CLOSE_WRITE of the
-//!                       output file. Tells the classifier the process
-//!                       has exited.
+//!   output file. Tells the classifier the process has exited.
 //!
 //! The daemon holds no critical state — every observation is persisted
 //! to disk immediately, so a crash + respawn loses at most one chunk's
@@ -72,8 +70,11 @@ fn main() -> Result<()> {
     info!(?roots, "bg-watchd starting");
 
     let (tx, rx) = channel::<notify::Result<Event>>();
-    let mut watcher = RecommendedWatcher::new(tx, Config::default().with_poll_interval(Duration::from_secs(2)))
-        .context("Failed to construct inotify watcher")?;
+    let mut watcher = RecommendedWatcher::new(
+        tx,
+        Config::default().with_poll_interval(Duration::from_secs(2)),
+    )
+    .context("Failed to construct inotify watcher")?;
 
     // Best-effort: ensure each root exists and is watched. Roots may not
     // exist yet on a freshly-booted pod (Claude Code creates them on
@@ -139,7 +140,9 @@ fn handle_event(event: &Event) -> Result<()> {
     // canonical stream; everything else (skills/, plans/, etc.) is
     // out of scope.
     for path in &event.paths {
-        let Some(stem) = output_stem(path) else { continue };
+        let Some(stem) = output_stem(path) else {
+            continue;
+        };
         let parent = match path.parent() {
             Some(p) => p,
             None => continue,
@@ -247,10 +250,7 @@ fn write_file(path: &Path, contents: &[u8]) -> Result<()> {
 /// Use `lsof -t -- <path>` to find a process holding the file open
 /// for write. Returns `Ok(None)` when no writer is currently attached.
 fn lsof_writer_pid(path: &Path) -> Result<Option<u32>> {
-    let out = Command::new("lsof")
-        .args(["-t", "--"])
-        .arg(path)
-        .output();
+    let out = Command::new("lsof").args(["-t", "--"]).arg(path).output();
     let out = match out {
         Ok(o) => o,
         // lsof may not be installed on minimal images; degrade gracefully.

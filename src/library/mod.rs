@@ -505,6 +505,7 @@ impl LibraryStore {
     }
 
     /// Recursively collect .md files and references.
+    #[allow(clippy::only_used_in_recursion)]
     #[async_recursion::async_recursion]
     async fn collect_skill_files_recursive(
         &self,

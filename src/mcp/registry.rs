@@ -249,13 +249,7 @@ impl McpRegistry {
         engram.scope = McpScope::Workspace;
         engram.default_enabled = false;
 
-        vec![
-            workspace,
-            desktop,
-            playwright,
-            automation_manager,
-            engram,
-        ]
+        vec![workspace, desktop, playwright, automation_manager, engram]
     }
 
     async fn ensure_defaults(
@@ -374,10 +368,7 @@ impl McpRegistry {
 
         // Ensure built-in MCPs have default_enabled = true (migrate old configs).
         for config in configs.iter_mut() {
-            if !matches!(
-                config.name.as_str(),
-                "workspace" | "desktop" | "playwright"
-            ) {
+            if !matches!(config.name.as_str(), "workspace" | "desktop" | "playwright") {
                 continue;
             }
 

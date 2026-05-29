@@ -2492,8 +2492,8 @@ fn build_anthropic_upstream_request(
     if is_stream {
         out.insert("stream".to_string(), serde_json::Value::Bool(true));
     }
-    let omit_sampling_params = model_id.contains("claude-opus-4-7")
-        || model_id.contains("claude-opus-4-8");
+    let omit_sampling_params =
+        model_id.contains("claude-opus-4-7") || model_id.contains("claude-opus-4-8");
     for key in ["temperature", "top_p", "top_k"] {
         if omit_sampling_params {
             continue;

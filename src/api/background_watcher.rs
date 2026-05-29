@@ -174,7 +174,9 @@ pub fn parse_bg_tool_result(content: &str) -> Option<(String, String)> {
     let path_marker = "Output is being written to: ";
     let id_start = content.find(id_marker)? + id_marker.len();
     let id_rest = &content[id_start..];
-    let id_end = id_rest.find('.').or_else(|| id_rest.find(char::is_whitespace))?;
+    let id_end = id_rest
+        .find('.')
+        .or_else(|| id_rest.find(char::is_whitespace))?;
     let shell_id = id_rest[..id_end].trim().to_string();
 
     let path_start = content.find(path_marker)? + path_marker.len();
@@ -266,9 +268,7 @@ pub fn format_classifier_prompt(
     let log_block = if omitted == 0 {
         output_head.to_string()
     } else {
-        format!(
-            "{output_head}\n<<< … omitted {omitted} bytes … >>>\n{output_tail}"
-        )
+        format!("{output_head}\n<<< … omitted {omitted} bytes … >>>\n{output_tail}")
     };
 
     format!(
@@ -311,7 +311,6 @@ pub fn format_classifier_prompt(
 /// noise.
 pub fn parse_verdict(reply: &str) -> Verdict {
     let token = reply
-        .trim()
         .split_whitespace()
         .next()
         .unwrap_or("")
@@ -551,6 +550,9 @@ async fn fetch_task_state(
     task: &BgTask,
 ) -> Result<TaskState> {
     let base = task.output_path.trim_end_matches(".output");
+    let ts_path = format!("{base}.ts");
+    let complete_path = format!("{base}.complete");
+    let pid_path = format!("{base}.pid");
     // One heredoc bundles four reads + a stat; the magic markers let us
     // demux the outputs in Rust without piping each through its own
     // exec round-trip.
@@ -572,7 +574,7 @@ test -f {complete} && echo YES || echo NO
 echo "===PS==="
 pid=$(cat {pid} 2>/dev/null | head -n 1 | tr -d '[:space:]')
 if [ -n "${{pid}}" ]; then
-  ps -o pid,%cpu,%mem,rss,stat,etime -p "${{pid}}" 2>/dev/null || echo "(pid {pid_val} no longer present)"
+  ps -o pid,%cpu,%mem,rss,stat,etime -p "${{pid}}" 2>/dev/null || echo "(pid $pid no longer present)"
 else
   echo "(no pid sidecar)"
 fi
@@ -580,10 +582,9 @@ echo "===END==="
 "#,
         cap = OUTPUT_CAP_EACH,
         out = task.output_path,
-        ts = format!("{base}.ts"),
-        complete = format!("{base}.complete"),
-        pid = format!("{base}.pid"),
-        pid_val = "$pid",
+        ts = ts_path,
+        complete = complete_path,
+        pid = pid_path,
     );
 
     let cwd = std::path::Path::new("/tmp");
@@ -607,7 +608,10 @@ fn parse_state_blob(blob: &str, task: &BgTask) -> Result<TaskState> {
     let last_output_at = ts_section
         .lines()
         .rev()
-        .find_map(|l| l.split_once('\t').and_then(|(_, ts)| DateTime::parse_from_rfc3339(ts.trim()).ok()))
+        .find_map(|l| {
+            l.split_once('\t')
+                .and_then(|(_, ts)| DateTime::parse_from_rfc3339(ts.trim()).ok())
+        })
         .map(|dt| dt.with_timezone(&Utc));
     let is_complete = complete_str.trim().eq_ignore_ascii_case("YES");
     let pid_stats = {
@@ -662,11 +666,7 @@ async fn invoke_classifier(
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-async fn send_inject(
-    deps: &WatcherDeps,
-    mission_id: Uuid,
-    content: String,
-) {
+async fn send_inject(deps: &WatcherDeps, mission_id: Uuid, content: String) {
     if let Err(e) = deps
         .cmd_tx
         .send(crate::api::control::ControlCommand::InjectSystemReminder {
@@ -695,15 +695,26 @@ mod tests {
                        You will be notified when it completes.";
         let (id, path) = parse_bg_tool_result(content).expect("should parse");
         assert_eq!(id, "b34zlqmjb");
-        assert_eq!(path, "/tmp/claude-0/-workspaces/c74c8269/tasks/b34zlqmjb.output");
+        assert_eq!(
+            path,
+            "/tmp/claude-0/-workspaces/c74c8269/tasks/b34zlqmjb.output"
+        );
     }
 
     #[test]
     fn parses_truthy_run_in_background_flag() {
-        assert!(is_run_in_background(&serde_json::json!({"run_in_background": true})));
-        assert!(is_run_in_background(&serde_json::json!({"run_in_background": 1})));
-        assert!(is_run_in_background(&serde_json::json!({"run_in_background": "true"})));
-        assert!(!is_run_in_background(&serde_json::json!({"run_in_background": false})));
+        assert!(is_run_in_background(
+            &serde_json::json!({"run_in_background": true})
+        ));
+        assert!(is_run_in_background(
+            &serde_json::json!({"run_in_background": 1})
+        ));
+        assert!(is_run_in_background(
+            &serde_json::json!({"run_in_background": "true"})
+        ));
+        assert!(!is_run_in_background(
+            &serde_json::json!({"run_in_background": false})
+        ));
         assert!(!is_run_in_background(&serde_json::json!({})));
     }
 
@@ -713,7 +724,10 @@ mod tests {
         assert_eq!(parse_verdict("  stuck "), Verdict::Stuck);
         assert_eq!(parse_verdict("PROGRESSING\n"), Verdict::Progressing);
         assert_eq!(parse_verdict("**Done**"), Verdict::Done);
-        assert_eq!(parse_verdict("I think the task is DONE"), Verdict::Progressing);
+        assert_eq!(
+            parse_verdict("I think the task is DONE"),
+            Verdict::Progressing
+        );
         assert_eq!(parse_verdict(""), Verdict::Progressing);
         assert_eq!(parse_verdict("garbage"), Verdict::Progressing);
     }
