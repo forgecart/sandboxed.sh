@@ -1739,7 +1739,9 @@ fn rewrite_model_for_anthropic_cli_proxy(
     let mut value: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))?;
     value["model"] = serde_json::Value::String(new_model.to_string());
-    if new_model.contains("claude-opus-4-7") {
+    // Adaptive-thinking Opus models (4.7+) reject `temperature`/`top_p`/
+    // `top_k`. Strip them so the CLI-proxied call doesn't 400.
+    if new_model.contains("claude-opus-4-7") || new_model.contains("claude-opus-4-8") {
         if let Some(obj) = value.as_object_mut() {
             for key in ["temperature", "top_p", "top_k"] {
                 obj.remove(key);
@@ -2490,7 +2492,8 @@ fn build_anthropic_upstream_request(
     if is_stream {
         out.insert("stream".to_string(), serde_json::Value::Bool(true));
     }
-    let omit_sampling_params = model_id.contains("claude-opus-4-7");
+    let omit_sampling_params = model_id.contains("claude-opus-4-7")
+        || model_id.contains("claude-opus-4-8");
     for key in ["temperature", "top_p", "top_k"] {
         if omit_sampling_params {
             continue;

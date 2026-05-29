@@ -2258,7 +2258,7 @@ pub(crate) async fn resolve_claudecode_default_model(
 ) -> Option<String> {
     // Keep this fallback aligned with Anthropic's model catalog:
     // https://docs.anthropic.com/en/docs/about-claude/models/overview
-    const CLAUDECODE_DEFAULT_MODEL: &str = "claude-opus-4-7";
+    const CLAUDECODE_DEFAULT_MODEL: &str = "claude-opus-4-8";
 
     let lib = {
         let guard = library.read().await;
