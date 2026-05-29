@@ -26,7 +26,6 @@ RUN mkdir -p src/bin \
     && echo "fn main() {}" > src/main.rs \
     && echo "fn main() {}" > src/bin/desktop_mcp.rs \
     && echo "fn main() {}" > src/bin/workspace_mcp.rs \
-    && echo "fn main() {}" > src/bin/orchestrator_mcp.rs \
     && cargo build --release --lib 2>/dev/null || true \
     && cargo build --release 2>/dev/null || true
 
@@ -35,7 +34,7 @@ RUN mkdir -p src/bin \
 # to bake skill manifests + workspace templates into the binary at compile time.
 COPY src/ src/
 COPY bundled-library/ bundled-library/
-RUN cargo build --release --bin sandboxed-sh --bin desktop-mcp --bin workspace-mcp --bin orchestrator-mcp
+RUN cargo build --release --bin sandboxed-sh --bin desktop-mcp --bin workspace-mcp
 
 # ---------------------------------------------------------------------------
 # Stage 2: Dashboard builder
@@ -116,7 +115,6 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 COPY --from=rust-builder /build/target/release/sandboxed-sh /usr/local/bin/sandboxed-sh
 COPY --from=rust-builder /build/target/release/desktop-mcp /usr/local/bin/desktop-mcp
 COPY --from=rust-builder /build/target/release/workspace-mcp /usr/local/bin/workspace-mcp
-COPY --from=rust-builder /build/target/release/orchestrator-mcp /usr/local/bin/orchestrator-mcp
 
 # -- Copy dashboard standalone build ------------------------------------------
 COPY --from=dashboard-builder /build/dashboard/.next/standalone /opt/dashboard
