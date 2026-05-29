@@ -19,10 +19,10 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use k8s_openapi::api::core::v1::{
-    ConfigMap, ConfigMapVolumeSource, Container, EnvFromSource, KeyToPath, LocalObjectReference,
+    ConfigMap, ConfigMapVolumeSource, Container, KeyToPath, LocalObjectReference,
     PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, Pod,
-    PodSecurityContext, PodSpec, ResourceRequirements, SecretEnvSource, SecurityContext, Volume,
-    VolumeMount, VolumeResourceRequirements,
+    PodSecurityContext, PodSpec, ResourceRequirements, SecurityContext, Volume, VolumeMount,
+    VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -137,14 +137,6 @@ const STORAGE_CLASS: &str = "harvester";
 const WORKSPACES_VOLUME_SIZE: &str = "20Gi";
 const DOCKER_VOLUME_SIZE: &str = "20Gi";
 const PULL_SECRET_DEFAULT: &str = "nexus-registry";
-
-/// Kubernetes Secret consumed by every mission pod via
-/// `envFrom: secretRef`. Built by Terraform from
-/// `application/modules/deployments/sandboxed-sh/env.defaults`
-/// (plus the dynamically-generated KUBECONFIG_CONTENT). Edits to
-/// env.defaults + `terraform apply` reach every new mission pod
-/// without touching this file — that's the point.
-const MISSION_ENV_SECRET: &str = "sandboxed-sh-mission-env";
 
 /// Per-mission Pod / PVC / ConfigMap name. Keyed on mission_id, not
 /// workspace_id, since each mission gets its own pod. Prefix `m-`
@@ -443,32 +435,22 @@ impl K8sPodClient {
             });
         }
 
-        // The mission pod's full default env surface comes from
-        // `sandboxed-sh-mission-env` (built by HCL from
-        // application/modules/deployments/sandboxed-sh/env.defaults
-        // — see the `mission_env` local + `kubernetes_secret
-        // .sandboxed_sh_mission_env` resource). Attached via
-        // `envFrom: secretRef` so adding a key to env.defaults +
-        // terraform apply is the full path to make it available
-        // to every new mission pod; nothing here needs to change.
+        // No host-side env flows into mission pods. The previous
+        // design attached the `sandboxed-sh-mission-env` Secret via
+        // `envFrom: secretRef`, which pushed env.defaults (DB creds,
+        // ANTHROPIC_API_KEY, registry token, …) into every mission
+        // pod regardless of which workspace it belonged to. That
+        // (a) leaked host-controlled state into customer workspaces
+        // and (b) overloaded `ANTHROPIC_API_KEY` between operator
+        // (Claude Code auth) and customer (linter / app) semantics.
         //
-        // Workspace-supplied env_vars below go in the container's
-        // `env:` list, which Kubernetes gives precedence over
-        // envFrom on key conflicts — workspaces can still override
-        // any value from the mission-env Secret.
-        // `optional: true` so a freshly-built control plane doesn't
-        // get stuck creating mission pods if the Secret hasn't been
-        // applied yet (e.g. the operator pushed code before
-        // `terraform apply`). Mission pods will start with only the
-        // workspace-supplied env until the Secret lands; on next
-        // pod recreation they pick it up.
-        let env_from = vec![EnvFromSource {
-            secret_ref: Some(SecretEnvSource {
-                name: MISSION_ENV_SECRET.to_string(),
-                optional: Some(true),
-            }),
-            ..Default::default()
-        }];
+        // The full env surface a mission pod sees now comes from
+        // `workspace.env_vars` — managed per-workspace via the
+        // dashboard's workspace edit UI. Forgecart-specific defaults
+        // live on the forgecart workspace's `env_vars`. The Claude
+        // Code operator credential is injected per-subprocess by
+        // `mission_runner` (as `CLAUDE_CODE_OAUTH_TOKEN`) and never
+        // appears in the pod env, so customer code can't read it.
 
         let env_list = env_vars
             .iter()
@@ -493,7 +475,6 @@ impl K8sPodClient {
             // cached, every subsequent mission on that node skips the
             // 30-60s pull. First mission per node still pays the cost.
             image_pull_policy: Some("IfNotPresent".to_string()),
-            env_from: Some(env_from),
             env: if env_list.is_empty() {
                 None
             } else {

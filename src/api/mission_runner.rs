@@ -4807,17 +4807,18 @@ pub fn run_claudecode_turn<'a>(
                         }
                         Err(e) => {
                             tracing::warn!("Failed to get Claude API key from secrets: {}", e);
-                            // Fall back to environment variable
+                            // Operator credential only lives under
+                            // CLAUDE_CODE_OAUTH_TOKEN now. Don't fall back
+                            // to ANTHROPIC_API_KEY — that's the customer's
+                            // key for linters / app code.
                             std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
                                 .ok()
-                                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
                                 .map(classify_claudecode_secret)
                         }
                     }
                 } else {
                     std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
                         .ok()
-                        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
                         .map(classify_claudecode_secret)
                 }
             }
@@ -4839,7 +4840,7 @@ pub fn run_claudecode_turn<'a>(
         // - Claude CLI credentials are available (copied into the mission directory), nor
         // - We have explicit API auth to inject via env vars.
         if api_auth.is_none() && !has_cli_creds && proxy_auth.is_none() {
-            let err_msg = "No Claude Code credentials detected. Either run `claude /login` on the host, or authenticate in Settings → AI Providers / set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.";
+            let err_msg = "No Claude Code credentials detected. Either run `claude /login` on the host, or authenticate in Settings → AI Providers / set CLAUDE_CODE_OAUTH_TOKEN. (ANTHROPIC_API_KEY is reserved for customer code in the workspace — the operator credential lives under CLAUDE_CODE_OAUTH_TOKEN to avoid collision.)";
             tracing::warn!(mission_id = %mission_id, "{}", err_msg);
             return AgentResult::failure(err_msg.to_string(), 0)
                 .with_terminal_reason(TerminalReason::LlmError);
@@ -5224,6 +5225,15 @@ pub fn run_claudecode_turn<'a>(
             match auth {
                 ClaudeCodeAuth::OAuthToken(token) => {
                     env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone());
+                    // The mission pod likely carries a CUSTOMER
+                    // `ANTHROPIC_API_KEY` (for linters / app code via
+                    // the forgecart workspace's env_vars). Override it
+                    // to empty for the Claude Code subprocess only, so
+                    // the CLI uses our OAuth token instead of being
+                    // fooled into authenticating as the customer. The
+                    // workspace's pod env is unchanged — only this
+                    // single subprocess sees the empty value.
+                    env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
                     tracing::debug!(
                         "Injecting OAuth token for Claude CLI authentication (token_len={})",
                         token.len()
@@ -5472,6 +5482,15 @@ pub fn run_claudecode_turn<'a>(
         // a successful tool result into an open_agent wakeup automation.
         // Maps tool_use_id -> (delay_seconds, prompt, reason).
         let mut pending_wakeups: HashMap<String, (u64, String, String)> = HashMap::new();
+        // Track Bash(run_in_background:true) tool_use events so we can
+        // register the resulting shell ID + output path on the global
+        // background-bash watcher when the matching tool_result arrives.
+        // Without this, the watcher has no way to learn which tasks
+        // exist and the 10-min sub-agent classifier never fires.
+        // Maps tool_use_id -> (command, description, started_at).
+        let mut pending_bg_bashes:
+            HashMap<String, (String, Option<String>, chrono::DateTime<chrono::Utc>)> =
+            HashMap::new();
         let mut total_cost_usd: Option<f64> = None;
         let mut total_input_tokens: u64 = 0;
         let mut total_output_tokens: u64 = 0;
@@ -5891,6 +5910,28 @@ pub fn run_claudecode_turn<'a>(
                                                     mission_id: Some(mission_id),
                                                 });
 
+                                                // Capture Bash(run_in_background:true) so we
+                                                // can register the resulting shell ID with the
+                                                // global background watcher on ToolResult.
+                                                // See `src/api/background_watcher.rs`.
+                                                if name == "Bash"
+                                                    && crate::api::background_watcher::is_run_in_background(&input)
+                                                {
+                                                    let command = input
+                                                        .get("command")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("")
+                                                        .to_string();
+                                                    let description = input
+                                                        .get("description")
+                                                        .and_then(|v| v.as_str())
+                                                        .map(|s| s.to_string());
+                                                    pending_bg_bashes.insert(
+                                                        id.clone(),
+                                                        (command, description, chrono::Utc::now()),
+                                                    );
+                                                }
+
                                                 // Capture args from Claude Code's built-in
                                                 // ScheduleWakeup so the matching ToolResult
                                                 // can turn it into a real wakeup automation.
@@ -6161,6 +6202,49 @@ pub fn run_claudecode_turn<'a>(
                                                     mission_id = %mission_id,
                                                     "All observed Claude tool results completed; waiting for terminal result"
                                                 );
+                                            }
+
+                                            // Register the resulting shell ID + output
+                                            // path on the global background-bash watcher
+                                            // when this is the tool_result for a
+                                            // run_in_background:true Bash invocation. The
+                                            // result string carries
+                                            //   "Command running in background with ID: <id>.
+                                            //    Output is being written to: <path>. …"
+                                            // and we extract both from there.
+                                            if let Some((command, description, started_at)) =
+                                                pending_bg_bashes.remove(&tool_use_id)
+                                            {
+                                                let content_str = content.to_string_lossy();
+                                                if let Some((shell_id, output_path)) =
+                                                    crate::api::background_watcher::parse_bg_tool_result(
+                                                        &content_str,
+                                                    )
+                                                {
+                                                    if let Some(watcher) =
+                                                        crate::api::background_watcher::global_watcher()
+                                                    {
+                                                        let task =
+                                                            crate::api::background_watcher::BgTask {
+                                                                shell_id: shell_id.clone(),
+                                                                command,
+                                                                description,
+                                                                output_path,
+                                                                tool_use_id: tool_use_id.clone(),
+                                                                started_at,
+                                                            };
+                                                        let mid = mission_id;
+                                                        let w = watcher.clone();
+                                                        tokio::spawn(async move {
+                                                            w.register(mid, task).await;
+                                                        });
+                                                        tracing::info!(
+                                                            mission_id = %mission_id,
+                                                            shell_id = %shell_id,
+                                                            "bg-watcher: registered background bash"
+                                                        );
+                                                    }
+                                                }
                                             }
 
                                             // Convert a successful Claude built-in

@@ -24,7 +24,15 @@ impl Default for ClaudeCodeConfig {
     fn default() -> Self {
         Self {
             cli_path: std::env::var("CLAUDE_CLI_PATH").unwrap_or_else(|_| "claude".to_string()),
-            api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
+            // The operator's Claude Code credential lives under
+            // `CLAUDE_CODE_OAUTH_TOKEN` to keep it from colliding with
+            // `ANTHROPIC_API_KEY`, which mission pods now carry as the
+            // CUSTOMER's key (via the forgecart workspace's `env_vars`)
+            // for use by linters / app code. Don't fall back to
+            // `ANTHROPIC_API_KEY` — that's a different credential
+            // semantically and falling back would re-introduce the
+            // collision.
+            api_key: std::env::var("CLAUDE_CODE_OAUTH_TOKEN").ok(),
             default_model: None,
         }
     }
@@ -75,16 +83,24 @@ impl ClaudeCodeClient {
             .arg("--include-partial-messages");
         // Note: --dangerously-skip-permissions cannot be used when running as root
 
-        // Set API key or OAuth token if configured
-        // OAuth tokens start with "sk-ant-oat" and must use CLAUDE_CODE_OAUTH_TOKEN
-        // API keys start with "sk-ant-api" and use ANTHROPIC_API_KEY
+        // Strip any inherited `ANTHROPIC_API_KEY` from the subprocess env
+        // before we set the operator's credential. Mission pods now carry
+        // a CUSTOMER `ANTHROPIC_API_KEY` (set via the forgecart workspace's
+        // `env_vars` for linters / app code); Claude Code's CLI would
+        // otherwise prefer that inherited value over our explicitly-set
+        // `CLAUDE_CODE_OAUTH_TOKEN`, causing it to authenticate as the
+        // customer instead of the operator. `env_remove` makes sure the
+        // CLI never sees it.
+        cmd.env_remove("ANTHROPIC_API_KEY");
+
+        // Set the operator's credential. OAuth tokens (`sk-ant-oat…`) use
+        // `CLAUDE_CODE_OAUTH_TOKEN`; API keys (`sk-ant-api…`) use
+        // `ANTHROPIC_API_KEY` per Claude Code's expected env-var naming.
         if let Some(ref key) = self.config.api_key {
             if key.starts_with("sk-ant-oat") {
-                // OAuth access token
                 cmd.env("CLAUDE_CODE_OAUTH_TOKEN", key);
                 debug!("Using OAuth token for Claude CLI authentication");
             } else {
-                // Regular API key
                 cmd.env("ANTHROPIC_API_KEY", key);
                 debug!("Using API key for Claude CLI authentication");
             }
