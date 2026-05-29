@@ -72,6 +72,11 @@ portable-pty = "0.9"
 md5 = "0.7"
 tokio-util = { version = "0.7", features = ["io"] }
 
+# Filesystem event watching for the background-task daemon (bg-watchd).
+# Auto-debounces and follows symlinks; we use the cross-platform inotify
+# backend on Linux.
+notify = "6"
+
 # Backup/restore
 zip = "2"
 # Keep MSRV-compatible idna_adapter for the production builder (rustc 1.75).
@@ -112,6 +117,10 @@ path = "src/bin/automation_manager_mcp.rs"
 [[bin]]
 name = "fido-agent-proxy"
 path = "src/bin/fido_agent_proxy.rs"
+
+[[bin]]
+name = "bg-watchd"
+path = "src/bin/bg_watchd.rs"
 
 [dev-dependencies]
 tokio-test = "0.4"

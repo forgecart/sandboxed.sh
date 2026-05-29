@@ -10,6 +10,7 @@ cleanup() {
     echo "[entrypoint] shutting down..."
     kill "$BACKEND_PID" "$DASHBOARD_PID" 2>/dev/null || true
     [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null || true
+    [ -n "$BG_WATCHD_PID" ] && kill "$BG_WATCHD_PID" 2>/dev/null || true
     wait
 }
 trap cleanup SIGTERM SIGINT
@@ -58,6 +59,20 @@ if [ "${DESKTOP_ENABLED:-false}" = "true" ]; then
     xset -dpms 2>/dev/null || true
     xset s noblank 2>/dev/null || true
     xsetroot -solid "#1a1a2e" 2>/dev/null || true
+fi
+
+# -- Start bg-watchd ----------------------------------------------------------
+# Pod-side daemon that produces sidecar files (<id>.ts / <id>.pid /
+# <id>.complete) next to every background-bash output file under
+# Claude Code's tasks dirs. The backend's background-bash watcher tick
+# reads those sidecars to ask its sub-agent classifier whether each
+# pending task is STUCK / PROGRESSING / DONE. Crash-safe (the daemon
+# holds no critical state; every observation is persisted to disk
+# immediately). Disable with SANDBOXED_SH_DISABLE_BG_WATCHD=1.
+if [ "${SANDBOXED_SH_DISABLE_BG_WATCHD:-0}" != "1" ]; then
+    echo "[entrypoint] starting bg-watchd"
+    bg-watchd &
+    BG_WATCHD_PID=$!
 fi
 
 # -- Start Rust backend -------------------------------------------------------

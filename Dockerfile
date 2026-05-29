@@ -34,7 +34,7 @@ RUN mkdir -p src/bin \
 # to bake skill manifests + workspace templates into the binary at compile time.
 COPY src/ src/
 COPY bundled-library/ bundled-library/
-RUN cargo build --release --bin sandboxed-sh --bin desktop-mcp --bin workspace-mcp
+RUN cargo build --release --bin sandboxed-sh --bin desktop-mcp --bin workspace-mcp --bin bg-watchd
 
 # ---------------------------------------------------------------------------
 # Stage 2: Dashboard builder
@@ -64,6 +64,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 # -- Core system deps --------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl jq unzip openssh-client ca-certificates gnupg \
+    # lsof: used by bg-watchd to discover which PID owns a backgrounded
+    # bash task's .output file. procps gives us `ps` for the same
+    # daemon's PID-stats path.
+    lsof procps \
     # nspawn / container workspaces
     systemd-container debootstrap \
     # Desktop automation
@@ -115,6 +119,7 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 COPY --from=rust-builder /build/target/release/sandboxed-sh /usr/local/bin/sandboxed-sh
 COPY --from=rust-builder /build/target/release/desktop-mcp /usr/local/bin/desktop-mcp
 COPY --from=rust-builder /build/target/release/workspace-mcp /usr/local/bin/workspace-mcp
+COPY --from=rust-builder /build/target/release/bg-watchd /usr/local/bin/bg-watchd
 
 # -- Copy dashboard standalone build ------------------------------------------
 COPY --from=dashboard-builder /build/dashboard/.next/standalone /opt/dashboard

@@ -3131,6 +3131,16 @@ pub enum ControlCommand {
     ClearQueue {
         respond: oneshot::Sender<usize>, // number of messages cleared
     },
+    /// Inject a server-side `<system-reminder>` payload into a specific
+    /// mission's FIFO queue. Used by the background-bash watcher to
+    /// deliver the completion callback that `--print` mode otherwise
+    /// drops on the floor. The content is enqueued like a user message
+    /// and processed by the runner's next turn; wrapping in
+    /// `<system-reminder>` tags is the caller's responsibility.
+    InjectSystemReminder {
+        mission_id: Uuid,
+        content: String,
+    },
 }
 
 // ==================== Mission Types ====================
@@ -3316,6 +3326,11 @@ pub struct ControlState {
     pub mission_store: Arc<dyn MissionStore>,
     /// Cache for semantic mission search results keyed by normalized query hash
     pub mission_search_cache: Arc<RwLock<HashMap<u64, MissionSearchCacheEntry>>>,
+    /// Per-mission registry of pending background bash tasks. The bg-watcher
+    /// tick loop reads this; the claudecode stream interceptor in
+    /// `mission_runner::run_mission_turn` writes to it on every
+    /// `Bash(run_in_background:true)` tool_use → tool_result pair.
+    pub bg_watcher: super::background_watcher::SharedBackgroundWatcher,
 }
 
 /// Control session manager for per-user sessions.
@@ -6204,6 +6219,9 @@ fn spawn_control_session(
         });
     }
 
+    let bg_watcher = super::background_watcher::SharedBackgroundWatcher::new();
+    super::background_watcher::install_global_watcher(bg_watcher.clone());
+
     let state = ControlState {
         cmd_tx,
         events_tx: events_tx.clone(),
@@ -6217,6 +6235,7 @@ fn spawn_control_session(
         max_parallel,
         mission_store: Arc::clone(&mission_store),
         mission_search_cache,
+        bg_watcher: bg_watcher.clone(),
     };
 
     // Spawn the main control actor
@@ -6281,6 +6300,18 @@ fn spawn_control_session(
             Arc::clone(&state.mission_store),
             state.cmd_tx.clone(),
             events_tx.clone(),
+        ));
+        // Background-bash watcher: per-mission 10-min tick that asks a
+        // sub-agent (same model as the main mission) to classify each
+        // pending bg task as STUCK / PROGRESSING / DONE. See
+        // `src/api/background_watcher.rs` for the full story.
+        tokio::spawn(super::background_watcher::tick_loop(
+            super::background_watcher::WatcherDeps {
+                watcher: state.bg_watcher.clone(),
+                cmd_tx: state.cmd_tx.clone(),
+                mission_store: Arc::clone(&state.mission_store),
+                workspaces: workspaces.clone(),
+            },
         ));
         tokio::spawn(ack_promotion_loop(
             Arc::clone(&state.mission_store),
@@ -10331,6 +10362,46 @@ async fn control_actor_loop(
 
                         tracing::info!("Cleared {} total queued messages (main + parallel)", cleared);
                         let _ = respond.send(cleared);
+                    }
+                    ControlCommand::InjectSystemReminder { mission_id, content } => {
+                        // Route the reminder to the runner that owns the target
+                        // mission — main if it matches `running_mission_id`,
+                        // otherwise the parallel-runner map. If neither hosts
+                        // the mission right now (e.g. it just finished and was
+                        // garbage-collected) we drop the reminder; the bg
+                        // watcher will retry on its next tick if the task is
+                        // still registered.
+                        if running_mission_id == Some(mission_id) {
+                            queue.push_back((Uuid::new_v4(), content, None, Some(mission_id)));
+                            tracing::info!(mission_id = %mission_id, "bg-watcher reminder queued onto main runner");
+                        } else if let Some(runner) = parallel_runners.get_mut(&mission_id) {
+                            let id = Uuid::new_v4();
+                            runner.queue_message(id, content, None);
+                            tracing::info!(mission_id = %mission_id, "bg-watcher reminder queued onto parallel runner");
+                            // Try to start the parallel runner if it's idle so the
+                            // reminder actually gets processed instead of sitting in
+                            // a stalled queue.
+                            if !runner.is_running() {
+                                runner.start_next(
+                                    config.clone(),
+                                    Arc::clone(&root_agent),
+                                    Arc::clone(&mcp),
+                                    Arc::clone(&workspaces),
+                                    library.clone(),
+                                    events_tx.clone(),
+                                    Arc::clone(&tool_hub),
+                                    Arc::clone(&status),
+                                    mission_cmd_tx.clone(),
+                                    Arc::new(RwLock::new(Some(mission_id))),
+                                    secrets.clone(),
+                                );
+                            }
+                        } else {
+                            tracing::debug!(
+                                mission_id = %mission_id,
+                                "bg-watcher reminder for unknown mission; dropping"
+                            );
+                        }
                     }
                 }
             }
