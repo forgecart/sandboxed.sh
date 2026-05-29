@@ -4106,6 +4106,66 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn copy_events_into(
+        &self,
+        source_mission_id: Uuid,
+        target_mission_id: Uuid,
+        up_to_sequence: Option<i64>,
+    ) -> Result<usize, String> {
+        // `id` is AUTOINCREMENT (omitted from the column list — sqlite
+        // generates fresh rowids per insert). `sequence` is preserved
+        // as-is: it's per-mission monotonic, not global, so reusing
+        // the source's values under the new mission_id is consistent
+        // and keeps the fork's ordering identical to the source.
+        //
+        // `REPLACE(content / metadata, src_uuid, dst_uuid)` rewrites
+        // the handful of event types that embed the mission's own
+        // UUID in their JSON payload (e.g. `mission_status_changed`,
+        // `mission_metadata_updated`, `goal_iteration`). A literal
+        // substring swap is safe — UUIDs are unique enough that we
+        // won't accidentally rewrite an unrelated 36-char span.
+        let conn = self.conn.clone();
+        let src = source_mission_id.to_string();
+        let dst = target_mission_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<usize, String> {
+            let conn = conn.blocking_lock();
+            let inserted: usize = if let Some(max_seq) = up_to_sequence {
+                conn.execute(
+                    "INSERT INTO mission_events \
+                       (mission_id, sequence, event_type, timestamp, event_id, \
+                        tool_call_id, tool_name, content, content_file, metadata) \
+                     SELECT ?2, sequence, event_type, timestamp, event_id, \
+                            tool_call_id, tool_name, \
+                            REPLACE(content, ?1, ?2), \
+                            content_file, \
+                            REPLACE(metadata, ?1, ?2) \
+                     FROM mission_events \
+                     WHERE mission_id = ?1 AND sequence <= ?3",
+                    params![&src, &dst, max_seq],
+                )
+                .map_err(|e| e.to_string())?
+            } else {
+                conn.execute(
+                    "INSERT INTO mission_events \
+                       (mission_id, sequence, event_type, timestamp, event_id, \
+                        tool_call_id, tool_name, content, content_file, metadata) \
+                     SELECT ?2, sequence, event_type, timestamp, event_id, \
+                            tool_call_id, tool_name, \
+                            REPLACE(content, ?1, ?2), \
+                            content_file, \
+                            REPLACE(metadata, ?1, ?2) \
+                     FROM mission_events \
+                     WHERE mission_id = ?1",
+                    params![&src, &dst],
+                )
+                .map_err(|e| e.to_string())?
+            };
+            Ok(inserted)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn count_events(
         &self,
         mission_id: Uuid,

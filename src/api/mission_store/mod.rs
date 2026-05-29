@@ -1277,6 +1277,34 @@ pub trait MissionStore: Send + Sync {
         Ok(0)
     }
 
+    /// Bulk-copy events from `source_mission_id` into
+    /// `target_mission_id`, preserving the per-mission
+    /// `sequence` numbering. If `up_to_sequence` is `Some(n)`,
+    /// only events with `sequence <= n` are copied — used by
+    /// the future "fork from message N" UI; the unbounded
+    /// variant (None) is what the topbar's plain Fork button
+    /// calls.
+    ///
+    /// Implementations MUST rewrite occurrences of
+    /// `source_mission_id` to `target_mission_id` inside the
+    /// `content` and `metadata` columns. A handful of event
+    /// types (`mission_status_changed`, `goal_iteration`, …)
+    /// embed the mission's own UUID in their JSON payload; if
+    /// we copied those verbatim the fork's stream would
+    /// resurface SSE rows tagged with the source's id and the
+    /// dashboard would mis-route them.
+    ///
+    /// Returns the number of rows inserted.
+    async fn copy_events_into(
+        &self,
+        source_mission_id: Uuid,
+        target_mission_id: Uuid,
+        up_to_sequence: Option<i64>,
+    ) -> Result<usize, String> {
+        let _ = (source_mission_id, target_mission_id, up_to_sequence);
+        Ok(0)
+    }
+
     /// Count events for a mission, optionally filtered by type.
     async fn count_events(
         &self,

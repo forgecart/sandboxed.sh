@@ -88,6 +88,7 @@ import {
   isNetworkError,
   cancelMission,
   deleteMission,
+  forkMission,
   autoGenerateMissionTitle,
   listWorkspaces,
   getHealth,
@@ -164,6 +165,7 @@ import {
   Users,
   BriefcaseBusiness,
   GitBranch,
+  GitFork,
   Inbox,
   Flag,
 } from "lucide-react";
@@ -7915,6 +7917,29 @@ export default function ControlClient() {
     [router],
   );
 
+  // Fork a mission: snapshots both PVCs (workspaces + /var/lib/docker)
+  // via Longhorn CSI, provisions a brand-new mission UUID + pod from
+  // those snapshots on the current `:latest` image, and copies the
+  // source mission's full event history. Returns immediately while
+  // the backend orchestrates the snapshot dance; the new mission's
+  // pod_phase streams to "ready" over SSE.
+  const handleForkMission = useCallback(
+    async (missionId: string, label: string) => {
+      try {
+        toast.info("Forking mission…");
+        const result = await forkMission(missionId);
+        toast.success(`Forked "${label}" — landing on the new pod`);
+        router.push(`/control?mission=${result.mission_id}`);
+      } catch (err) {
+        console.error("Failed to fork mission:", err);
+        toast.error(
+          err instanceof Error ? err.message : "Failed to fork mission",
+        );
+      }
+    },
+    [router],
+  );
+
   // Track the mission ID being fetched to prevent race conditions
   const fetchingMissionIdRef = useRef<string | null>(null);
   const pendingMissionNavRef = useRef<string | null>(null);
@@ -11292,6 +11317,27 @@ export default function ControlClient() {
                 <span className="text-xs opacity-60">
                   {latestAgentTodos.length}
                 </span>
+              </button>
+            )}
+
+            {/* Fork mission — snapshots PVCs + spawns a fresh-image
+                pod with the same conversation + workspace + docker
+                state. Backend orchestrates async; we navigate to the
+                new mission immediately. */}
+            {activeMission && (
+              <button
+                onClick={() =>
+                  handleForkMission(
+                    activeMission.id,
+                    activeMission.title?.trim() ||
+                      getMissionShortName(activeMission.id),
+                  )
+                }
+                className="flex items-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-2 text-sm text-white/70 transition-colors hover:border-white/[0.10] hover:bg-white/[0.04] hover:text-white"
+                title="Fork this mission onto a fresh pod (keeps disk + docker state)"
+              >
+                <GitFork className="h-4 w-4" />
+                <span className="hidden lg:inline">Fork</span>
               </button>
             )}
 

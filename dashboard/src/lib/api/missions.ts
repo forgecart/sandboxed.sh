@@ -483,6 +483,34 @@ export async function deleteMission(
   return res.json();
 }
 
+/**
+ * Fork a K8sPod mission: snapshots both PVCs (workspaces + docker)
+ * via Longhorn CSI, provisions a new mission UUID + pod from the
+ * snapshots on the current `:latest` image, and copies the source
+ * mission's events into it. Returns immediately; the new mission's
+ * pod_phase ("forking" → "pulling" → "ready") progresses over the
+ * existing SSE stream.
+ */
+export async function forkMission(
+  id: string,
+  options?: { title?: string; afterSequence?: number },
+): Promise<{ mission_id: string; parent_mission_id: string }> {
+  const body: Record<string, unknown> = {};
+  if (options?.title !== undefined) body.title = options.title;
+  if (options?.afterSequence !== undefined)
+    body.after_sequence = options.afterSequence;
+  const res = await apiFetch(`/api/control/missions/${id}/fork`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to fork mission: ${text}`);
+  }
+  return res.json();
+}
+
 export async function cleanupEmptyMissions(): Promise<{
   ok: boolean;
   deleted_count: number;

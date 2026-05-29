@@ -21,16 +21,17 @@ use anyhow::{anyhow, bail, Context, Result};
 use k8s_openapi::api::core::v1::{
     ConfigMap, ConfigMapVolumeSource, Container, KeyToPath, LocalObjectReference,
     PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, Pod,
-    PodSecurityContext, PodSpec, ResourceRequirements, SecurityContext, Volume, VolumeMount,
-    VolumeResourceRequirements,
+    PodSecurityContext, PodSpec, ResourceRequirements, SecurityContext, TypedLocalObjectReference,
+    Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::{
-    api::{Api, DeleteParams, PostParams},
+    api::{Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, PostParams},
     config::Config,
     Client,
 };
+use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -133,10 +134,14 @@ const POD_LABEL_MISSION_KEY: &str = "forgecart.dev/mission-id";
 const POD_LABEL_WORKSPACE_KEY: &str = "forgecart.dev/workspace-id";
 const POD_LABEL_MANAGED_BY_KEY: &str = "app.kubernetes.io/managed-by";
 const POD_LABEL_MANAGED_BY_VALUE: &str = "sandboxed-sh";
-const STORAGE_CLASS: &str = "harvester";
-const WORKSPACES_VOLUME_SIZE: &str = "20Gi";
-const DOCKER_VOLUME_SIZE: &str = "20Gi";
+pub(crate) const STORAGE_CLASS: &str = "harvester";
+pub(crate) const WORKSPACES_VOLUME_SIZE: &str = "20Gi";
+pub(crate) const DOCKER_VOLUME_SIZE: &str = "20Gi";
 const PULL_SECRET_DEFAULT: &str = "nexus-registry";
+/// VolumeSnapshotClass name in the workload cluster. Created by the
+/// Harvester CSI driver at install time. If this changes, the
+/// startup probe in `K8sPodClient::try_init` will surface it.
+pub(crate) const SNAPSHOT_CLASS: &str = "harvester-snapshot";
 
 /// Per-mission Pod / PVC / ConfigMap name. Keyed on mission_id, not
 /// workspace_id, since each mission gets its own pod. Prefix `m-`
@@ -152,20 +157,29 @@ fn k8s_object_name(mission_id: Uuid, suffix: &str) -> String {
     }
 }
 
-fn pod_name(mission_id: Uuid) -> String {
+pub(crate) fn pod_name(mission_id: Uuid) -> String {
     k8s_object_name(mission_id, "")
 }
 
-fn workspaces_pvc_name(mission_id: Uuid) -> String {
+pub(crate) fn workspaces_pvc_name(mission_id: Uuid) -> String {
     k8s_object_name(mission_id, "workspaces")
 }
 
-fn docker_pvc_name(mission_id: Uuid) -> String {
+pub(crate) fn docker_pvc_name(mission_id: Uuid) -> String {
     k8s_object_name(mission_id, "docker")
 }
 
 fn init_configmap_name(mission_id: Uuid) -> String {
     k8s_object_name(mission_id, "init")
+}
+
+/// Snapshot CR name for a fork operation. Keyed on the *new* (fork)
+/// mission's id so two concurrent forks of the same source don't
+/// collide. Returned strings stay under k8s's 63-char name limit
+/// (snap- + 36-char UUID + -workspaces = 51 chars).
+#[allow(dead_code)] // Phase 3 (mission_fork.rs) is the sole caller.
+pub(crate) fn snapshot_name(new_mission_id: Uuid, suffix: &str) -> String {
+    format!("snap-{}-{}", new_mission_id, suffix)
 }
 
 fn standard_labels(mission_id: Uuid, workspace_id: Uuid) -> BTreeMap<String, String> {
@@ -275,6 +289,36 @@ impl K8sPodClient {
         env_vars: &HashMap<String, String>,
         init_script: Option<&str>,
     ) -> Result<()> {
+        self.create_mission_pod_inner(mission_id, workspace_id, env_vars, init_script, false)
+            .await
+    }
+
+    /// Variant used by the fork orchestrator. PVCs already exist
+    /// (provisioned from `VolumeSnapshot`s — see
+    /// `create_pvc_from_snapshot`) so `ensure_pvc` no-ops via the
+    /// `get_opt` guard. `force_pull = true` switches the Pod's
+    /// `imagePullPolicy` to `Always` so the fork lands on the
+    /// current `:latest` digest even if the node has an older
+    /// image cached.
+    pub async fn create_forked_mission_pod(
+        &self,
+        mission_id: Uuid,
+        workspace_id: Uuid,
+        env_vars: &HashMap<String, String>,
+        init_script: Option<&str>,
+    ) -> Result<()> {
+        self.create_mission_pod_inner(mission_id, workspace_id, env_vars, init_script, true)
+            .await
+    }
+
+    async fn create_mission_pod_inner(
+        &self,
+        mission_id: Uuid,
+        workspace_id: Uuid,
+        env_vars: &HashMap<String, String>,
+        init_script: Option<&str>,
+        force_pull: bool,
+    ) -> Result<()> {
         let pod_name = pod_name(mission_id);
 
         if self.pods().get_opt(&pod_name).await?.is_some() {
@@ -294,7 +338,13 @@ impl K8sPodClient {
         }
 
         // 3. Pod
-        let pod = self.build_pod_spec(mission_id, workspace_id, init_script.is_some(), env_vars);
+        let pod = self.build_pod_spec(
+            mission_id,
+            workspace_id,
+            init_script.is_some(),
+            env_vars,
+            force_pull,
+        );
         self.pods()
             .create(&PostParams::default(), &pod)
             .await
@@ -303,6 +353,7 @@ impl K8sPodClient {
             mission_id = %mission_id,
             workspace_id = %workspace_id,
             pod = %pod_name,
+            force_pull,
             "Created mission pod"
         );
         Ok(())
@@ -335,6 +386,239 @@ impl K8sPodClient {
             .create(&PostParams::default(), &pvc)
             .await
             .with_context(|| format!("Failed to create PVC {}", name))?;
+        Ok(())
+    }
+
+    // ──── VolumeSnapshot helpers (Phase 1 of mission-fork) ─────────────────
+    //
+    // VolumeSnapshot is a CRD provided by the snapshot-controller +
+    // the Harvester CSI driver. We use kube-rs `DynamicObject` rather
+    // than typed bindings so we don't have to vendor a separate crate
+    // for the v1 schema — it's a 2-field spec (snapshotClassName +
+    // source.persistentVolumeClaimName) and a status that exposes
+    // `readyToUse: bool`.
+
+    /// Returns the namespaced `Api<DynamicObject>` for
+    /// `snapshot.storage.k8s.io/v1 VolumeSnapshot`. Lazy — kube-rs
+    /// caches discovery internally.
+    pub(crate) fn snapshots(&self) -> Api<DynamicObject> {
+        let gvk = GroupVersionKind::gvk("snapshot.storage.k8s.io", "v1", "VolumeSnapshot");
+        let ar = ApiResource::from_gvk(&gvk);
+        Api::namespaced_with(self.client.clone(), &self.namespace, &ar)
+    }
+
+    /// Create a `VolumeSnapshot` of `source_pvc` named `snap_name`.
+    /// Idempotent: returns Ok if a snapshot with this name already
+    /// exists (we don't validate that an existing one points at the
+    /// same source — callers always derive the name from a unique
+    /// new mission_id, so a name collision means a duplicate fork
+    /// call which is safe to retry against the same snapshot).
+    pub async fn create_volume_snapshot(&self, snap_name: &str, source_pvc: &str) -> Result<()> {
+        if self.snapshots().get_opt(snap_name).await?.is_some() {
+            return Ok(());
+        }
+        let gvk = GroupVersionKind::gvk("snapshot.storage.k8s.io", "v1", "VolumeSnapshot");
+        let ar = ApiResource::from_gvk(&gvk);
+        let snap = DynamicObject::new(snap_name, &ar)
+            .within(&self.namespace)
+            .data(json!({
+                "spec": {
+                    "volumeSnapshotClassName": SNAPSHOT_CLASS,
+                    "source": {
+                        "persistentVolumeClaimName": source_pvc,
+                    },
+                },
+            }));
+        self.snapshots()
+            .create(&PostParams::default(), &snap)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to create VolumeSnapshot {} for PVC {}",
+                    snap_name, source_pvc
+                )
+            })?;
+        Ok(())
+    }
+
+    /// Poll the snapshot's `status.readyToUse` until it flips to
+    /// `true`. Returns Err on timeout or terminal error.
+    pub async fn wait_snapshot_ready(&self, snap_name: &str, timeout: Duration) -> Result<()> {
+        let start = Instant::now();
+        loop {
+            let snap = self
+                .snapshots()
+                .get(snap_name)
+                .await
+                .with_context(|| format!("Failed to GET VolumeSnapshot {}", snap_name))?;
+            let ready = snap
+                .data
+                .get("status")
+                .and_then(|s| s.get("readyToUse"))
+                .and_then(|r| r.as_bool())
+                .unwrap_or(false);
+            if ready {
+                return Ok(());
+            }
+            // CSI surfaces hard failures via `status.error.message`.
+            // Treat them as terminal — retry isn't going to help.
+            if let Some(err_msg) = snap
+                .data
+                .get("status")
+                .and_then(|s| s.get("error"))
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+            {
+                bail!("VolumeSnapshot {} failed: {}", snap_name, err_msg);
+            }
+            if start.elapsed() > timeout {
+                bail!(
+                    "VolumeSnapshot {} not ready within {:?}",
+                    snap_name,
+                    timeout
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    /// Create a PVC whose contents are restored from `snap_name`.
+    /// Idempotent. The PVC inherits the snapshot's data on first
+    /// mount; afterwards it diverges as its own Longhorn volume —
+    /// deleting the snapshot then has no effect on the new PVC.
+    pub async fn create_pvc_from_snapshot(
+        &self,
+        pvc_name: &str,
+        snap_name: &str,
+        size: &str,
+    ) -> Result<()> {
+        if self.pvcs().get_opt(pvc_name).await?.is_some() {
+            return Ok(());
+        }
+        let mut requests = BTreeMap::new();
+        requests.insert("storage".to_string(), Quantity(size.to_string()));
+        let pvc = PersistentVolumeClaim {
+            metadata: ObjectMeta {
+                name: Some(pvc_name.to_string()),
+                namespace: Some(self.namespace.clone()),
+                ..Default::default()
+            },
+            spec: Some(PersistentVolumeClaimSpec {
+                access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+                resources: Some(VolumeResourceRequirements {
+                    requests: Some(requests),
+                    limits: None,
+                }),
+                storage_class_name: Some(STORAGE_CLASS.to_string()),
+                data_source: Some(TypedLocalObjectReference {
+                    api_group: Some("snapshot.storage.k8s.io".to_string()),
+                    kind: "VolumeSnapshot".to_string(),
+                    name: snap_name.to_string(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        self.pvcs()
+            .create(&PostParams::default(), &pvc)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to create PVC {} from snapshot {}",
+                    pvc_name, snap_name
+                )
+            })?;
+        Ok(())
+    }
+
+    /// Delete a VolumeSnapshot. 404-tolerant. Once the fork's PVC is
+    /// provisioned, the snapshot is no longer load-bearing — we
+    /// reclaim it eagerly so disk usage tracks live volumes only.
+    pub async fn delete_volume_snapshot(&self, snap_name: &str) -> Result<()> {
+        match self
+            .snapshots()
+            .delete(snap_name, &DeleteParams::default())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if is_404(&e) => Ok(()),
+            Err(e) => {
+                Err(e).with_context(|| format!("Failed to delete VolumeSnapshot {}", snap_name))
+            }
+        }
+    }
+
+    // ──── dockerd quiesce for crash-consistent snapshots ───────────────────
+    //
+    // Best-effort: we `docker pause` every running container then
+    // `sync` so the filesystem buffers flush. Containers stay paused
+    // only long enough for the snapshot to capture their overlay
+    // state — the orchestrator unpauses immediately after the
+    // snapshot READY response. Failure here doesn't block the fork
+    // (e.g. the source pod might already have crashed); the cost is
+    // that the fork's docker layer cache may be inconsistent and
+    // `docker compose up -d` in the fork will have to re-pull /
+    // rebuild from upstream.
+
+    /// Pause every running container in the source mission's
+    /// dockerd. Returns Ok even if the exec command failed — see
+    /// module comment above. Logs the failure for triage.
+    pub async fn quiesce_dockerd(&self, src_mission_id: Uuid) -> Result<()> {
+        let script = "docker ps -q 2>/dev/null | xargs -r docker pause 2>/dev/null; sync";
+        let out = self
+            .exec_command(
+                src_mission_id,
+                None,
+                "/bin/sh",
+                &["-c".to_string(), script.to_string()],
+                &HashMap::new(),
+            )
+            .await;
+        match out {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => {
+                tracing::warn!(
+                    src_mission_id = %src_mission_id,
+                    code = ?o.status.code(),
+                    stderr = %String::from_utf8_lossy(&o.stderr),
+                    "quiesce_dockerd exited nonzero; continuing with best-effort snapshot"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    src_mission_id = %src_mission_id,
+                    error = %e,
+                    "quiesce_dockerd exec failed; continuing"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Unpause every paused container in the source pod's dockerd.
+    /// Idempotent + tolerant of an already-gone source pod (e.g.
+    /// the user deleted it mid-fork) — we never want to leave the
+    /// source's containers stuck in `paused` state.
+    pub async fn unquiesce_dockerd(&self, src_mission_id: Uuid) -> Result<()> {
+        let script =
+            "docker ps -q -f status=paused 2>/dev/null | xargs -r docker unpause 2>/dev/null";
+        let _ = self
+            .exec_command(
+                src_mission_id,
+                None,
+                "/bin/sh",
+                &["-c".to_string(), script.to_string()],
+                &HashMap::new(),
+            )
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    src_mission_id = %src_mission_id,
+                    error = %e,
+                    "unquiesce_dockerd exec failed (source pod may be gone)"
+                );
+            });
         Ok(())
     }
 
@@ -379,6 +663,7 @@ impl K8sPodClient {
         workspace_id: Uuid,
         with_init_script: bool,
         env_vars: &HashMap<String, String>,
+        force_pull: bool,
     ) -> Pod {
         let mut volumes = vec![
             Volume {
@@ -474,7 +759,10 @@ impl K8sPodClient {
             // IfNotPresent: once the node has the workspace-base image
             // cached, every subsequent mission on that node skips the
             // 30-60s pull. First mission per node still pays the cost.
-            image_pull_policy: Some("IfNotPresent".to_string()),
+            // Forks force `Always` so they land on the current
+            // `:latest` even if the node has a stale digest cached —
+            // the point of a fork is "same data, new image."
+            image_pull_policy: Some(if force_pull { "Always" } else { "IfNotPresent" }.to_string()),
             env: if env_list.is_empty() {
                 None
             } else {

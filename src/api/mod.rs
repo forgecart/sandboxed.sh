@@ -38,6 +38,7 @@ pub mod library;
 pub mod lsp;
 pub mod mcp;
 pub mod metadata_llm;
+pub mod mission_fork;
 pub mod mission_runner;
 pub mod mission_store;
 pub mod mission_workspace_gc;
