@@ -71,6 +71,7 @@ const AGENT_DIR: &str = "agent";
 const INIT_SCRIPT_DIR: &str = "init-script";
 const PLUGINS_FILE: &str = "plugins.json";
 const WORKSPACE_TEMPLATE_DIR: &str = "workspace-template";
+const WORKFLOW_DIR: &str = "workflow";
 const CONFIGS_DIR: &str = "configs";
 const DEFAULT_PROFILE: &str = "default";
 const OKX_SECURITY_SKILL_NAME: &str = "okx-security";
@@ -81,6 +82,10 @@ const AUTONOMOUS_TRANSACTION_SAFETY_TEMPLATE_NAME: &str = "autonomous-transactio
 const AUTONOMOUS_TRANSACTION_SAFETY_TEMPLATE: &str = include_str!(
     "../../bundled-library/workspace-template/autonomous-transaction-safety-check.json"
 );
+const FORGE_WORKFLOW_NAME: &str = "forge";
+const FORGE_WORKFLOW: &str = include_str!("../../bundled-library/workflow/forge/forge.js");
+const FORGE_WORKFLOW_SOURCE: &str =
+    include_str!("../../bundled-library/workflow/forge/.workflow-source.json");
 
 /// Store for managing the configuration library.
 pub struct LibraryStore {
@@ -168,6 +173,33 @@ impl LibraryStore {
                 .await
                 .context("Failed to write bundled OKX workspace template")?;
             seeded_paths.push(template_path);
+        }
+
+        let forge_dir = self.workflows_dir().join(FORGE_WORKFLOW_NAME);
+        let forge_js = forge_dir.join(format!("{}.js", FORGE_WORKFLOW_NAME));
+        let forge_source = forge_dir.join(".workflow-source.json");
+        if !forge_js.exists() {
+            fs::create_dir_all(&forge_dir)
+                .await
+                .context("Failed to create bundled forge workflow directory")?;
+            fs::write(&forge_js, FORGE_WORKFLOW)
+                .await
+                .context("Failed to write bundled forge workflow")?;
+            fs::write(&forge_source, FORGE_WORKFLOW_SOURCE)
+                .await
+                .context("Failed to write bundled forge workflow source metadata")?;
+            seeded_paths.push(forge_js);
+            seeded_paths.push(forge_source);
+        } else if !forge_source.exists() {
+            let existing = fs::read_to_string(&forge_js)
+                .await
+                .context("Failed to read existing forge workflow")?;
+            if existing == FORGE_WORKFLOW {
+                fs::write(&forge_source, FORGE_WORKFLOW_SOURCE)
+                    .await
+                    .context("Failed to write bundled forge workflow source metadata")?;
+                seeded_paths.push(forge_source);
+            }
         }
 
         let seed_author = git::GitAuthor::new(
@@ -919,6 +951,99 @@ impl LibraryStore {
     /// Recursively copy a directory, skipping `.git` at all levels.
     async fn copy_dir_recursive_skip_git(src: &Path, dst: &Path) -> Result<()> {
         crate::util::copy_dir_recursive_skip(src, dst, &[".git"]).await
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Workflows (workflow/*/<name>.js — dynamic workflow scripts for Claude
+    // Code's runtime; written to `.claude/workflows/<name>.js` in missions)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Get the workflows directory path.
+    fn workflows_dir(&self) -> PathBuf {
+        self.path.join(WORKFLOW_DIR)
+    }
+
+    /// List all workflows with their summaries.
+    pub async fn list_workflows(&self) -> Result<Vec<WorkflowSummary>> {
+        let workflows_dir = self.workflows_dir();
+
+        if !workflows_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut workflows = Vec::new();
+        let mut entries = fs::read_dir(&workflows_dir).await?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let entry_path = entry.path();
+            if !entry_path.is_dir() {
+                continue;
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            let script_path = entry_path.join(format!("{}.js", name));
+            if !script_path.exists() {
+                continue;
+            }
+
+            let source_file = entry_path.join(".workflow-source.json");
+            let source = if source_file.exists() {
+                fs::read_to_string(&source_file)
+                    .await
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default()
+            } else {
+                WorkflowSource::default()
+            };
+
+            workflows.push(WorkflowSummary {
+                name,
+                // We don't parse JS at list time. Descriptions are surfaced via
+                // the optional `.workflow-source.json` sidecar, or by the
+                // consumer parsing `meta.description` from the script body.
+                description: None,
+                path: format!("{}/{}", WORKFLOW_DIR, entry.file_name().to_string_lossy()),
+                source,
+            });
+        }
+
+        workflows.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(workflows)
+    }
+
+    /// Get a workflow by name with the full script body.
+    pub async fn get_workflow(&self, name: &str) -> Result<Workflow> {
+        Self::validate_name(name)?;
+        let workflow_dir = self.workflows_dir().join(name);
+        let script_path = workflow_dir.join(format!("{}.js", name));
+
+        if !script_path.exists() {
+            anyhow::bail!("Workflow not found: {}", name);
+        }
+
+        let script = fs::read_to_string(&script_path)
+            .await
+            .context("Failed to read workflow script")?;
+
+        let source_file = workflow_dir.join(".workflow-source.json");
+        let source = if source_file.exists() {
+            fs::read_to_string(&source_file)
+                .await
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default()
+        } else {
+            WorkflowSource::default()
+        };
+
+        Ok(Workflow {
+            name: name.to_string(),
+            description: None,
+            path: format!("{}/{}", WORKFLOW_DIR, name),
+            source,
+            script,
+        })
     }
 
     // ─────────────────────────────────────────────────────────────────────────

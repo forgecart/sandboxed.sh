@@ -204,32 +204,6 @@ impl McpRegistry {
         playwright.scope = McpScope::Workspace;
         playwright.default_enabled = true;
 
-        let orchestrator_command = {
-            let release = working_dir
-                .join("target")
-                .join("release")
-                .join("orchestrator-mcp");
-            let debug = working_dir
-                .join("target")
-                .join("debug")
-                .join("orchestrator-mcp");
-            if release.exists() {
-                release.to_string_lossy().to_string()
-            } else if debug.exists() {
-                debug.to_string_lossy().to_string()
-            } else {
-                "orchestrator-mcp".to_string()
-            }
-        };
-        let mut orchestrator = McpServerConfig::new_stdio(
-            "orchestrator".to_string(),
-            orchestrator_command,
-            Vec::new(),
-            HashMap::new(),
-        );
-        orchestrator.scope = McpScope::Workspace;
-        orchestrator.default_enabled = true;
-
         let automation_manager_command = std::env::var("AUTOMATION_MANAGER_MCP_BIN")
             .ok()
             .map(|v| v.trim().to_string())
@@ -279,7 +253,6 @@ impl McpRegistry {
             workspace,
             desktop,
             playwright,
-            orchestrator,
             automation_manager,
             engram,
         ]
@@ -381,13 +354,10 @@ impl McpRegistry {
                 .await;
         }
 
-        // Ensure workspace/desktop/orchestrator MCPs have correct scope (migrate old configs).
+        // Ensure workspace/desktop MCPs have correct scope (migrate old configs).
         // This must run even if the binary doesn't exist locally.
         for config in configs.iter_mut() {
-            if !matches!(
-                config.name.as_str(),
-                "workspace" | "desktop" | "orchestrator"
-            ) {
+            if !matches!(config.name.as_str(), "workspace" | "desktop") {
                 continue;
             }
 
@@ -406,7 +376,7 @@ impl McpRegistry {
         for config in configs.iter_mut() {
             if !matches!(
                 config.name.as_str(),
-                "workspace" | "desktop" | "playwright" | "orchestrator"
+                "workspace" | "desktop" | "playwright"
             ) {
                 continue;
             }
@@ -428,7 +398,6 @@ impl McpRegistry {
             let binary_name = match config.name.as_str() {
                 "workspace" => Some("workspace-mcp"),
                 "desktop" => Some("desktop-mcp"),
-                "orchestrator" => Some("orchestrator-mcp"),
                 _ => None,
             };
 

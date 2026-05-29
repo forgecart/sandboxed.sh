@@ -1677,6 +1677,7 @@ async fn write_claudecode_config(
     workspace_env: &HashMap<String, String>,
     skill_contents: Option<&[SkillContent]>,
     command_contents: Option<&[CommandContent]>,
+    workflow_contents: Option<&[WorkflowContent]>,
     shared_network: Option<bool>,
     profile_overlay: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
@@ -1798,6 +1799,12 @@ async fn write_claudecode_config(
         tokio::fs::write(&home_settings_json, &settings_content).await?;
         let home_mcp = claude_home.join("mcp.json");
         tokio::fs::write(&home_mcp, &mcp_content).await?;
+    }
+
+    // Write dynamic-workflow scripts to .claude/workflows/. Claude Code's
+    // runtime auto-discovers them and exposes each as a `/<name>` command.
+    if let Some(workflows) = workflow_contents {
+        write_claudecode_workflows_to_workspace(workspace_dir, workflows).await?;
     }
 
     // Write skills to .claude/skills/ using Claude Code's native format
@@ -2198,6 +2205,7 @@ pub async fn write_backend_config(
     skill_allowlist: Option<&[String]>,
     skill_contents: Option<&[SkillContent]>,
     command_contents: Option<&[CommandContent]>,
+    workflow_contents: Option<&[WorkflowContent]>,
     shared_network: Option<bool>,
     custom_providers: Option<&[AIProvider]>,
     claudecode_profile_overlay: Option<&serde_json::Value>,
@@ -2240,6 +2248,7 @@ pub async fn write_backend_config(
                 workspace_env,
                 skill_contents,
                 command_contents,
+                workflow_contents,
                 shared_network,
                 claudecode_profile_overlay,
             )
@@ -2307,6 +2316,21 @@ pub struct SkillContent {
     /// Additional markdown files (relative path, content)
     /// Path preserves subdirectory structure (e.g., "references/guide.md")
     pub files: Vec<(String, String)>,
+}
+
+/// Dynamic-workflow script to be written into a Claude Code mission's
+/// `.claude/workflows/<name>.js` directory. The CLI's workflow runtime
+/// auto-discovers and registers the script as a `/<name>` command on
+/// startup; we ship the JS as a workspace artifact, the same way we ship
+/// SKILL.md files.
+pub struct WorkflowContent {
+    /// Workflow name (filename stem; matches `meta.name` inside the script)
+    pub name: String,
+    /// Optional description (not consumed by the runtime — used only for
+    /// surfacing in autocomplete listings)
+    pub description: Option<String>,
+    /// The `.js` script body, written verbatim
+    pub script: String,
 }
 
 /// Command content to be written to the workspace.
@@ -2495,6 +2519,50 @@ pub async fn write_claudecode_skills_to_workspace(
         count = skills.len(),
         workspace = %workspace_dir.display(),
         "Wrote Claude Code skills to workspace"
+    );
+
+    Ok(())
+}
+
+/// Write workflow scripts to the workspace's `.claude/workflows/` directory.
+/// Claude Code 2.1.154+ auto-discovers `.claude/workflows/<name>.js`,
+/// parses the `meta` block, and registers the script as a `/<name>`
+/// command available in-conversation. The runtime itself ships in the
+/// CLI binary — we only deliver the script as a workspace artifact.
+pub async fn write_claudecode_workflows_to_workspace(
+    workspace_dir: &Path,
+    workflows: &[WorkflowContent],
+) -> anyhow::Result<()> {
+    let workflows_dir = workspace_dir.join(".claude").join("workflows");
+
+    tracing::debug!(
+        workspace = %workspace_dir.display(),
+        workflows_dir = %workflows_dir.display(),
+        workflow_count = workflows.len(),
+        workflow_names = ?workflows.iter().map(|w| &w.name).collect::<Vec<_>>(),
+        "Writing Claude Code workflows to workspace"
+    );
+
+    // Clean up stale workflows on every mission setup, mirroring skills.
+    if workflows_dir.exists() {
+        let _ = tokio::fs::remove_dir_all(&workflows_dir).await;
+    }
+
+    if workflows.is_empty() {
+        return Ok(());
+    }
+
+    tokio::fs::create_dir_all(&workflows_dir).await?;
+
+    for workflow in workflows {
+        let script_path = workflows_dir.join(format!("{}.js", workflow.name));
+        tokio::fs::write(&script_path, &workflow.script).await?;
+    }
+
+    tracing::info!(
+        count = workflows.len(),
+        workspace = %workspace_dir.display(),
+        "Wrote Claude Code workflows to workspace"
     );
 
     Ok(())
@@ -2946,6 +3014,49 @@ async fn collect_skill_contents(
     skills_to_write
 }
 
+/// Collect every workflow from the library. Workflows are cheap text files
+/// and `/<name>` autocomplete is opt-in, so every mission gets every
+/// workflow — no per-workspace filter today.
+async fn collect_workflow_contents(
+    context_name: &str,
+    library: &LibraryStore,
+) -> Vec<WorkflowContent> {
+    let mut workflows_to_write: Vec<WorkflowContent> = Vec::new();
+
+    match library.list_workflows().await {
+        Ok(summaries) => {
+            for summary in summaries {
+                match library.get_workflow(&summary.name).await {
+                    Ok(workflow) => {
+                        workflows_to_write.push(WorkflowContent {
+                            name: workflow.name,
+                            description: workflow.description,
+                            script: workflow.script,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            workflow = %summary.name,
+                            context = %context_name,
+                            error = %e,
+                            "Failed to load workflow from library, skipping"
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                context = %context_name,
+                error = %e,
+                "Failed to list workflows from library"
+            );
+        }
+    }
+
+    workflows_to_write
+}
+
 /// Collect all command contents from the library.
 /// Used for both Claude Code (as commands) and OpenCode (as skills).
 async fn collect_command_contents(
@@ -3244,11 +3355,11 @@ fn read_custom_providers_from_file(workspace_root: &Path) -> Vec<AIProvider> {
 
 /// Prepare a workspace directory for a mission with skill and tool syncing for a specific backend.
 ///
-/// `boss_user_id` is the API user that owns this (boss) mission. When set, it
-/// is injected into the orchestrator MCP environment as `BOSS_USER_ID` so the
-/// MCP mints a service JWT scoped to that user — putting any worker missions
-/// it creates into the same per-user mission store as the boss instead of the
-/// MCP's own implicit `orchestrator-mcp` store.
+/// `boss_user_id` is retained for API compatibility after the worker-mission
+/// retirement (PR removing orchestrator MCP). It used to be threaded into the
+/// orchestrator MCP's env; now it's unused but kept to avoid churning every
+/// caller in one PR. Remove in a follow-up once we've confirmed nothing
+/// else needs it.
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_mission_workspace_with_skills_backend(
     workspace: &Workspace,
@@ -3258,7 +3369,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     backend_id: &str,
     custom_providers: Option<&[AIProvider]>,
     config_profile: Option<&str>,
-    boss_user_id: Option<&str>,
+    _boss_user_id: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
     // Mission workspace directory lives under the selected workspace root.
     // This keeps filesystem and config effects scoped to the mission.
@@ -3289,9 +3400,28 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     };
     let mut skill_contents: Option<Vec<SkillContent>> = None;
     let mut command_contents: Option<Vec<CommandContent>> = None;
+    let mut workflow_contents: Option<Vec<WorkflowContent>> = None;
 
     if let Some(lib) = library {
         let context = format!("mission-{}", mission_id);
+
+        // Collect dynamic workflows (Claude Code only — other backends
+        // don't have a workflow runtime). Every mission gets every workflow.
+        if backend_id == "claudecode" {
+            let workflows = collect_workflow_contents(&context, lib).await;
+            if !workflows.is_empty() {
+                tracing::info!(
+                    mission_id = %mission_id,
+                    backend_id = %backend_id,
+                    workspace = %workspace.name,
+                    workflow_count = workflows.len(),
+                    workflow_names = ?workflows.iter().map(|w| &w.name).collect::<Vec<_>>(),
+                    "Collected {} workflows for claudecode backend",
+                    workflows.len(),
+                );
+                workflow_contents = Some(workflows);
+            }
+        }
 
         // Collect commands from library (for all backends)
         let commands = collect_command_contents(&context, lib).await;
@@ -3434,22 +3564,11 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                         .or_insert_with(|| format!("http://127.0.0.1:{}", port));
                 }
                 // Forward JWT_SECRET to trusted internal MCPs so they can
-                // mint service tokens.  Other MCPs (including third-party ones)
-                // must not receive this secret.
-                if cfg.name == "orchestrator" || cfg.name == "automation-manager" {
+                // mint service tokens. Other MCPs (including third-party
+                // ones) must not receive this secret.
+                if cfg.name == "automation-manager" {
                     if let Ok(secret) = std::env::var("JWT_SECRET") {
                         env.entry("JWT_SECRET".to_string()).or_insert(secret);
-                    }
-                }
-                // Tell the orchestrator MCP which user owns the boss
-                // mission so it mints its service JWT as that user. Without
-                // this, worker missions end up in `missions-orchestrator-mcp.db`
-                // and never appear in the boss's `/api/control/missions` list,
-                // breaking the dashboard's worker chips and the WorkerPanel.
-                if cfg.name == "orchestrator" {
-                    if let Some(user_id) = boss_user_id {
-                        env.entry("BOSS_USER_ID".to_string())
-                            .or_insert_with(|| user_id.to_string());
                     }
                 }
             }
@@ -3467,6 +3586,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         skill_allowlist,
         skill_contents.as_deref(),
         command_contents.as_deref(),
+        workflow_contents.as_deref(),
         workspace.shared_network,
         effective_custom_providers,
         claudecode_profile_overlay.as_ref(),

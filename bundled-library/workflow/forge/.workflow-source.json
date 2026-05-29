@@ -1,0 +1,6 @@
+{
+  "type": "WorkflowsRegistry",
+  "identifier": "forgecart/workflows",
+  "workflow_name": "forge",
+  "version": "bundled"
+}

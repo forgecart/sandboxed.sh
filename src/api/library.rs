@@ -1111,6 +1111,51 @@ fn build_builtin_commands() -> BuiltinCommandsResponse {
             path: "builtin-claude".to_string(),
             params: vec![],
         },
+        // Bundled dynamic workflows shipping in Claude Code 2.1.154+.
+        // Names and descriptions verified against the binary's workflow
+        // registry. See https://code.claude.com/docs/en/workflows.
+        CommandSummary {
+            name: "autopilot".to_string(),
+            description: Some(
+                "End-to-end task runner: plan with 5 critics, implement, verify (bug finders + completeness), fix, open PR".to_string(),
+            ),
+            path: "builtin-claude-workflow".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "bugfix".to_string(),
+            description: Some(
+                "Reproduce-first bug fixer: failing repro → root cause → minimal fix → regression test → PR".to_string(),
+            ),
+            path: "builtin-claude-workflow".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "dashboard".to_string(),
+            description: Some(
+                "Dashboard generator: discover data sources, design panels, implement, verify, open PR".to_string(),
+            ),
+            path: "builtin-claude-workflow".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "deep-research".to_string(),
+            description: Some(
+                "Fan-out web searches across angles, fetch sources, adversarially verify claims, synthesize cited report".to_string(),
+            ),
+            path: "builtin-claude-workflow".to_string(),
+            params: vec![],
+        },
+        // Our custom workflow — forgecart-specific plan/implement/verify/PR
+        // runner. Lives at .claude/workflows/forge.js in every mission.
+        CommandSummary {
+            name: "forge".to_string(),
+            description: Some(
+                "Forgecart end-to-end task runner: plan with critics, implement, bug-hunt verify, fix confirmed issues, open PR with our conventions".to_string(),
+            ),
+            path: "library-workflow".to_string(),
+            params: vec![],
+        },
     ];
 
     // Codex builtin commands. `/goal` lands in codex 0.128.0 behind the

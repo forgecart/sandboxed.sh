@@ -278,6 +278,61 @@ pub struct SkillSummary {
     pub setup_commands: Vec<String>,
 }
 
+/// Source/provenance of a workflow — local or from a bundled registry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(tag = "type")]
+pub enum WorkflowSource {
+    /// Locally created workflow
+    #[default]
+    Local,
+    /// Workflow from a bundled registry (the `bundled-library/workflow/` tree)
+    WorkflowsRegistry {
+        /// Repository identifier (e.g., "forgecart/workflows")
+        identifier: String,
+        /// Specific workflow name within the repo
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workflow_name: Option<String>,
+        /// Pinned version
+        #[serde(skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+    },
+}
+
+/// Workflow summary for listing (without script body).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowSummary {
+    /// Workflow name (matches `meta.name` in the script and the filename stem)
+    pub name: String,
+    /// Description (from the `meta.description` field in the script, surfaced via the
+    /// optional .workflow-source.json sidecar; we don't parse JS at list time)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Path relative to library root (e.g., "workflow/forge")
+    pub path: String,
+    /// Source/provenance of the workflow
+    #[serde(default)]
+    pub source: WorkflowSource,
+}
+
+/// Full workflow with the script body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workflow {
+    /// Workflow name (matches `meta.name` and the filename stem)
+    pub name: String,
+    /// Optional description (sourced from .workflow-source.json or the script's
+    /// `meta.description`; we don't parse JS at load time)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Path relative to library root
+    pub path: String,
+    /// Source/provenance of the workflow
+    #[serde(default)]
+    pub source: WorkflowSource,
+    /// The `.js` script body. Written verbatim to `.claude/workflows/<name>.js`
+    /// in the mission's workspace; Claude Code's runtime parses and executes it.
+    pub script: String,
+}
+
 /// Full skill with content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
