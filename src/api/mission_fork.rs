@@ -174,10 +174,14 @@ pub async fn fork_mission_handler(
         )
         .await
         {
+            // `{:#}` walks the anyhow Context chain so the underlying
+            // cause (often a kube ApiError JSON body — "forbidden",
+            // "alreadyexists", validation messages) is visible. Plain
+            // `{}` only shows the outermost `.context()` string.
             tracing::error!(
                 source_mission_id = %source_mission_id,
                 new_mission_id = %new_mission_id,
-                error = %e,
+                error = format!("{e:#}"),
                 "fork worker failed"
             );
         }
@@ -347,10 +351,15 @@ async fn run_fork(
     match inner {
         Ok(()) => Ok(()),
         Err(e) => {
+            // `{:#}` walks the full anyhow Context chain so the
+            // underlying kube ApiError / webhook denial is visible
+            // both in the log AND in the pod_message the dashboard
+            // surfaces to the operator.
+            let chained = format!("{e:#}");
             tracing::error!(
                 source_mid = %source_mid,
                 new_mid = %new_mid,
-                error = %e,
+                error = %chained,
                 "fork orchestration failed; rolling back"
             );
             // Best-effort rollback. Source mission never observably
@@ -359,7 +368,7 @@ async fn run_fork(
             let _ = k8s.destroy_mission_pod(new_mid).await; // pod + 2 PVCs
             let _ = k8s.delete_volume_snapshot(&ws_snap).await;
             let _ = k8s.delete_volume_snapshot(&docker_snap).await;
-            let msg = format!("Fork failed: {e}");
+            let msg = format!("Fork failed: {chained}");
             let _ = mission_store
                 .update_mission_pod_phase(new_mid, Some("error"), Some(&msg))
                 .await;
