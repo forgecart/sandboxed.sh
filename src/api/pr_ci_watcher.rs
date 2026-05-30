@@ -240,43 +240,86 @@ pub fn watcher_enabled() -> bool {
     std::env::var("SANDBOXED_SH_DISABLE_PR_CI_WATCHER").as_deref() != Ok("1")
 }
 
-/// Is this command line a CI-trigger we should watch? Leading-
-/// whitespace + word-boundary anchored so an `echo "gh pr create ..."`
-/// doesn't false-fire. We deliberately do NOT detect agent-side
-/// watch commands (`gh run watch`, `gh pr checks --watch`, `gh
-/// actions watch`) — those are hard-blocked by the bashenv `gh()`
-/// wrapper in the workspace pod.
+/// Is this command line a CI-trigger we should watch?
+///
+/// The detection splits the command on `;`, `&&`, `||`, and newline
+/// (the bash sub-command separators) and checks each segment's
+/// leading-trimmed prefix. That way a chained command like
+/// `cd /tmp && git clone … && git push origin HEAD` still fires
+/// the Push detection — the agent commonly emits chained one-shots,
+/// and the previous "prefix-only" check missed every one of them.
+///
+/// We deliberately do NOT detect agent-side watch commands
+/// (`gh run watch`, `gh pr checks --watch`, `gh actions watch`) —
+/// those are hard-blocked by the bashenv `gh()` wrapper in the
+/// workspace pod.
 pub fn detect_ci_invocation(command: &str) -> Option<CiKind> {
-    let trimmed = command.trim_start();
-    let starts_with_word = |hay: &str, prefix: &str| -> bool {
-        if !hay.starts_with(prefix) {
-            return false;
+    for segment in split_subcommands(command) {
+        let trimmed = segment.trim_start();
+        let starts_with_word = |hay: &str, prefix: &str| -> bool {
+            if !hay.starts_with(prefix) {
+                return false;
+            }
+            match hay.as_bytes().get(prefix.len()) {
+                None => true,
+                Some(b) => b.is_ascii_whitespace(),
+            }
+        };
+        if starts_with_word(trimmed, "gh pr create") {
+            return Some(CiKind::PrCreate);
         }
-        match hay.as_bytes().get(prefix.len()) {
-            None => true,
-            Some(b) => b.is_ascii_whitespace(),
+        if starts_with_word(trimmed, "gh pr merge") {
+            return Some(CiKind::PrMerge);
         }
-    };
-    if starts_with_word(trimmed, "gh pr create") {
-        return Some(CiKind::PrCreate);
-    }
-    if starts_with_word(trimmed, "gh pr merge") {
-        return Some(CiKind::PrMerge);
-    }
-    if starts_with_word(trimmed, "gh run rerun") {
-        return Some(CiKind::RunDirect);
-    }
-    if starts_with_word(trimmed, "gh workflow run") {
-        return Some(CiKind::RunDirect);
-    }
-    if starts_with_word(trimmed, "git push") {
-        // `git push --dry-run` doesn't trigger CI.
-        if trimmed.contains("--dry-run") {
-            return None;
+        if starts_with_word(trimmed, "gh run rerun") {
+            return Some(CiKind::RunDirect);
         }
-        return Some(CiKind::Push);
+        if starts_with_word(trimmed, "gh workflow run") {
+            return Some(CiKind::RunDirect);
+        }
+        if starts_with_word(trimmed, "git push") {
+            // `git push --dry-run` doesn't trigger CI.
+            if trimmed.contains("--dry-run") {
+                continue;
+            }
+            return Some(CiKind::Push);
+        }
     }
     None
+}
+
+/// Split a bash command line into segments on the shell operators
+/// that separate independent commands (`;`, `&&`, `||`, newline).
+/// Pipes (`|`) are NOT treated as separators — `something | grep …`
+/// is one logical invocation.
+///
+/// Quoting is not respected: an `echo "git && push"` would be split
+/// inside the quotes. Acceptable because the resulting segments
+/// would still be examined against the strict prefix rule, and an
+/// echo-prefixed segment never matches.
+fn split_subcommands(command: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = command.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b';' || c == b'\n' {
+            out.push(&command[start..i]);
+            i += 1;
+            start = i;
+        } else if (c == b'&' || c == b'|') && bytes.get(i + 1) == Some(&c) {
+            out.push(&command[start..i]);
+            i += 2;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if start < bytes.len() {
+        out.push(&command[start..]);
+    }
+    out
 }
 
 /// Extract a CI target from the Bash tool result for a given kind.
@@ -870,6 +913,37 @@ mod tests {
             Some(CiKind::Push)
         );
         assert_eq!(detect_ci_invocation("git push --dry-run"), None);
+    }
+
+    #[test]
+    fn detect_chained_commands() {
+        // The agent commonly emits chained one-shots — those must
+        // still fire detection on the embedded trigger.
+        assert_eq!(
+            detect_ci_invocation("cd /tmp && git push origin HEAD"),
+            Some(CiKind::Push)
+        );
+        assert_eq!(
+            detect_ci_invocation(
+                "cd /tmp && rm -rf sb && gh repo clone o/r sb && cd sb && git push -u origin HEAD"
+            ),
+            Some(CiKind::Push)
+        );
+        assert_eq!(
+            detect_ci_invocation("git status; gh pr create --draft"),
+            Some(CiKind::PrCreate)
+        );
+        // newline separator
+        assert_eq!(
+            detect_ci_invocation("git status\ngh workflow run my-wf.yml"),
+            Some(CiKind::RunDirect)
+        );
+        // pipes are NOT separators — they're one logical command
+        assert_eq!(
+            detect_ci_invocation("echo foo | git push"),
+            None,
+            "pipes shouldn't be treated as sub-command boundaries"
+        );
     }
 
     #[test]
