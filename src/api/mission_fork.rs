@@ -1,8 +1,7 @@
 //! Mission fork: snapshot disk + docker state of a running K8sPod
 //! mission onto a fresh pod under a new mission UUID.
 //!
-//! High-level flow (matches the planned design at
-//! `~/.claude/plans/ok-now-i-want-witty-raccoon.md`):
+//! ## Flow
 //!
 //! ```text
 //! POST /api/control/missions/:id/fork
@@ -10,12 +9,14 @@
 //!   2. INSERT new mission row (parent_mission_id = source.id,
 //!      pod_phase = "forking"); respond immediately with the new id.
 //!   3. tokio::spawn the heavy work:
-//!        a. docker pause + sync inside the source pod
-//!        b. VolumeSnapshot {workspaces, docker} PVCs
-//!        c. wait for snapshots readyToUse=true
-//!        d. docker unpause source dockerd
-//!        e. create new PVCs from snapshots
-//!        f. SQL bulk-copy mission_events with mission_id rewrite
+//!        a. SQL bulk-copy mission_events with mission_id rewrite
+//!           (FIRST, before anything that can fail — see below).
+//!        b. docker pause + sync inside the source pod
+//!        c. VolumeSnapshot {workspaces, docker} PVCs with retry
+//!           on Harvester CSI transient API conflicts
+//!        d. wait for snapshots readyToUse=true
+//!        e. docker unpause source dockerd
+//!        f. create new PVCs from snapshots
 //!        g. create_forked_mission_pod (force_pull=true)
 //!        h. wait_for_ready
 //!        i. delete snapshots (PVCs are now independent volumes)
@@ -23,6 +24,22 @@
 //!      mark new mission failed). Source mission never observably
 //!      changes besides the brief docker-pause window.
 //! ```
+//!
+//! ## Why events copy runs FIRST
+//!
+//! The disk/docker clone path can fail in non-trivial ways — the
+//! Harvester CSI's snapshot controller has a known race with its
+//! `VolumeSnapshotBeingCreated` annotation that can wedge a
+//! snapshot mid-flight, the pod can fail to schedule, etc. By
+//! copying events before any of that, even a failed fork still
+//! carries the source's conversation history. The operator
+//! navigates to the new mission, sees the chat, and can retry the
+//! fork or delete the failed mission with one click. Without this
+//! ordering, a failed fork is an empty shell — the operator has
+//! lost their landmark and has to manually correlate URLs.
+//!
+//! Events copy is a single `INSERT … SELECT` in SQLite, so paying
+//! the cost up front even on the happy path is negligible.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -256,6 +273,35 @@ async fn run_fork(
     };
 
     let inner = async {
+        // Copy events FIRST — before anything that can fail on the
+        // pod / PVC / snapshot side. This way, even when the disk
+        // clone path fails (Harvester CSI transient race, snapshot
+        // controller hiccup, etc.) the forked mission already
+        // carries the source's conversation history. The operator
+        // sees the chat when they navigate to the new mission and
+        // can decide whether to retry the fork or delete it.
+        //
+        // Cheap (single `INSERT ... SELECT` per the impl in
+        // `mission_store::sqlite.rs`) so we pay it up front even on
+        // happy-path forks.
+        set_phase(
+            &mission_store,
+            new_mid,
+            "forking",
+            "Copying conversation events",
+        )
+        .await;
+        let copied = mission_store
+            .copy_events_into(source_mid, new_mid, after_sequence)
+            .await
+            .map_err(|e| anyhow::anyhow!("copy_events_into: {e}"))?;
+        tracing::info!(
+            source_mid = %source_mid,
+            new_mid = %new_mid,
+            copied_events = copied,
+            "fork: events copied"
+        );
+
         set_phase(
             &mission_store,
             new_mid,
@@ -272,26 +318,12 @@ async fn run_fork(
             "Creating VolumeSnapshots",
         )
         .await;
-        k8s.create_volume_snapshot(&ws_snap, &src_ws_pvc)
+        create_and_wait_snapshot_with_retry(&k8s, &ws_snap, &src_ws_pvc, SNAPSHOT_TIMEOUT)
             .await
-            .context("create workspaces snapshot")?;
-        k8s.create_volume_snapshot(&docker_snap, &src_docker_pvc)
+            .context("workspaces snapshot")?;
+        create_and_wait_snapshot_with_retry(&k8s, &docker_snap, &src_docker_pvc, SNAPSHOT_TIMEOUT)
             .await
-            .context("create docker snapshot")?;
-
-        set_phase(
-            &mission_store,
-            new_mid,
-            "forking",
-            "Waiting for snapshots to be ready",
-        )
-        .await;
-        k8s.wait_snapshot_ready(&ws_snap, SNAPSHOT_TIMEOUT)
-            .await
-            .context("wait workspaces snapshot ready")?;
-        k8s.wait_snapshot_ready(&docker_snap, SNAPSHOT_TIMEOUT)
-            .await
-            .context("wait docker snapshot ready")?;
+            .context("docker snapshot")?;
 
         // Snapshot data is captured. Source dockerd can resume. We
         // unquiesce eagerly (not just via the guard's Drop) so the
@@ -312,24 +344,6 @@ async fn run_fork(
         k8s.create_pvc_from_snapshot(&new_docker_pvc, &docker_snap, DOCKER_VOLUME_SIZE)
             .await
             .context("create docker PVC from snapshot")?;
-
-        set_phase(
-            &mission_store,
-            new_mid,
-            "forking",
-            "Copying conversation events",
-        )
-        .await;
-        let copied = mission_store
-            .copy_events_into(source_mid, new_mid, after_sequence)
-            .await
-            .map_err(|e| anyhow::anyhow!("copy_events_into: {e}"))?;
-        tracing::info!(
-            source_mid = %source_mid,
-            new_mid = %new_mid,
-            copied_events = copied,
-            "fork: events copied"
-        );
 
         set_phase(&mission_store, new_mid, "pulling", "Pulling current image").await;
         k8s.create_forked_mission_pod(new_mid, workspace_id, &env_vars, init_script.as_deref())
@@ -404,4 +418,83 @@ async fn set_phase(
     let _ = mission_store
         .update_mission_pod_phase(mission_id, Some(phase), Some(message))
         .await;
+}
+
+/// Number of times to retry the create-snapshot + wait-ready cycle
+/// when the Harvester CSI snapshot controller hits a transient API
+/// conflict. Real failure modes (storage class missing, RBAC
+/// denied, source PVC gone) propagate immediately; the retry path
+/// only catches the "server rejected our request" / "operation
+/// timed out" / "context deadline exceeded" class of errors that
+/// Harvester emits when the snapshot-controller can't update the
+/// content's `VolumeSnapshotBeingCreated` annotation atomically.
+const SNAPSHOT_CREATE_RETRIES: u32 = 3;
+
+/// Create `snap_name` from `source_pvc` and wait for ready, with
+/// limited retry on the Harvester transient API-conflict class of
+/// errors. On retry we delete the half-created snapshot CR so the
+/// next attempt starts clean.
+async fn create_and_wait_snapshot_with_retry(
+    k8s: &K8sPodClient,
+    snap_name: &str,
+    source_pvc: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..SNAPSHOT_CREATE_RETRIES {
+        if attempt > 0 {
+            tracing::warn!(
+                snap = %snap_name,
+                attempt,
+                "Retrying snapshot create after transient failure"
+            );
+            // Clear any stuck snapshot from the previous attempt
+            // so the next create_volume_snapshot doesn't hit
+            // "already exists" or pick up the failed status.
+            let _ = k8s.delete_volume_snapshot(snap_name).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        match k8s.create_volume_snapshot(snap_name, source_pvc).await {
+            Ok(()) => match k8s.wait_snapshot_ready(snap_name, timeout).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    if is_transient_snapshot_error(&msg) {
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(e).context(format!("wait snapshot ready {snap_name}"));
+                }
+            },
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if is_transient_snapshot_error(&msg) {
+                    last_err = Some(e);
+                    continue;
+                }
+                return Err(e).context(format!("create snapshot {snap_name}"));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("snapshot exhausted retries")))
+}
+
+/// Heuristic for snapshot-controller transient errors that retry can
+/// recover from. The Harvester CSI emits these in the
+/// `status.error.message` of a `VolumeSnapshot` when the snapshot
+/// controller's annotation update races with another reconcile loop:
+///
+///   "failed to remove VolumeSnapshotBeingCreated annotation from
+///    the content … the server rejected our request due to an error
+///    in our request"
+///
+/// Real config errors (RBAC, missing snapshot class, source PVC
+/// not found) carry distinct messages and bypass retry.
+fn is_transient_snapshot_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("server rejected our request")
+        || m.contains("the object has been modified")
+        || m.contains("operation timed out")
+        || m.contains("context deadline exceeded")
+        || m.contains("volumesnapshotbeingcreated")
 }

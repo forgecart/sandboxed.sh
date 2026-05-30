@@ -49,22 +49,41 @@ backend
  ├─ 3. Respond 200 { mission_id, parent_mission_id }
  │
  └─ tokio::spawn:
+     ├─ INSERT INTO mission_events SELECT ... FROM mission_events
+     │     WHERE mission_id = <src>          ← *FIRST*, before any
+     │     (REPLACE() rewrites embedded       disk path that might
+     │      <src> uuid in content/metadata)   fail. See "Why events
+     │                                        copy runs first" below.
      ├─ docker pause + sync inside source pod  (best-effort quiesce)
      ├─ VolumeSnapshot snap-<new_id>-workspaces ← m-<src>-workspaces
      ├─ VolumeSnapshot snap-<new_id>-docker     ← m-<src>-docker
+     │     (with 3× retry on Harvester CSI transient API conflicts —
+     │      the "VolumeSnapshotBeingCreated annotation" race)
      ├─ poll snapshots until status.readyToUse=true (5 min budget)
      ├─ docker unpause source dockerd
      ├─ create PVC m-<new_id>-workspaces with dataSource=snap-...
      ├─ create PVC m-<new_id>-docker     with dataSource=snap-...
-     ├─ INSERT INTO mission_events SELECT ... FROM mission_events
-     │     WHERE mission_id = <src>
-     │     (REPLACE() rewrites embedded <src> uuid in content/metadata)
      ├─ create Pod m-<new_id> with imagePullPolicy=Always
      ├─ wait_for_ready (5 min budget)
      └─ delete the two VolumeSnapshot CRs (new PVCs are now
         independent Longhorn volumes — snapshots no longer
         load-bearing)
 ```
+
+### Why events copy runs first
+
+The disk/docker clone path can fail in non-trivial ways — the
+Harvester CSI's snapshot controller has a known race with its
+`VolumeSnapshotBeingCreated` annotation that can wedge a snapshot
+mid-flight, the pod can fail to schedule, etc. By copying events
+before any of that, even a failed fork still carries the source's
+conversation history. The operator navigates to the new mission,
+sees the chat, and can retry the fork or delete the failed mission
+with one click. Without this ordering, a failed fork is an empty
+shell.
+
+Events copy is a single `INSERT … SELECT` in SQLite, so the cost
+up front (even on the happy path) is negligible.
 
 `pod_phase` flips through `forking → pulling → container_starting →
 ready` over the existing SSE stream, so the dashboard's workbench
