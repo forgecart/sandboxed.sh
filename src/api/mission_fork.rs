@@ -52,6 +52,7 @@ use axum::{
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::api::auth::AuthUser;
@@ -175,15 +176,17 @@ pub async fn fork_mission_handler(
 
     let new_mission_id = new_mission.id;
 
-    // Surface the initial "forking" phase before we return so the
-    // dashboard's mission row renders the spinner even on the very
-    // first poll.
+    // Surface an initial phase before we return so the dashboard's
+    // ForkProgressOverlay renders the spinner even on the very first
+    // poll (the orchestrator's first real `set_phase_json` lands a
+    // few ms later, but the response is on the wire before that).
+    let initial_detail = json!({ "label": "Copying conversation events" }).to_string();
     let _ = control
         .mission_store
         .update_mission_pod_phase(
             new_mission_id,
-            Some("forking"),
-            Some("Snapshotting source PVCs"),
+            Some("events_copying"),
+            Some(&initial_detail),
         )
         .await;
 
@@ -284,11 +287,12 @@ async fn run_fork(
         // Cheap (single `INSERT ... SELECT` per the impl in
         // `mission_store::sqlite.rs`) so we pay it up front even on
         // happy-path forks.
-        set_phase(
+        // === events_copying =============================================
+        set_phase_json(
             &mission_store,
             new_mid,
-            "forking",
-            "Copying conversation events",
+            "events_copying",
+            json!({ "label": "Copying conversation events" }),
         )
         .await;
         let copied = mission_store
@@ -302,42 +306,78 @@ async fn run_fork(
             "fork: events copied"
         );
 
-        set_phase(
+        // === quiescing_source ==========================================
+        set_phase_json(
             &mission_store,
             new_mid,
-            "forking",
-            "Quiescing source dockerd",
+            "quiescing_source",
+            json!({
+                "label": "Pausing source pod's docker daemon",
+                "events_copied": copied,
+            }),
         )
         .await;
         let _ = k8s.quiesce_dockerd(source_mid).await;
 
-        set_phase(
+        // === snapshotting ==============================================
+        // Both snapshots progress in parallel from the snapshot
+        // controller's perspective. We update the per-item status
+        // as each create + wait pair completes.
+        let snap_items = |ws: &str, dk: &str| {
+            json!({
+                "label": "Snapshotting source disks",
+                "items": [
+                    {"name": "workspaces", "status": ws},
+                    {"name": "docker",     "status": dk},
+                ],
+            })
+        };
+        set_phase_json(
             &mission_store,
             new_mid,
-            "forking",
-            "Creating VolumeSnapshots",
+            "snapshotting",
+            snap_items("pending", "pending"),
         )
         .await;
-        // Create both snapshots, then wait for each ready.
-        // `wait_snapshot_ready` is patient with the snapshot-controller's
-        // own transient errors (409 "object has been modified" reconcile
-        // loop, "VolumeSnapshotBeingCreated annotation" race) and only
-        // short-circuits on RBAC / missing-class / missing-source-PVC
-        // errors. The previous "delete and recreate on first error"
-        // retry strategy fought the controller's own retry loop and
-        // made the race permanent — see commit history.
+        // wait_snapshot_ready tolerates the snapshot-controller's
+        // own transient errors ("object has been modified" 409
+        // reconcile loop, "VolumeSnapshotBeingCreated annotation"
+        // race). Only RBAC / missing-class / missing-source-PVC
+        // errors short-circuit; everything else is polled out
+        // until readyToUse=true.
         k8s.create_volume_snapshot(&ws_snap, &src_ws_pvc)
             .await
             .context("create workspaces snapshot")?;
         k8s.create_volume_snapshot(&docker_snap, &src_docker_pvc)
             .await
             .context("create docker snapshot")?;
+        set_phase_json(
+            &mission_store,
+            new_mid,
+            "snapshotting",
+            snap_items("in_progress", "in_progress"),
+        )
+        .await;
         k8s.wait_snapshot_ready(&ws_snap, SNAPSHOT_TIMEOUT)
             .await
             .context("wait workspaces snapshot ready")?;
+        set_phase_json(
+            &mission_store,
+            new_mid,
+            "snapshotting",
+            snap_items("done", "in_progress"),
+        )
+        .await;
         k8s.wait_snapshot_ready(&docker_snap, SNAPSHOT_TIMEOUT)
             .await
             .context("wait docker snapshot ready")?;
+        set_phase_json(
+            &mission_store,
+            new_mid,
+            "snapshotting",
+            snap_items("done", "done"),
+        )
+        .await;
 
         // Snapshot data is captured. Source dockerd can resume. We
         // unquiesce eagerly (not just via the guard's Drop) so the
@@ -345,49 +385,66 @@ async fn run_fork(
         // snapshot poll finishes.
         let _ = k8s.unquiesce_dockerd(source_mid).await;
 
-        set_phase(
+        // === pvc_provisioning ==========================================
+        let pvc_items = |ws: &str, dk: &str| {
+            json!({
+                "label": "Claiming forked volumes",
+                "items": [
+                    {"name": "workspaces", "status": ws},
+                    {"name": "docker",     "status": dk},
+                ],
+            })
+        };
+        set_phase_json(
             &mission_store,
             new_mid,
-            "forking",
-            "Provisioning forked PVCs",
+            "pvc_provisioning",
+            pvc_items("pending", "pending"),
         )
         .await;
         k8s.create_pvc_from_snapshot(&new_ws_pvc, &ws_snap, WORKSPACES_VOLUME_SIZE)
             .await
             .context("create workspaces PVC from snapshot")?;
+        set_phase_json(
+            &mission_store,
+            new_mid,
+            "pvc_provisioning",
+            pvc_items("done", "in_progress"),
+        )
+        .await;
         k8s.create_pvc_from_snapshot(&new_docker_pvc, &docker_snap, DOCKER_VOLUME_SIZE)
             .await
             .context("create docker PVC from snapshot")?;
+        set_phase_json(
+            &mission_store,
+            new_mid,
+            "pvc_provisioning",
+            pvc_items("done", "done"),
+        )
+        .await;
 
-        set_phase(&mission_store, new_mid, "pulling", "Pulling current image").await;
+        // === pod_starting ==============================================
+        set_phase_json(
+            &mission_store,
+            new_mid,
+            "pod_starting",
+            json!({
+                "label": "Starting forked pod",
+                "sub": "Pulling current image and attaching volumes",
+            }),
+        )
+        .await;
         k8s.create_forked_mission_pod(new_mid, workspace_id, &env_vars, init_script.as_deref())
             .await
             .context("create forked mission pod")?;
-
-        set_phase(
-            &mission_store,
-            new_mid,
-            "container_starting",
-            "Waiting for pod to become ready",
-        )
-        .await;
         k8s.wait_for_ready(new_mid, POD_READY_TIMEOUT)
             .await
             .context("forked pod did not become ready")?;
 
         // Clear the autostack marker the source pod left on its
-        // `/workspaces` PVC. Without this, `bashenv.sh` sees
-        // `/workspaces/.sandboxed-autostack-done` and skips the
-        // `docker compose up -d` pass — leaving the inherited
-        // compose containers in their `Exited` state from when the
-        // source pod was paused. The fork's image cache is intact
-        // (the docker PVC carries every layer), so `compose up -d`
-        // on first bash exec is fast: re-create the containers,
-        // no image re-pull.
-        //
-        // Best-effort: if the exec fails, the operator can still
-        // `rm /workspaces/.sandboxed-autostack-done` by hand or
-        // run `docker compose up -d` directly.
+        // `/workspaces` PVC so bashenv's `docker compose up -d`
+        // pass actually fires on the fork. See history for the
+        // rationale + best-effort error handling.
         let _ = k8s
             .exec_command(
                 new_mid,
@@ -414,7 +471,84 @@ async fn run_fork(
         let _ = k8s.delete_volume_snapshot(&ws_snap).await;
         let _ = k8s.delete_volume_snapshot(&docker_snap).await;
 
-        set_phase(&mission_store, new_mid, "ready", "Forked mission is ready").await;
+        // === dockerd_starting ==========================================
+        set_phase_json(
+            &mission_store,
+            new_mid,
+            "dockerd_starting",
+            json!({ "label": "Starting Docker daemon inside the pod" }),
+        )
+        .await;
+        k8s.wait_dockerd_ready(new_mid, Duration::from_secs(120))
+            .await
+            .context("dockerd did not become ready")?;
+
+        // === compose_starting ==========================================
+        // Trigger the autostack pass once dockerd is up by running a
+        // throwaway bash. The bashenv hook then kicks the background
+        // `docker compose up -d` task. We need the trigger because
+        // the fork's first agent bash hasn't run yet — but the
+        // marker-clear above already happened, so bashenv WILL run
+        // the compose-up step on this exec.
+        let _ = k8s
+            .exec_command(
+                new_mid,
+                None,
+                "/bin/bash",
+                &["-c".to_string(), "true".to_string()],
+                &HashMap::new(),
+            )
+            .await;
+        // Poll compose service status, surfacing each tick's snapshot
+        // into pod_message so the dashboard's per-service sub-list
+        // walks starting → healthy live.
+        set_phase_json(
+            &mission_store,
+            new_mid,
+            "compose_starting",
+            json!({
+                "label": "Starting compose services",
+                "services": []
+            }),
+        )
+        .await;
+        let mission_store_for_cb = mission_store.clone();
+        k8s.wait_compose_healthy(new_mid, Duration::from_secs(360), move |services| {
+            let detail = json!({
+                "label": "Starting compose services",
+                "services": services
+                    .iter()
+                    .map(|s| json!({
+                        "service": s.service,
+                        "state": s.state,
+                        "health": s.health,
+                        "status": s.status,
+                        "image": s.image,
+                    }))
+                    .collect::<Vec<_>>(),
+            });
+            let store = mission_store_for_cb.clone();
+            tokio::spawn(async move {
+                let _ = store
+                    .update_mission_pod_phase(
+                        new_mid,
+                        Some("compose_starting"),
+                        Some(&detail.to_string()),
+                    )
+                    .await;
+            });
+        })
+        .await
+        .context("compose services did not become healthy")?;
+
+        // === ready =====================================================
+        set_phase_json(
+            &mission_store,
+            new_mid,
+            "ready",
+            json!({ "label": "Forked mission is ready" }),
+        )
+        .await;
         Ok::<(), anyhow::Error>(())
     }
     .await;
@@ -444,10 +578,13 @@ async fn run_fork(
             let _ = k8s.destroy_mission_pod(new_mid).await; // pod + 2 PVCs
             let _ = k8s.delete_volume_snapshot(&ws_snap).await;
             let _ = k8s.delete_volume_snapshot(&docker_snap).await;
-            let msg = format!("Fork failed: {chained}");
-            let _ = mission_store
-                .update_mission_pod_phase(new_mid, Some("error"), Some(&msg))
-                .await;
+            set_phase_json(
+                &mission_store,
+                new_mid,
+                "error",
+                json!({ "label": "Fork failed", "error": chained }),
+            )
+            .await;
             let _ = mission_store
                 .update_mission_status(new_mid, MissionStatus::Failed)
                 .await;
@@ -456,14 +593,21 @@ async fn run_fork(
     }
 }
 
-async fn set_phase(
+/// Update mission `pod_phase` + `pod_message`, with the message body
+/// serialised as JSON for the dashboard's `ForkProgressOverlay` to
+/// parse. The overlay JSON-parses `pod_message` opportunistically
+/// and falls back to rendering the raw string if it isn't valid
+/// JSON — so non-fork phases (which historically wrote plain
+/// strings) still work without changes.
+async fn set_phase_json(
     mission_store: &Arc<dyn MissionStore>,
     mission_id: Uuid,
     phase: &str,
-    message: &str,
+    detail: serde_json::Value,
 ) {
+    let body = detail.to_string();
     let _ = mission_store
-        .update_mission_pod_phase(mission_id, Some(phase), Some(message))
+        .update_mission_pod_phase(mission_id, Some(phase), Some(&body))
         .await;
 }
 

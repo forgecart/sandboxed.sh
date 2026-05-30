@@ -960,6 +960,102 @@ impl K8sPodClient {
         }
     }
 
+    /// Wait until the inner dockerd is responsive. The workspace-base
+    /// entrypoint spawns `dockerd` in the background; pod-level
+    /// `wait_for_ready` returns when the *container* is ready, but
+    /// `docker version` doesn't succeed for another ~10 s while
+    /// dockerd binds `/var/run/docker.sock` and initialises the
+    /// containerd backend. The fork progress overlay needs that
+    /// finer-grained signal — otherwise the operator sees a green
+    /// "pod ready" row while `docker ps` would still fail inside.
+    pub async fn wait_dockerd_ready(&self, mission_id: Uuid, timeout: Duration) -> Result<()> {
+        let start = Instant::now();
+        loop {
+            let probe = self
+                .exec_command(
+                    mission_id,
+                    None,
+                    "/bin/sh",
+                    &[
+                        "-c".to_string(),
+                        "docker version --format '{{.Server.Version}}' 2>/dev/null".to_string(),
+                    ],
+                    &HashMap::new(),
+                )
+                .await;
+            if let Ok(out) = probe {
+                if out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+                    return Ok(());
+                }
+            }
+            if start.elapsed() > timeout {
+                bail!(
+                    "dockerd in pod {} did not respond within {:?}",
+                    pod_name(mission_id),
+                    timeout
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    /// Wait until every compose service is either `running + healthy`
+    /// (or `running` with no healthcheck) or a successfully-exited
+    /// init container. Calls `progress_cb` on each poll so the fork
+    /// orchestrator can serialise the latest service list into the
+    /// mission's `pod_message` for the dashboard's per-service UI.
+    ///
+    /// Returns Err on timeout — the caller surfaces that as a
+    /// fork-stalled error and the operator inspects via the
+    /// overlay's last-known service list.
+    pub async fn wait_compose_healthy<F>(
+        &self,
+        mission_id: Uuid,
+        timeout: Duration,
+        mut progress_cb: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[DockerServiceStatus]),
+    {
+        let start = Instant::now();
+        // First poll may return empty if `bashenv.sh` hasn't kicked
+        // its background `docker compose up -d` yet. We tolerate
+        // empty-for-a-while: only after `EMPTY_GRACE_SECS` do we
+        // treat empty as "compose is done with nothing to start".
+        const EMPTY_GRACE_SECS: u64 = 30;
+        loop {
+            let services = self
+                .query_docker_compose_status(mission_id)
+                .await
+                .unwrap_or_default();
+            progress_cb(&services);
+            if services.is_empty() {
+                if start.elapsed().as_secs() >= EMPTY_GRACE_SECS {
+                    // No compose files in the inherited /workspaces/repos
+                    // (or all repos were filtered out by SANDBOXED_AUTOSTACK_REPOS).
+                    // The fork is "ready" — nothing to wait for.
+                    return Ok(());
+                }
+            } else if all_compose_services_healthy(&services) {
+                return Ok(());
+            }
+            if start.elapsed() > timeout {
+                let unhealthy: Vec<&str> = services
+                    .iter()
+                    .filter(|s| !is_service_ready(s))
+                    .map(|s| s.service.as_str())
+                    .collect();
+                bail!(
+                    "compose services did not become healthy in {:?} for pod {} (unhealthy: {})",
+                    timeout,
+                    pod_name(mission_id),
+                    unhealthy.join(", ")
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
     /// Run a one-shot command inside the workspace pod. Mirrors
     /// `std::process::Command::output()`'s return shape so callers in
     /// `workspace_exec.rs::output()` can use it as a drop-in.
@@ -1883,6 +1979,30 @@ fn is_404(e: &kube::Error) -> bool {
         e,
         kube::Error::Api(api_err) if api_err.code == 404
     )
+}
+
+/// True when a compose service has finished bringing itself up — it
+/// reached `running` with health `healthy` (or no healthcheck), or it
+/// exited cleanly (`exited` + status code 0, the init-container case
+/// like `shop-beta-citus-init-1`).
+pub(crate) fn is_service_ready(s: &DockerServiceStatus) -> bool {
+    let state = s.state.as_str();
+    let health = s.health.as_str();
+    if state == "exited" {
+        // `status` is the raw docker line ("Exited (0) 3 minutes ago").
+        // Treat zero exit as success; anything else is a failure to
+        // surface.
+        return s.status.contains("Exited (0)");
+    }
+    if state != "running" {
+        return false;
+    }
+    // Healthy, or no healthcheck (compose v2 returns empty health).
+    matches!(health, "healthy" | "" | "none")
+}
+
+pub(crate) fn all_compose_services_healthy(services: &[DockerServiceStatus]) -> bool {
+    !services.is_empty() && services.iter().all(is_service_ready)
 }
 
 /// True when a VolumeSnapshot's `status.error.message` represents a

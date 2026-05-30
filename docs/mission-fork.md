@@ -214,3 +214,89 @@ End-to-end test against the live cluster (`code.forgecart.com`):
     source pod (`kubectl delete pod m-<src>`). The fork's pod_phase
     flips to `error`, mission status to `failed`, the source's
     dockerd is unpaused, and no orphan snapshots / PVCs remain.
+
+## Per-step progress UX
+
+The dashboard's **`ForkProgressOverlay`**
+(`dashboard/src/components/fork-progress-overlay.tsx`) replaces the
+mission's chat pane with a granular checklist whenever
+`mission.pod_phase` is anything in the fork taxonomy other than
+`ready`. The composer is hard-disabled in this state — the
+`shouldBlockComposer` helper exported from the overlay file gates
+`canSubmitComposer` in `control-client.tsx`.
+
+The phases walk strictly in order:
+
+| `pod_phase` | UI row label | Typical duration |
+|---|---|---|
+| `events_copying` | Copy conversation history | < 1 s |
+| `quiescing_source` | Pause source docker | < 5 s |
+| `snapshotting` | Snapshot source disks (workspaces + docker) | 5–60 s |
+| `pvc_provisioning` | Claim forked volumes from snapshots | 1–3 s |
+| `pod_starting` | Start forked pod (image pull + PVC attach) | 30 s – 2 min |
+| `dockerd_starting` | Start Docker daemon | ≤ 15 s |
+| `compose_starting` | Start docker-compose services | 30 s – 3 min |
+| `ready` | Ready — composer unlocked | — |
+
+The orchestrator (`src/api/mission_fork.rs::run_fork`) stuffs a JSON
+body into `pod_message` so the overlay can render per-item detail:
+
+- During `snapshotting` / `pvc_provisioning`: the `items` array
+  shows per-volume status (`pending → in_progress → done`).
+- During `compose_starting`: the `services` array carries every
+  compose container's `service`, `state`, `health`, and `status`
+  — the overlay renders each as a sub-row with its own dot
+  (spinner → green check on healthy; red triangle on a non-zero
+  exit).
+
+The overlay tolerates legacy (plain-string) `pod_message` values
+by falling back to rendering the raw string — so non-fork
+missions whose pod_phase is one of the older labels
+(`pvc_binding`, `pod_scheduled`, `pulling`, …) still get a usable
+`PodStartupBanner` rendered above the composer.
+
+### Readiness probes
+
+Two probes live in `src/k8s_pod.rs`:
+
+- **`wait_dockerd_ready(mission_id, timeout)`** — execs
+  `docker version` inside the pod every 2 s until the server
+  version line is non-empty. Pod-`Running` is necessary but not
+  sufficient: the workspace-base entrypoint spawns `dockerd` in
+  the background, and there's a ~10 s tail before
+  `/var/run/docker.sock` is bound. Without this probe, the
+  fork's first `docker compose up -d` raced with dockerd's own
+  init.
+
+- **`wait_compose_healthy(mission_id, timeout, progress_cb)`** —
+  polls `query_docker_compose_status` (same helper that drives
+  the post-ready `DockerServicesPanel`) every 2 s. Returns when
+  every service is `running + healthy` (or `running` with no
+  healthcheck) or `exited(0)` (init containers like
+  `citus-init`). On each tick, `progress_cb` fires so the
+  orchestrator can stuff the latest service list into the
+  mission's `pod_message`. A 30 s grace window covers the case
+  where bashenv hasn't kicked its background `docker compose up -d`
+  yet on the first tick.
+
+Both probes are reused by `mission_runner` (the activation gate
+at `mission_runner.rs:3194`) so non-fork K8sPod missions also
+wait for dockerd readiness before the first claude-CLI resolver
+call — the same race that produced the misleading
+*"Claude Code CLI 'claude' not found and neither npm nor bun is
+available"* error.
+
+### Race fix
+
+The original bug: a user sent their first message 7 s after
+clicking Fork; `mission_runner` activated immediately, ran the
+claude-CLI resolver via `kubectl exec` into the not-yet-Ready
+pod, got `container not found ("workspace")`, fell into the
+auto-install branch which then said "neither npm nor bun
+available" — both checks failed for the same reason. The
+`wait_dockerd_ready` addition + the dashboard composer-gate (the
+user *can't send* a message until phase=ready) eliminate this
+race end-to-end. The misleading error path is now dead code on
+the happy path; on real failures the orchestrator surfaces a
+coherent `error` row with the underlying cause in
+`pod_message.error`.

@@ -28,6 +28,10 @@ import {
 } from "@/components/enhanced-input";
 import { MissionAutomationsDialog } from "@/components/mission-automations-dialog";
 import { PerfOverlay } from "@/components/perf-overlay";
+import {
+  ForkProgressOverlay,
+  shouldBlockComposer,
+} from "@/components/fork-progress-overlay";
 import { deriveAssistantTurnStatus } from "@/lib/assistant-turn-status";
 import { perfBus } from "@/lib/perf-bus";
 import { isStreamContinuation } from "@/lib/stream-continuation";
@@ -2654,12 +2658,20 @@ function MissionWorkbenchPanel({
               )}
             </section>
 
-            {mission.status === "pending" && mission.pod_phase && (
-              <PodStartupBanner
-                phase={mission.pod_phase}
-                message={mission.pod_message ?? null}
-              />
-            )}
+            {/* Legacy non-fork pod-startup banner. The new
+                ForkProgressOverlay (rendered in the chat pane)
+                supersedes this for any phase in the fork taxonomy
+                (events_copying → ready); only the historical
+                phases (pvc_binding / pod_scheduled / pulling / …)
+                still render here. */}
+            {mission.status === "pending" &&
+              mission.pod_phase &&
+              !shouldBlockComposer(mission.pod_phase) && (
+                <PodStartupBanner
+                  phase={mission.pod_phase}
+                  message={mission.pod_message ?? null}
+                />
+              )}
 
             {dockerServices && dockerServices.length > 0 && (
               <DockerServicesPanel services={dockerServices} />
@@ -6265,7 +6277,19 @@ export default function ControlClient() {
 
   // Treat "waiting_for_tool" as not busy for message input (user should respond immediately)
   const isBusy = viewingRunState === "running";
-  const canSubmitComposer = canSubmitInput || input.trim().length > 0;
+
+  // Fork pod still booting — block the composer + replace the chat
+  // view with a granular progress checklist. `shouldBlockComposer`
+  // matches the backend's fork-phase taxonomy (see
+  // `src/api/mission_fork.rs` + `components/fork-progress-overlay.tsx`).
+  // Existing nspawn/Host missions don't emit these phases, so this
+  // is a no-op for them.
+  const forkPodBlocking = shouldBlockComposer(
+    viewingMission?.pod_phase ?? null,
+  );
+
+  const canSubmitComposer =
+    (canSubmitInput || input.trim().length > 0) && !forkPodBlocking;
 
   // Goal-mode state, keyed by mission id. Updated from `goal_iteration` /
   // `goal_status` SSE events. Cleared when status reaches a terminal value
@@ -12073,6 +12097,24 @@ export default function ControlClient() {
               </div>
             )}
             {/* Messages */}
+            {/* Fork pod boot — replace the chat with a blocking,
+                granular progress checklist while the fork's pod_phase
+                walks events_copying → snapshotting → ... → ready.
+                Once phase=ready the chat returns. */}
+            {forkPodBlocking && viewingMission ? (
+              <div
+                key={viewingMissionId ?? "no-mission"}
+                data-testid="fork-progress-overlay"
+                className="flex-1 overflow-hidden"
+              >
+                <ForkProgressOverlay
+                  phase={viewingMission.pod_phase ?? null}
+                  message={viewingMission.pod_message ?? null}
+                  title={viewingMission.title ?? null}
+                />
+              </div>
+            ) : (
+            <>
             {/* `key={viewingMissionId}` forces the entire chat
                 scroll container — virtualizer, ToolCallItem
                 expansions, ThinkingGroups, SubagentChatView,
@@ -12434,9 +12476,11 @@ export default function ControlClient() {
               )}
               </>)}
             </div>
+            </>
+            )}
 
             {/* Scroll to bottom button */}
-            {!isAtBottom && items.length > 0 && (
+            {!isAtBottom && items.length > 0 && !forkPodBlocking && (
               <button
                 onClick={() => scrollToBottom()}
                 className="absolute bottom-20 right-6 p-2 rounded-full bg-white/[0.1] border border-white/[0.1] text-white/60 hover:bg-white/[0.15] hover:text-white/80 transition-all shadow-lg"

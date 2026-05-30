@@ -3238,6 +3238,31 @@ async fn run_mission_turn(
                 // through the normal agent error path. The user
                 // sees the kube error rather than a silent hang.
             }
+            // Pod Ready ≠ dockerd Ready. The workspace-base
+            // entrypoint spawns `dockerd` in the background and
+            // it takes another ~10 s to bind /var/run/docker.sock
+            // and finish initialising containerd. The agent's
+            // first turn doesn't strictly need docker, but
+            // anything the agent does that hits docker (compose,
+            // pulling an image, etc.) will fail mysteriously if
+            // dockerd isn't responsive yet. More directly: the
+            // fork-progress race we observed had `kubectl exec`
+            // succeed against a Ready container while the
+            // resolver was probing for npm/bun via `which` —
+            // those `which` calls hit "container not found"
+            // because the kubelet's exec channel races with the
+            // pod's runtime. Waiting for dockerd is a stable
+            // signal that the pod is genuinely up.
+            if let Err(e) = k8s
+                .wait_dockerd_ready(mission_id, std::time::Duration::from_secs(120))
+                .await
+            {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    error = %e,
+                    "wait_dockerd_ready timed out / failed; continuing anyway since agent may not need docker"
+                );
+            }
         }
     }
 
