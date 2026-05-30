@@ -8852,23 +8852,23 @@ async fn control_actor_loop(
                         mission_id,
                         std::time::Duration::from_secs(360),
                         move |services| {
-                            let body = serde_json::json!({
-                                "label": "Starting compose services",
-                                "services": services
-                                    .iter()
-                                    .map(|s| serde_json::json!({
-                                        "service": s.service,
-                                        "state":   s.state,
-                                        "health":  s.health,
-                                        "status":  s.status,
-                                        "image":   s.image,
-                                    }))
-                                    .collect::<Vec<_>>(),
-                            })
-                            .to_string();
                             let store = mission_store_for_cb.clone();
                             let tx = events_tx_for_cb.clone();
-                            tokio::spawn(async move {
+                            async move {
+                                let body = serde_json::json!({
+                                    "label": "Starting compose services",
+                                    "services": services
+                                        .iter()
+                                        .map(|s| serde_json::json!({
+                                            "service": s.service,
+                                            "state":   s.state,
+                                            "health":  s.health,
+                                            "status":  s.status,
+                                            "image":   s.image,
+                                        }))
+                                        .collect::<Vec<_>>(),
+                                })
+                                .to_string();
                                 let _ = store
                                     .update_mission_pod_phase(
                                         mission_id,
@@ -8881,7 +8881,7 @@ async fn control_actor_loop(
                                     phase: "compose_starting".to_string(),
                                     message: body,
                                 });
-                            });
+                            }
                         },
                     )
                     .await;

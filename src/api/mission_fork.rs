@@ -514,21 +514,21 @@ async fn run_fork(
         .await;
         let mission_store_for_cb = mission_store.clone();
         k8s.wait_compose_healthy(new_mid, Duration::from_secs(360), move |services| {
-            let detail = json!({
-                "label": "Starting compose services",
-                "services": services
-                    .iter()
-                    .map(|s| json!({
-                        "service": s.service,
-                        "state": s.state,
-                        "health": s.health,
-                        "status": s.status,
-                        "image": s.image,
-                    }))
-                    .collect::<Vec<_>>(),
-            });
             let store = mission_store_for_cb.clone();
-            tokio::spawn(async move {
+            async move {
+                let detail = json!({
+                    "label": "Starting compose services",
+                    "services": services
+                        .iter()
+                        .map(|s| json!({
+                            "service": s.service,
+                            "state": s.state,
+                            "health": s.health,
+                            "status": s.status,
+                            "image": s.image,
+                        }))
+                        .collect::<Vec<_>>(),
+                });
                 let _ = store
                     .update_mission_pod_phase(
                         new_mid,
@@ -536,7 +536,7 @@ async fn run_fork(
                         Some(&detail.to_string()),
                     )
                     .await;
-            });
+            }
         })
         .await
         .context("compose services did not become healthy")?;

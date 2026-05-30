@@ -1008,14 +1008,15 @@ impl K8sPodClient {
     /// Returns Err on timeout — the caller surfaces that as a
     /// fork-stalled error and the operator inspects via the
     /// overlay's last-known service list.
-    pub async fn wait_compose_healthy<F>(
+    pub async fn wait_compose_healthy<F, Fut>(
         &self,
         mission_id: Uuid,
         timeout: Duration,
         mut progress_cb: F,
     ) -> Result<()>
     where
-        F: FnMut(&[DockerServiceStatus]),
+        F: FnMut(Vec<DockerServiceStatus>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send,
     {
         let start = Instant::now();
         // First poll may return empty if `bashenv.sh` hasn't kicked
@@ -1028,7 +1029,12 @@ impl K8sPodClient {
                 .query_docker_compose_status(mission_id)
                 .await
                 .unwrap_or_default();
-            progress_cb(&services);
+            // Run the progress callback to completion *inline* — if we
+            // spawned it instead, a late-completing callback could
+            // race with the caller's post-wait "ready" pod_phase
+            // update and overwrite it with the stale "compose_starting"
+            // payload. Bug observed live on mission e9eeea6c.
+            progress_cb(services.clone()).await;
             if services.is_empty() {
                 if start.elapsed().as_secs() >= EMPTY_GRACE_SECS {
                     // No compose files in the inherited /workspaces/repos
