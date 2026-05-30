@@ -65,6 +65,12 @@ pub struct ForkBody {
     /// (the topbar "Fork" button case). Threaded for a future
     /// "fork from message N" UI; backend already supports it.
     pub after_sequence: Option<i64>,
+    /// Model override for the forked mission. None / empty inherits the
+    /// source mission's model (the default one-click fork). The dashboard's
+    /// fork picker sends this so the operator can switch models when forking
+    /// — e.g. retrying a wedged claudecode mission on a different Opus
+    /// version without touching the source.
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,13 +130,22 @@ pub async fn fork_mission_handler(
         )
     });
 
+    // The fork inherits the source's model unless the request overrides it
+    // (trimmed; an empty string means "inherit", same as omitting it).
+    let model_override = body
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .or(source.model_override.as_deref());
+
     let new_mission = control
         .mission_store
         .create_mission_with_parent(
             Some(&new_title),
             Some(source.workspace_id),
             source.agent.as_deref(),
-            source.model_override.as_deref(),
+            model_override,
             source.model_effort.as_deref(),
             Some(source.backend.as_str()),
             source.config_profile.as_deref(),

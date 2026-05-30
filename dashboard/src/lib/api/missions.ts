@@ -493,12 +493,13 @@ export async function deleteMission(
  */
 export async function forkMission(
   id: string,
-  options?: { title?: string; afterSequence?: number },
+  options?: { title?: string; afterSequence?: number; model?: string },
 ): Promise<{ mission_id: string; parent_mission_id: string }> {
   const body: Record<string, unknown> = {};
   if (options?.title !== undefined) body.title = options.title;
   if (options?.afterSequence !== undefined)
     body.after_sequence = options.afterSequence;
+  if (options?.model !== undefined) body.model = options.model;
   const res = await apiFetch(`/api/control/missions/${id}/fork`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

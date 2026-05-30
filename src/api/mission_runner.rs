@@ -10242,14 +10242,18 @@ async fn ensure_claudecode_cli_available(
 }
 
 fn desired_claudecode_version() -> String {
-    // 2.1.140 ships the bug-fixed native `/goal` slash command (added in
-    // 2.1.139, hardened against `disableAllHooks` / `allowManagedHooksOnly`
-    // in 2.1.140). Bumping the pin so the per-workspace install matches what
-    // `run_claudecode_native_goal` relies on.
+    // 2.1.156 fixes the Opus 4.8 thinking-block corruption that wedged missions
+    // with a repeating `messages.N.content.M: 'thinking' ... cannot be modified`
+    // 400 (anthropics/claude-code#10199); 2.1.152 additionally strips stale
+    // thinking-block signatures proactively on model/login switch with a retry
+    // safety-net. Still >= 2.1.140, so the hardened native `/goal` slash command
+    // that `run_claudecode_native_goal` relies on (added 2.1.139, hardened
+    // 2.1.140) is retained. Keep in sync with `CLAUDE_VERSION` in
+    // docker/workspace-base/Dockerfile.
     std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "2.1.140".to_string())
+        .unwrap_or_else(|| "2.1.158".to_string())
 }
 
 async fn claude_cli_matches_desired_version(

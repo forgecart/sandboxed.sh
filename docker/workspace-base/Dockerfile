@@ -54,7 +54,8 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 # (`desired_claudecode_version()` in src/api/mission_runner.rs). Pinning
 # avoids the "bun-fallback hang" path the resolver takes when
 # /usr/local/bin/claude --version doesn't substring-match.
-ARG CLAUDE_VERSION=2.1.140
+# 2.1.156 fixes the Opus 4.8 thinking-block 400 (anthropics/claude-code#10199).
+ARG CLAUDE_VERSION=2.1.158
 # typescript-language-server runs alongside the agent so the dashboard's
 # Monaco editor can connect over the LSP WebSocket bridge (see
 # `/api/control/missions/:id/lsp`) and get real cross-file diagnostics,

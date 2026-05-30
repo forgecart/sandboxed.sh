@@ -89,6 +89,7 @@ import {
   cancelMission,
   deleteMission,
   forkMission,
+  listBackendModelOptions,
   autoGenerateMissionTitle,
   listWorkspaces,
   getHealth,
@@ -105,6 +106,7 @@ import {
   type Mission,
   type MissionStatus,
   type ModelEffort,
+  type BackendModelOption,
   type RunningMissionInfo,
   type UploadProgress,
   type Workspace,
@@ -5426,6 +5428,13 @@ export default function ControlClient() {
   // Workspaces for mission creation
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
 
+  // Per-backend model catalogs, keyed by backend id (e.g. "claudecode").
+  // Powers the on-the-fly model selector in the mission run-settings panel
+  // and the model picker in the fork dialog.
+  const [backendModelOptions, setBackendModelOptions] = useState<
+    Record<string, BackendModelOption[]>
+  >({});
+
   // Library context for agents
 
   // Only tick when stream is active to avoid unnecessary re-renders
@@ -5542,6 +5551,12 @@ export default function ControlClient() {
   const desktopDisplayIdRef = useRef(":99");
   const [showDisplaySelector, setShowDisplaySelector] = useState(false);
   const [hasDesktopSession, setHasDesktopSession] = useState(false);
+
+  // Fork-with-model picker. Empty `forkModel` means "inherit the source's
+  // model" (the default one-click fork).
+  const [showForkMenu, setShowForkMenu] = useState(false);
+  const [forkModel, setForkModel] = useState<string>("");
+  const forkMenuRef = useRef<HTMLDivElement>(null);
   const [desktopSessions, setDesktopSessions] = useState<
     DesktopSessionDetail[]
   >([]);
@@ -7868,6 +7883,42 @@ export default function ControlClient() {
       });
   }, [authRetryTrigger]);
 
+  // Fetch the per-backend model catalogs for the on-the-fly model selector
+  // and the fork dialog's model picker. `includeAll` so every configured
+  // provider's models are offered, not just the currently-default one.
+  useEffect(() => {
+    listBackendModelOptions({ includeAll: true })
+      .then((data) => {
+        setBackendModelOptions(data.backends ?? {});
+      })
+      .catch((err) => {
+        if (isNetworkError(err)) return;
+        console.error("Failed to fetch backend model options:", err);
+      });
+  }, [authRetryTrigger]);
+
+  // Close the fork-with-model picker on outside click / Escape.
+  useEffect(() => {
+    if (!showForkMenu) return;
+    function handlePointerDown(event: MouseEvent) {
+      if (
+        forkMenuRef.current &&
+        !forkMenuRef.current.contains(event.target as Node)
+      ) {
+        setShowForkMenu(false);
+      }
+    }
+    function handleKey(event: KeyboardEvent) {
+      if (event.key === "Escape") setShowForkMenu(false);
+    }
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKey);
+    };
+  }, [showForkMenu]);
+
   // Fetch server configuration (max_iterations) from health endpoint
   useEffect(() => {
     getHealth()
@@ -7924,10 +7975,13 @@ export default function ControlClient() {
   // the backend orchestrates the snapshot dance; the new mission's
   // pod_phase streams to "ready" over SSE.
   const handleForkMission = useCallback(
-    async (missionId: string, label: string) => {
+    async (missionId: string, label: string, model?: string) => {
       try {
         toast.info("Forking mission…");
-        const result = await forkMission(missionId);
+        const result = await forkMission(
+          missionId,
+          model ? { model } : undefined,
+        );
         toast.success(`Forked "${label}" — landing on the new pod`);
         router.push(`/control?mission=${result.mission_id}`);
       } catch (err) {
@@ -10873,6 +10927,13 @@ export default function ControlClient() {
     missionLoading &&
     !!viewingMissionId &&
     activeMission?.id !== viewingMissionId;
+  // Model catalog for the active mission's backend, driving the on-the-fly
+  // model selector below the backend row.
+  const activeMissionModelOptions = useMemo<BackendModelOption[]>(() => {
+    const backend = activeMission?.backend;
+    if (!backend) return [];
+    return backendModelOptions[backend] ?? [];
+  }, [activeMission?.backend, backendModelOptions]);
   const workspaceNameById = useMemo(() => {
     return Object.fromEntries(workspaces.map((ws) => [ws.id, ws.name]));
   }, [workspaces]);
@@ -11322,23 +11383,75 @@ export default function ControlClient() {
 
             {/* Fork mission — snapshots PVCs + spawns a fresh-image
                 pod with the same conversation + workspace + docker
-                state. Backend orchestrates async; we navigate to the
-                new mission immediately. */}
+                state. Clicking opens a small picker so the operator can
+                choose the fork's model (defaults to the source's model);
+                backend orchestrates async and we navigate immediately. */}
             {activeMission && (
-              <button
-                onClick={() =>
-                  handleForkMission(
-                    activeMission.id,
-                    activeMission.title?.trim() ||
-                      getMissionShortName(activeMission.id),
-                  )
-                }
-                className="flex items-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-2 text-sm text-white/70 transition-colors hover:border-white/[0.10] hover:bg-white/[0.04] hover:text-white"
-                title="Fork this mission onto a fresh pod (keeps disk + docker state)"
-              >
-                <GitFork className="h-4 w-4" />
-                <span className="hidden lg:inline">Fork</span>
-              </button>
+              <div className="relative" ref={forkMenuRef}>
+                <button
+                  onClick={() => {
+                    setForkModel("");
+                    setShowForkMenu((v) => !v);
+                  }}
+                  className="flex items-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-2 text-sm text-white/70 transition-colors hover:border-white/[0.10] hover:bg-white/[0.04] hover:text-white"
+                  title="Fork this mission onto a fresh pod (keeps disk + docker state)"
+                >
+                  <GitFork className="h-4 w-4" />
+                  <span className="hidden lg:inline">Fork</span>
+                  <ChevronDown className="h-3.5 w-3.5 opacity-60" />
+                </button>
+                {showForkMenu && (
+                  <div className="absolute right-0 top-full mt-1 z-50 min-w-[260px] rounded-lg border border-white/[0.06] bg-[#121214] p-3 shadow-xl">
+                    <div className="mb-2 text-xs font-medium text-white/70">
+                      Fork with model
+                    </div>
+                    <select
+                      value={forkModel}
+                      onChange={(e) => setForkModel(e.target.value)}
+                      className="w-full font-mono text-[11px] text-white/80 bg-white/[0.04] border border-white/[0.06] rounded px-2 py-1.5 focus:outline-none focus:border-indigo-400/50"
+                    >
+                      <option value="" className="bg-[#1a1a1a]">
+                        Same as source
+                        {activeMission.model_override
+                          ? ` (${activeMission.model_override})`
+                          : ""}
+                      </option>
+                      {activeMissionModelOptions.map((opt) => (
+                        <option
+                          key={opt.value}
+                          value={opt.value}
+                          className="bg-[#1a1a1a]"
+                        >
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="mt-3 flex items-center justify-end gap-2">
+                      <button
+                        onClick={() => setShowForkMenu(false)}
+                        className="rounded-md px-2.5 py-1.5 text-xs text-white/50 transition-colors hover:text-white/80"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={() => {
+                          setShowForkMenu(false);
+                          handleForkMission(
+                            activeMission.id,
+                            activeMission.title?.trim() ||
+                              getMissionShortName(activeMission.id),
+                            forkModel || undefined,
+                          );
+                        }}
+                        className="flex items-center gap-1.5 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2.5 py-1.5 text-xs text-indigo-300 transition-colors hover:border-indigo-500/50 hover:bg-indigo-500/20"
+                      >
+                        <GitFork className="h-3.5 w-3.5" />
+                        Fork
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
             )}
 
             {/* Delete mission — destructive, confirms before firing.
@@ -11704,17 +11817,47 @@ export default function ControlClient() {
                             </span>
                           </div>
                         )}
-                        {activeMission.model_override && (
+                        {(activeMissionModelOptions.length > 0 ||
+                          activeMission.model_override) && (
                           <div className="flex items-center justify-between gap-2">
-                            <span className="text-white/40">
-                              Model override
-                            </span>
-                            <span
-                              className="font-mono text-[11px] text-indigo-400 truncate max-w-[160px]"
-                              title={activeMission.model_override}
+                            <span className="text-white/40">Model</span>
+                            <select
+                              value={activeMission.model_override ?? ""}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                void handleUpdateMissionSettings({
+                                  modelOverride: v || undefined,
+                                });
+                              }}
+                              disabled={missionLoading}
+                              className="font-mono text-[11px] text-indigo-300 bg-white/[0.04] border border-white/[0.06] rounded px-1.5 py-0.5 focus:outline-none focus:border-indigo-400/50 disabled:opacity-50 max-w-[160px] truncate"
+                              title="Change the mission's model on the fly"
                             >
-                              {activeMission.model_override}
-                            </span>
+                              <option value="" className="bg-[#1a1a1a]">
+                                default
+                              </option>
+                              {activeMission.model_override &&
+                                !activeMissionModelOptions.some(
+                                  (o) =>
+                                    o.value === activeMission.model_override,
+                                ) && (
+                                  <option
+                                    value={activeMission.model_override}
+                                    className="bg-[#1a1a1a]"
+                                  >
+                                    {activeMission.model_override}
+                                  </option>
+                                )}
+                              {activeMissionModelOptions.map((opt) => (
+                                <option
+                                  key={opt.value}
+                                  value={opt.value}
+                                  className="bg-[#1a1a1a]"
+                                >
+                                  {opt.label}
+                                </option>
+                              ))}
+                            </select>
                           </div>
                         )}
                         {(activeMission.backend === "claudecode" ||
