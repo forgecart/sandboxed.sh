@@ -1490,6 +1490,21 @@ done
              - **`/workspaces`** (this directory) is scratch — write per-project work into the \
                correct `/workspaces/repos/<name>/` subdir, not at `/workspaces` root.\n",
         );
+        md.push_str(
+            "\n## Background CI watcher\n\n\
+             When you run `gh pr create`, `gh pr merge`, `gh run rerun`, \
+             `gh workflow run`, or `git push`, the backend automatically watches \
+             the resulting CI run and will inject a `<system-reminder>` carrying \
+             the verdict, check list, and (on failure) failed-job log tail when \
+             it completes. You don't need to do anything to opt in.\n\n\
+             **Do not** call `gh run watch`, `gh pr checks --watch`, or \
+             `gh actions watch` yourself. They block your turn and waste minutes \
+             of context. The shell wrapper in this pod also intercepts those \
+             subcommands and exits with a hint instead of running them — your \
+             call would just be rejected. Fire-and-forget your push or PR \
+             command and continue with other work; the watcher will deliver the \
+             outcome.\n",
+        );
 
         // Write the file via a small heredoc-style exec to avoid
         // dealing with quoting in `echo`. Base64 keeps embedded

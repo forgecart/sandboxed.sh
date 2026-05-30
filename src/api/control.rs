@@ -3331,6 +3331,12 @@ pub struct ControlState {
     /// `mission_runner::run_mission_turn` writes to it on every
     /// `Bash(run_in_background:true)` tool_use → tool_result pair.
     pub bg_watcher: super::background_watcher::SharedBackgroundWatcher,
+    /// Per-mission registry of pending CI watches (gh pr create /
+    /// gh pr merge / gh run rerun / gh workflow run / git push). Each
+    /// registration owns a backend-spawned `gh ... --watch`
+    /// subprocess that injects a `<system-reminder>` when CI terminates.
+    /// See `src/api/pr_ci_watcher.rs`.
+    pub pr_ci_watcher: super::pr_ci_watcher::SharedPrCiWatcher,
 }
 
 /// Control session manager for per-user sessions.
@@ -6222,6 +6228,19 @@ fn spawn_control_session(
     let bg_watcher = super::background_watcher::SharedBackgroundWatcher::new();
     super::background_watcher::install_global_watcher(bg_watcher.clone());
 
+    // PR-CI watcher: shares ControlState's command sender so the
+    // backend-owned `gh ... --watch` subprocesses can inject their
+    // verdict via the existing InjectSystemReminder path. No tick
+    // loop — one tokio task per registered CI invocation, spawned
+    // by `mission_runner` on the matching ToolResult.
+    let pr_ci_watcher = super::pr_ci_watcher::SharedPrCiWatcher::new();
+    super::pr_ci_watcher::install_global_deps(super::pr_ci_watcher::CiWatcherDeps {
+        watcher: pr_ci_watcher.clone(),
+        cmd_tx: cmd_tx.clone(),
+        mission_store: Arc::clone(&mission_store),
+        workspaces: workspaces.clone(),
+    });
+
     let state = ControlState {
         cmd_tx,
         events_tx: events_tx.clone(),
@@ -6236,6 +6255,7 @@ fn spawn_control_session(
         mission_store: Arc::clone(&mission_store),
         mission_search_cache,
         bg_watcher: bg_watcher.clone(),
+        pr_ci_watcher,
     };
 
     // Spawn the main control actor

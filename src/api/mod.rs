@@ -47,6 +47,7 @@ mod monitoring;
 mod native_loop_observer;
 pub mod opencode;
 pub mod paloma;
+pub mod pr_ci_watcher;
 mod provider_usage_cache;
 mod providers;
 pub(crate) mod proxy;

@@ -9,6 +9,50 @@
 # is rooted directly at /workspaces — no /workspaces/mission-*
 # wrapper anymore.
 #
+# Also: a `gh()` shell function that intercepts agent-side CI watch
+# commands so the backend's pr-ci-watcher
+# (src/api/pr_ci_watcher.rs) has the only watch in flight. See the
+# function definition at the bottom of this file for the rationale.
+
+# ── CI-watch interception ────────────────────────────────────────────
+# The sandboxed.sh backend already watches CI runs you've kicked off
+# via `gh pr create`, `gh pr merge`, `gh run rerun`, `gh workflow
+# run`, and `git push`, and will inject a <system-reminder> into your
+# next turn with the verdict + checks + (on failure) log tail. You
+# don't need to block on `gh run watch` / `gh pr checks --watch` /
+# `gh actions watch` — and we don't let you, because doing so wastes
+# minutes of context for no signal you don't already get.
+#
+# This function intercepts those subcommands and exits with a hint.
+# Anything else is passed through to the real `gh`. Human operators
+# who really need to watch interactively can bypass with
+# `command gh ...`.
+gh() {
+  local s1="${1:-}" s2="${2:-}"
+  local blocked=0
+  if [ "$s1" = "run" ] && [ "$s2" = "watch" ]; then
+    blocked=1
+  elif [ "$s1" = "actions" ] && [ "$s2" = "watch" ]; then
+    blocked=1
+  elif [ "$s1" = "pr" ] && [ "$s2" = "checks" ] && \
+       echo " $* " | grep -q ' --watch '; then
+    blocked=1
+  fi
+  if [ "$blocked" -eq 0 ]; then
+    command gh "$@"
+    return $?
+  fi
+  cat >&2 <<'EOF'
+[ci-watcher] This subcommand is intercepted. The sandboxed.sh
+backend already watches CI runs you've kicked off via `gh pr
+create`, `gh pr merge`, `gh run rerun`, `gh workflow run`, and
+`git push`, and will inject a <system-reminder> with the result.
+Don't block your turn here — continue with other work.
+EOF
+  return 2
+}
+export -f gh
+#
 # Key constraint: this script gets re-sourced on EVERY `kubectl exec`
 # into the workspace pod (each exec spawns a fresh bash). The login
 # and compose-up steps would otherwise run on every agent tool call

@@ -5492,6 +5492,22 @@ pub fn run_claudecode_turn<'a>(
             String,
             (String, Option<String>, chrono::DateTime<chrono::Utc>),
         > = HashMap::new();
+
+        // Same idea for the PR-CI watcher: when the agent fires a
+        // command that kicks off GitHub CI (gh pr create / gh pr
+        // merge / gh run rerun / gh workflow run / git push), stash
+        // the kind + command at ToolUse time so the matching
+        // ToolResult can parse the resulting URL / commit and spawn
+        // a backend-owned `gh ... --watch` subprocess. See
+        // `src/api/pr_ci_watcher.rs`.
+        let mut pending_ci_invocations: HashMap<
+            String,
+            (
+                crate::api::pr_ci_watcher::CiKind,
+                String,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        > = HashMap::new();
         let mut total_cost_usd: Option<f64> = None;
         let mut total_input_tokens: u64 = 0;
         let mut total_output_tokens: u64 = 0;
@@ -5933,6 +5949,34 @@ pub fn run_claudecode_turn<'a>(
                                                     );
                                                 }
 
+                                                // Capture CI-triggering Bash commands so the
+                                                // matching ToolResult can hand off to the
+                                                // pr-ci-watcher. See
+                                                // `src/api/pr_ci_watcher.rs`.
+                                                if name == "Bash"
+                                                    && crate::api::pr_ci_watcher::watcher_enabled()
+                                                {
+                                                    if let Some(command) = input
+                                                        .get("command")
+                                                        .and_then(|v| v.as_str())
+                                                    {
+                                                        if let Some(kind) =
+                                                            crate::api::pr_ci_watcher::detect_ci_invocation(
+                                                                command,
+                                                            )
+                                                        {
+                                                            pending_ci_invocations.insert(
+                                                                id.clone(),
+                                                                (
+                                                                    kind,
+                                                                    command.to_string(),
+                                                                    chrono::Utc::now(),
+                                                                ),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+
                                                 // Capture args from Claude Code's built-in
                                                 // ScheduleWakeup so the matching ToolResult
                                                 // can turn it into a real wakeup automation.
@@ -6245,6 +6289,53 @@ pub fn run_claudecode_turn<'a>(
                                                             "bg-watcher: registered background bash"
                                                         );
                                                     }
+                                                }
+                                            }
+
+                                            // Hand a CI-triggering Bash result off to the
+                                            // pr-ci-watcher. See `src/api/pr_ci_watcher.rs`.
+                                            // The watcher spawns its own backend-owned
+                                            // `gh ... --watch` subprocess; the agent never
+                                            // blocks on it.
+                                            if let Some((kind, command, started_at)) =
+                                                pending_ci_invocations.remove(&tool_use_id)
+                                            {
+                                                let content_str = content.to_string_lossy();
+                                                if let Some(target) =
+                                                    crate::api::pr_ci_watcher::parse_ci_target(
+                                                        kind,
+                                                        &content_str,
+                                                    )
+                                                {
+                                                    if let Some(deps) =
+                                                        crate::api::pr_ci_watcher::global_deps()
+                                                    {
+                                                        let task = crate::api::pr_ci_watcher::CiTask {
+                                                            kind,
+                                                            target,
+                                                            command,
+                                                            started_at,
+                                                            tool_use_id: tool_use_id.clone(),
+                                                        };
+                                                        crate::api::pr_ci_watcher::spawn_watch_task(
+                                                            deps,
+                                                            mission_id,
+                                                            task,
+                                                        );
+                                                        tracing::info!(
+                                                            mission_id = %mission_id,
+                                                            tool_use_id = %tool_use_id,
+                                                            kind = ?kind,
+                                                            "pr-ci-watcher: spawned watch task"
+                                                        );
+                                                    }
+                                                } else {
+                                                    tracing::debug!(
+                                                        mission_id = %mission_id,
+                                                        tool_use_id = %tool_use_id,
+                                                        kind = ?kind,
+                                                        "pr-ci-watcher: could not parse CI target from tool result; dropping"
+                                                    );
                                                 }
                                             }
 

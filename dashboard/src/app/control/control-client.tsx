@@ -5495,7 +5495,7 @@ export default function ControlClient() {
   const subagentsPanelDismissedRef = useRef<Set<string>>(new Set());
   // Agent-tasks panel (TodoWrite list) — separate sidebar instead
   // of being baked into the workbench card.
-  const [showAgentTasksPanel, setShowAgentTasksPanel] = useState(true);
+  const [showAgentTasksPanel, setShowAgentTasksPanel] = useState(false);
   const agentTasksPanelDismissedRef = useRef<Set<string>>(new Set());
   const [highlightedItemId, setHighlightedItemId] = useState<string | null>(
     null,
