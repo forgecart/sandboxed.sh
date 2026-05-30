@@ -98,6 +98,38 @@ RUN curl -fsSL https://apt.releases.hashicorp.com/gpg \
     && apt-get install -y --no-install-recommends terraform \
     && rm -rf /var/lib/apt/lists/*
 
+# --- rust toolchain --------------------------------------------------------
+# Mirrors CI's `dtolnay/rust-toolchain@stable` (.github/workflows/ci.yml) so a
+# mission editing the sandboxed.sh crate can run the exact same gates locally:
+#   cargo check / cargo test --locked --workspace
+#   cargo clippy --locked --workspace -- -D clippy::all   (needs clippy)
+#   cargo fmt --all -- --check                            (needs rustfmt)
+# rustfmt + clippy are pulled as components to match CI's dedicated fmt/clippy
+# jobs. `stable` (overridable via ARG) tracks CI rather than pinning, since the
+# crate declares only an MSRV (rust-version = 1.91), no rust-toolchain.toml.
+#
+# Installed system-wide under /usr/local (RUSTUP_HOME/CARGO_HOME) instead of
+# ~/.cargo so it's independent of HOME and survives the control plane's PVC
+# bind-mounts onto /root. build-essential + pkg-config + libssl-dev are needed
+# to *build*, not just install: the linker (cc) and openssl-sys's native
+# OpenSSL probe (reqwest's default-tls / native-tls path is in Cargo.lock).
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo
+ARG RUST_TOOLCHAIN=stable
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+       | sh -s -- -y --no-modify-path --profile minimal \
+           --default-toolchain "${RUST_TOOLCHAIN}" \
+           -c rustfmt -c clippy \
+    && chmod -R a+w "${RUSTUP_HOME}" "${CARGO_HOME}" \
+    && /usr/local/cargo/bin/rustc --version \
+    && /usr/local/cargo/bin/cargo --version \
+    && /usr/local/cargo/bin/cargo fmt --version \
+    && /usr/local/cargo/bin/cargo clippy --version
+
 # --- entrypoint + bashenv autostart ----------------------------------------
 COPY docker/workspace-base/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
@@ -113,7 +145,7 @@ RUN chmod 755 /etc/sandboxed-bashenv.sh \
 RUN mkdir -p /workspaces /var/lib/docker /etc/sandboxed
 
 ENV BASH_ENV=/etc/sandboxed-bashenv.sh \
-    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     HOME=/root
 
 WORKDIR /workspaces
