@@ -2925,6 +2925,15 @@ pub fn is_session_corruption_error(result: &AgentResult) -> bool {
     || out.contains("tool_use block must have a corresponding tool_result")
     || out.contains("tool_result block must have a corresponding tool_use")
     || out.contains("must have a corresponding tool_use block")
+    // Extended-thinking transcript corruption. When a turn is interrupted or
+    // cancelled mid-stream (e.g. parallel tool calls aborted), the session can
+    // retain a partial/altered `thinking` (or `redacted_thinking`) block. The
+    // API then rejects EVERY subsequent resume with a 400 because the replayed
+    // block no longer byte-matches the original it signed, permanently bricking
+    // the mission. This is only escapable by rotating to a fresh session — the
+    // recovery strategy maps it to ResetSessionFresh (a brand-new session whose
+    // history is replayed as plain text, never as raw signed thinking blocks).
+    || out.contains("blocks in the latest assistant message cannot be modified")
     // Session was lost (e.g. after service restart or session expiry)
     || out.contains("No conversation found with session ID")
     // Session ID collision: the CLI refused to start because the requested
@@ -17639,6 +17648,37 @@ mod tests {
         )
         .with_terminal_reason(TerminalReason::LlmError);
 
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, false, false),
+            ClaudeTransportRecoveryStrategy::ResetSessionFresh
+        );
+    }
+
+    #[test]
+    fn is_session_corruption_error_detects_thinking_block_immutability() {
+        // An interrupted/cancelled turn can leave a partial or altered
+        // `thinking`/`redacted_thinking` block in the session transcript; the
+        // API then rejects every resume with this 400. Must be treated as
+        // session corruption so recovery can rotate to a fresh session.
+        let result = AgentResult::failure(
+            "API Error: 400 messages.1.content.30: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn claudecode_transport_recovery_strategy_resets_on_thinking_block_corruption() {
+        // The poisoned thinking block lives in the session transcript, so
+        // resuming the same session just replays it. The only escape is a fresh
+        // session (ResetSessionFresh), whose prior history is replayed as plain
+        // text rather than raw signed thinking blocks.
+        let result = AgentResult::failure(
+            "API Error: 400 messages.1.content.30: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
         assert_eq!(
             claudecode_transport_recovery_strategy(&result, true, false, false),
             ClaudeTransportRecoveryStrategy::ResetSessionFresh

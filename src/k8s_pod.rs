@@ -138,6 +138,19 @@ pub(crate) const STORAGE_CLASS: &str = "harvester";
 pub(crate) const WORKSPACES_VOLUME_SIZE: &str = "20Gi";
 pub(crate) const DOCKER_VOLUME_SIZE: &str = "20Gi";
 const PULL_SECRET_DEFAULT: &str = "nexus-registry";
+/// Secret (in the workspace namespace) that the deployment populates
+/// with the mission-pod kubeconfig under `KUBECONFIG_CONTENT_KEY`.
+/// Only that one key is projected into mission pods (via
+/// `valueFrom: secretKeyRef`) — never the whole Secret, see the
+/// env-injection comment in `build_pod_spec` for why a blanket
+/// `envFrom` is deliberately avoided. Overridable via
+/// `SANDBOXED_SH_K8S_WORKSPACE_MISSION_ENV_SECRET`.
+const MISSION_ENV_SECRET_DEFAULT: &str = "sandboxed-sh-mission-env";
+/// Key within the mission-env Secret holding the base64 kubeconfig
+/// that `bashenv.sh` decodes into `~/.kube/config`. It carries the
+/// agent ServiceAccount's cluster-admin credential, which is what lets
+/// a mission reach the control-plane API and sibling mission pods.
+const KUBECONFIG_CONTENT_KEY: &str = "KUBECONFIG_CONTENT";
 /// VolumeSnapshotClass name in the workload cluster. Created by the
 /// Harvester CSI driver at install time. If this changes, the
 /// startup probe in `K8sPodClient::try_init` will surface it.
@@ -206,6 +219,7 @@ pub struct K8sPodClient {
     namespace: String,
     image: String,
     pull_secret: String,
+    mission_env_secret: String,
 }
 
 impl K8sPodClient {
@@ -225,6 +239,10 @@ impl K8sPodClient {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| PULL_SECRET_DEFAULT.to_string());
+        let mission_env_secret = std::env::var("SANDBOXED_SH_K8S_WORKSPACE_MISSION_ENV_SECRET")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| MISSION_ENV_SECRET_DEFAULT.to_string());
         // Force in-cluster config. The control plane's `$HOME/.kube/config`
         // points at the Rancher API proxy, which 403s on WebSocket
         // upgrades for `pods/exec`. The in-cluster API server (resolved
@@ -249,6 +267,7 @@ impl K8sPodClient {
             namespace = %namespace,
             image = %image,
             pull_secret = %pull_secret,
+            mission_env_secret = %mission_env_secret,
             "K8sPod backend enabled (in-cluster config)"
         );
         let me = Self {
@@ -256,6 +275,7 @@ impl K8sPodClient {
             namespace,
             image,
             pull_secret,
+            mission_env_secret,
         };
         // Mirror into the global handle. If try_init is called twice
         // (shouldn't happen but be defensive), the first call wins.
@@ -720,7 +740,7 @@ impl K8sPodClient {
             });
         }
 
-        // No host-side env flows into mission pods. The previous
+        // Almost no host-side env flows into mission pods. The previous
         // design attached the `sandboxed-sh-mission-env` Secret via
         // `envFrom: secretRef`, which pushed env.defaults (DB creds,
         // ANTHROPIC_API_KEY, registry token, …) into every mission
@@ -736,6 +756,15 @@ impl K8sPodClient {
         // Code operator credential is injected per-subprocess by
         // `mission_runner` (as `CLAUDE_CODE_OAUTH_TOKEN`) and never
         // appears in the pod env, so customer code can't read it.
+        //
+        // The single deliberate exception is `KUBECONFIG_CONTENT`,
+        // projected below as a single `secretKeyRef` key (NOT a blanket
+        // `envFrom`). It carries the agent ServiceAccount's kubeconfig
+        // so a mission can reach the control-plane API and sibling
+        // mission pods — without it, `bashenv.sh` has nothing to write
+        // to `~/.kube/config` and cross-pod access fails with "no
+        // cluster-scope RBAC". Projecting just this one key keeps the
+        // DB creds / registry token / ANTHROPIC_API_KEY out of the pod.
 
         let mut env_list = env_vars
             .iter()
@@ -760,6 +789,28 @@ impl K8sPodClient {
                 name: "GITHUB_RUN_ID".to_string(),
                 value: Some(mission_id.to_string()),
                 value_from: None,
+            });
+        }
+
+        // Project ONLY the kubeconfig key out of the mission-env Secret
+        // (see the env comment above for why a blanket `envFrom` is not
+        // used). `optional: true` keeps pods startable in deployments
+        // where the Secret doesn't exist (e.g. docker-compose); in that
+        // case the var is simply unset and `bashenv.sh` already no-ops
+        // on an empty `KUBECONFIG_CONTENT`. A workspace `env_vars` entry
+        // for the same key wins and suppresses the projection.
+        if !env_vars.contains_key(KUBECONFIG_CONTENT_KEY) {
+            env_list.push(k8s_openapi::api::core::v1::EnvVar {
+                name: KUBECONFIG_CONTENT_KEY.to_string(),
+                value: None,
+                value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
+                    secret_key_ref: Some(k8s_openapi::api::core::v1::SecretKeySelector {
+                        name: self.mission_env_secret.clone(),
+                        key: KUBECONFIG_CONTENT_KEY.to_string(),
+                        optional: Some(true),
+                    }),
+                    ..Default::default()
+                }),
             });
         }
 

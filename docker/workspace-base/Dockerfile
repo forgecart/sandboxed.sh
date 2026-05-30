@@ -19,10 +19,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 # `inotify-tools` ships `inotifywait`, used by the dashboard's
 # /fs-events WebSocket to stream pod-side file changes for live
 # editor updates.
+# `jq` is relied on heavily by the agents for parsing JSON from the
+# control-plane / dashboard HTTP API (see the cross-mission API
+# snippets in cloud's CLAUDE.md) — without it agents fall back to
+# ad-hoc python3 one-liners.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash ca-certificates curl gnupg lsb-release \
         git openssh-client \
-        sudo less \
+        sudo less jq \
         iproute2 iptables \
         inotify-tools \
         tini \
