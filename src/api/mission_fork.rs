@@ -375,6 +375,39 @@ async fn run_fork(
             .await
             .context("forked pod did not become ready")?;
 
+        // Clear the autostack marker the source pod left on its
+        // `/workspaces` PVC. Without this, `bashenv.sh` sees
+        // `/workspaces/.sandboxed-autostack-done` and skips the
+        // `docker compose up -d` pass — leaving the inherited
+        // compose containers in their `Exited` state from when the
+        // source pod was paused. The fork's image cache is intact
+        // (the docker PVC carries every layer), so `compose up -d`
+        // on first bash exec is fast: re-create the containers,
+        // no image re-pull.
+        //
+        // Best-effort: if the exec fails, the operator can still
+        // `rm /workspaces/.sandboxed-autostack-done` by hand or
+        // run `docker compose up -d` directly.
+        let _ = k8s
+            .exec_command(
+                new_mid,
+                None,
+                "/bin/sh",
+                &[
+                    "-c".to_string(),
+                    "rm -f /workspaces/.sandboxed-autostack-done".to_string(),
+                ],
+                &HashMap::new(),
+            )
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    new_mid = %new_mid,
+                    error = %e,
+                    "fork: failed to clear autostack marker (compose stack will need manual up)"
+                );
+            });
+
         // PVCs are now independent Longhorn volumes; the snapshot
         // CRs are no longer load-bearing. Reclaim them eagerly so
         // `kubectl get volumesnapshot -n sandboxed-sh` stays clean.
