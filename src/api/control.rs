@@ -8757,6 +8757,8 @@ async fn control_actor_loop(
             use futures::StreamExt;
             let stream = k8s.clone().stream_pod_startup_events(mission_id);
             futures::pin_mut!(stream);
+            let mut reached_ready = false;
+            let mut ended_in_error = false;
             while let Some(event) = stream.next().await {
                 let phase = event.phase_id();
                 let message = event.message();
@@ -8773,15 +8775,135 @@ async fn control_actor_loop(
                     phase: phase.to_string(),
                     message,
                 });
-                if matches!(
-                    event,
-                    crate::k8s_pod::PodStartupEvent::Ready
-                        | crate::k8s_pod::PodStartupEvent::Error { .. }
-                ) {
-                    break;
+                match event {
+                    crate::k8s_pod::PodStartupEvent::Ready => {
+                        reached_ready = true;
+                        break;
+                    }
+                    crate::k8s_pod::PodStartupEvent::Error { .. } => {
+                        ended_in_error = true;
+                        break;
+                    }
+                    _ => {}
                 }
             }
-            tracing::info!(mission_id = %mission_id, "mission pod bootstrap finished");
+            tracing::info!(
+                mission_id = %mission_id,
+                reached_ready,
+                ended_in_error,
+                "mission pod bootstrap finished"
+            );
+
+            // Pod container Ready ≠ dockerd Ready ≠ compose services healthy.
+            // Probe each in turn and surface granular phases so the
+            // dashboard's ForkProgressOverlay walks dockerd_starting →
+            // compose_starting → ready instead of jumping straight to
+            // "ready" while `docker compose ps` would still fail. Fork
+            // missions go through the same probes inside `mission_fork::
+            // run_fork`; this branch covers the fresh-mission path.
+            if reached_ready {
+                // dockerd_starting
+                let detail =
+                    serde_json::json!({ "label": "Starting Docker daemon" }).to_string();
+                let _ = mission_store
+                    .update_mission_pod_phase(mission_id, Some("dockerd_starting"), Some(&detail))
+                    .await;
+                let _ = events_tx.send(AgentEvent::MissionPodStartup {
+                    mission_id,
+                    phase: "dockerd_starting".to_string(),
+                    message: "Starting Docker daemon".to_string(),
+                });
+                if let Err(e) = k8s
+                    .wait_dockerd_ready(mission_id, std::time::Duration::from_secs(120))
+                    .await
+                {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        error = %e,
+                        "dockerd did not become ready during bootstrap (continuing anyway)"
+                    );
+                }
+
+                // compose_starting — poll until all services are healthy,
+                // surfacing each tick's service list into pod_message so
+                // the dashboard's per-service sub-rows walk
+                // starting → healthy live.
+                let detail = serde_json::json!({
+                    "label": "Starting compose services",
+                    "services": []
+                })
+                .to_string();
+                let _ = mission_store
+                    .update_mission_pod_phase(
+                        mission_id,
+                        Some("compose_starting"),
+                        Some(&detail),
+                    )
+                    .await;
+                let _ = events_tx.send(AgentEvent::MissionPodStartup {
+                    mission_id,
+                    phase: "compose_starting".to_string(),
+                    message: "Starting compose services".to_string(),
+                });
+                let mission_store_for_cb = mission_store.clone();
+                let events_tx_for_cb = events_tx.clone();
+                let compose_outcome = k8s
+                    .wait_compose_healthy(
+                        mission_id,
+                        std::time::Duration::from_secs(360),
+                        move |services| {
+                            let body = serde_json::json!({
+                                "label": "Starting compose services",
+                                "services": services
+                                    .iter()
+                                    .map(|s| serde_json::json!({
+                                        "service": s.service,
+                                        "state":   s.state,
+                                        "health":  s.health,
+                                        "status":  s.status,
+                                        "image":   s.image,
+                                    }))
+                                    .collect::<Vec<_>>(),
+                            })
+                            .to_string();
+                            let store = mission_store_for_cb.clone();
+                            let tx = events_tx_for_cb.clone();
+                            tokio::spawn(async move {
+                                let _ = store
+                                    .update_mission_pod_phase(
+                                        mission_id,
+                                        Some("compose_starting"),
+                                        Some(&body),
+                                    )
+                                    .await;
+                                let _ = tx.send(AgentEvent::MissionPodStartup {
+                                    mission_id,
+                                    phase: "compose_starting".to_string(),
+                                    message: body,
+                                });
+                            });
+                        },
+                    )
+                    .await;
+                if let Err(e) = compose_outcome {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        error = %e,
+                        "compose did not become healthy during bootstrap (continuing anyway — agent can still talk to the pod)"
+                    );
+                }
+
+                // ready
+                let detail = serde_json::json!({ "label": "Ready" }).to_string();
+                let _ = mission_store
+                    .update_mission_pod_phase(mission_id, Some("ready"), Some(&detail))
+                    .await;
+                let _ = events_tx.send(AgentEvent::MissionPodStartup {
+                    mission_id,
+                    phase: "ready".to_string(),
+                    message: "Ready".to_string(),
+                });
+            }
 
             // After the pod is Ready, attach a docker-events tail
             // INSIDE the pod and broadcast `MissionDockerStatus` SSE

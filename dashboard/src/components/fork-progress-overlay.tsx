@@ -21,7 +21,10 @@
 import { CheckCircle, Circle, Loader, AlertTriangle } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-const PHASE_ORDER = [
+// Fork missions walk this taxonomy. The first four phases are
+// fork-only (`mission_fork::run_fork`); the last three are shared
+// with fresh missions (see `FRESH_ORDER` below).
+const FORK_ORDER = [
   "events_copying",
   "quiescing_source",
   "snapshotting",
@@ -32,18 +35,53 @@ const PHASE_ORDER = [
   "ready",
 ] as const;
 
-type PhaseId = (typeof PHASE_ORDER)[number];
+// Fresh-mission bootstrap walks this taxonomy (PodStartupEvent values
+// from `src/k8s_pod.rs` + the post-Ready dockerd/compose probes added
+// in `spawn_mission_pod_bootstrap`).
+const FRESH_ORDER = [
+  "pvc_binding",
+  "pod_scheduled",
+  "pulling",
+  "pulled",
+  "container_starting",
+  "container_ready",
+  "init_script_running",
+  "dockerd_starting",
+  "compose_starting",
+  "ready",
+] as const;
+
+type PhaseId = (typeof FORK_ORDER)[number] | (typeof FRESH_ORDER)[number];
 
 const PHASE_LABELS: Record<PhaseId, string> = {
+  // fork-only
   events_copying: "Copy conversation history",
   quiescing_source: "Pause source docker (capture-point quiesce)",
   snapshotting: "Snapshot source disks",
   pvc_provisioning: "Claim forked volumes",
   pod_starting: "Start forked pod",
+  // fresh-only (PodStartupEvent values)
+  pvc_binding: "Bind storage",
+  pod_scheduled: "Schedule pod",
+  pulling: "Pull workspace image",
+  pulled: "Image pulled",
+  container_starting: "Start container",
+  container_ready: "Container ready",
+  init_script_running: "Run workspace init script",
+  // shared
   dockerd_starting: "Start Docker daemon",
   compose_starting: "Start docker-compose services",
   ready: "Ready",
 };
+
+/// Pick the right phase order based on which set the current phase
+/// belongs to. Unknown phases default to the fresh-mission order so
+/// the overlay still renders sensibly during a partial rollout.
+function orderFor(phase: string | null | undefined): readonly PhaseId[] {
+  if (!phase) return FRESH_ORDER;
+  if ((FORK_ORDER as readonly string[]).includes(phase)) return FORK_ORDER;
+  return FRESH_ORDER;
+}
 
 type RowState = "done" | "active" | "pending" | "error";
 
@@ -84,7 +122,11 @@ function parseDetail(message: string | null | undefined): ParsedDetail | null {
   return null;
 }
 
-function rowState(rowPhase: PhaseId, currentPhase: string | undefined): RowState {
+function rowState(
+  rowPhase: PhaseId,
+  currentPhase: string | undefined,
+  order: readonly PhaseId[],
+): RowState {
   if (!currentPhase) return "pending";
   if (currentPhase === "error") {
     // The row that was active when the error fired isn't tracked
@@ -97,8 +139,8 @@ function rowState(rowPhase: PhaseId, currentPhase: string | undefined): RowState
     // earlier rows are "done" too.
     return "done";
   }
-  const rowIdx = PHASE_ORDER.indexOf(rowPhase);
-  const curIdx = PHASE_ORDER.indexOf(currentPhase as PhaseId);
+  const rowIdx = order.indexOf(rowPhase);
+  const curIdx = order.indexOf(currentPhase as PhaseId);
   if (curIdx === -1) {
     // Backend emitted a phase we don't recognise. Show all rows as
     // pending and let the caller display the raw label.
@@ -197,10 +239,11 @@ export function shouldBlockComposer(
 ): boolean {
   if (!phase) return false;
   if (phase === "ready") return false;
-  // Any of our known fork phases — block. The "error" phase also
-  // blocks (the operator should delete the failed fork, not try to
-  // talk to it).
-  return PHASE_ORDER.includes(phase as PhaseId) || phase === "error";
+  if (phase === "error") return true;
+  return (
+    (FORK_ORDER as readonly string[]).includes(phase) ||
+    (FRESH_ORDER as readonly string[]).includes(phase)
+  );
 }
 
 export function ForkProgressOverlay({
@@ -210,20 +253,23 @@ export function ForkProgressOverlay({
 }: ForkProgressOverlayProps) {
   const detail = parseDetail(message);
   const isError = phase === "error";
+  const order = orderFor(phase);
+  const isFork = order === FORK_ORDER;
 
   return (
     <div className="flex h-full w-full flex-col overflow-auto px-6 py-8">
       <div className="mx-auto w-full max-w-xl">
         <header className="mb-6">
           <p className="text-[10px] uppercase tracking-wide text-white/30">
-            Fork in progress
+            {isFork ? "Fork in progress" : "Workspace starting"}
           </p>
           <h2 className="mt-1 text-base font-medium leading-snug text-white/85">
-            {title?.trim() || "Forked mission"}
+            {title?.trim() || (isFork ? "Forked mission" : "New mission")}
           </h2>
           <p className="mt-2 text-xs text-white/50">
-            The chat is held until the forked pod is fully ready — disks
-            claimed, Docker up, every compose service healthy.
+            The chat is held until the pod is fully ready —{" "}
+            {isFork && "disks claimed, "}Docker up, every compose service
+            healthy.
           </p>
         </header>
 
@@ -248,8 +294,8 @@ export function ForkProgressOverlay({
         )}
 
         <ol className="space-y-2.5">
-          {PHASE_ORDER.map((rowPhase) => {
-            const state = rowState(rowPhase, phase ?? undefined);
+          {order.map((rowPhase) => {
+            const state = rowState(rowPhase, phase ?? undefined, order);
             const isCurrent = phase === rowPhase;
             const label = PHASE_LABELS[rowPhase];
             return (
