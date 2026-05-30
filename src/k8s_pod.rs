@@ -737,7 +737,7 @@ impl K8sPodClient {
         // `mission_runner` (as `CLAUDE_CODE_OAUTH_TOKEN`) and never
         // appears in the pod env, so customer code can't read it.
 
-        let env_list = env_vars
+        let mut env_list = env_vars
             .iter()
             .map(|(k, v)| k8s_openapi::api::core::v1::EnvVar {
                 name: k.clone(),
@@ -745,6 +745,23 @@ impl K8sPodClient {
                 value_from: None,
             })
             .collect::<Vec<_>>();
+
+        // Inject the mission id as GITHUB_RUN_ID so workflows that key
+        // per-run resources on it get a stable per-mission value
+        // locally, mirroring CI. shop-beta's e2e suite, for example,
+        // derives its Postgres DB name from `$GITHUB_RUN_ID` to keep
+        // concurrent runs from colliding; without it the local run has
+        // no isolation suffix. A workspace `env_vars` entry wins if it
+        // sets GITHUB_RUN_ID explicitly. Value is the raw mission UUID
+        // (hyphenated) — consumers that splice it into a SQL identifier
+        // are responsible for sanitising (e.g. hyphens → underscores).
+        if !env_vars.contains_key("GITHUB_RUN_ID") {
+            env_list.push(k8s_openapi::api::core::v1::EnvVar {
+                name: "GITHUB_RUN_ID".to_string(),
+                value: Some(mission_id.to_string()),
+                value_from: None,
+            });
+        }
 
         let mut requests = BTreeMap::new();
         requests.insert("cpu".to_string(), Quantity("2000m".to_string()));

@@ -98,12 +98,20 @@ if [ -z "${SANDBOXED_BASHENV_DONE:-}" ] && command -v dockerd >/dev/null 2>&1; t
       fi
 
       if [ -d /workspaces/repos ]; then
-        __marker=/workspaces/.sandboxed-autostack-done
-        if [ ! -f "$__marker" ]; then
-          # Lock so two parallel bashes don't both compose-up the
-          # same repo set.
-          if mkdir /workspaces/.sandboxed-autostack-lock 2>/dev/null; then
-            trap 'rmdir /workspaces/.sandboxed-autostack-lock 2>/dev/null || true' EXIT
+        # One lock guards both the compose-up and the dependency
+        # install passes so two parallel bashes don't race on the
+        # same repo set. Acquired up-front (not behind the
+        # compose-done marker) so the install pass still runs on
+        # later execs after the stack is already up — e.g. when a
+        # repo is cloned, or its lockfile changes, after the first
+        # compose-up has already been marked done.
+        if mkdir /workspaces/.sandboxed-autostack-lock 2>/dev/null; then
+          trap 'rmdir /workspaces/.sandboxed-autostack-lock 2>/dev/null || true' EXIT
+
+          # --- docker compose up -d (once per pod) ------------------
+          # Marker-gated: the stack only needs bringing up once.
+          __marker=/workspaces/.sandboxed-autostack-done
+          if [ ! -f "$__marker" ]; then
             __upped=0
             for __cf in /workspaces/repos/*/docker-compose.yml /workspaces/repos/*/compose.yml; do
               [ -f "$__cf" ] || continue
@@ -119,6 +127,43 @@ if [ -z "${SANDBOXED_BASHENV_DONE:-}" ] && command -v dockerd >/dev/null 2>&1; t
               touch "$__marker" 2>/dev/null || true
             fi
           fi
+
+          # --- JS workspace dependency install ----------------------
+          # `node_modules` isn't baked into the image and isn't part
+          # of the clone, so `nx` / jest / etc. are missing until the
+          # workspace deps are installed (the "nx: not found" class of
+          # failure). For each cloned repo, pick the installer from
+          # the lockfile it ships and run it. Gated on a sentinel
+          # inside node_modules whose mtime is compared against the
+          # lockfile (`-nt`): the install runs when node_modules is
+          # absent or the lockfile is newer than the last successful
+          # install (fresh clone, branch switch, dep bump,
+          # `dev:env:pull`), and is a cheap stat-only skip otherwise.
+          for __rd in /workspaces/repos/*/; do
+            __rd="${__rd%/}"
+            [ -d "$__rd" ] || continue
+            __lock=""; __pm=""; __install=""
+            if   [ -f "$__rd/pnpm-lock.yaml" ]    && command -v pnpm >/dev/null 2>&1; then
+              __lock="$__rd/pnpm-lock.yaml";    __pm=pnpm; __install="pnpm install --frozen-lockfile"
+            elif [ -f "$__rd/package-lock.json" ] && command -v npm  >/dev/null 2>&1; then
+              __lock="$__rd/package-lock.json"; __pm=npm;  __install="npm ci"
+            elif [ -f "$__rd/yarn.lock" ]         && command -v yarn >/dev/null 2>&1; then
+              __lock="$__rd/yarn.lock";         __pm=yarn; __install="yarn install --frozen-lockfile"
+            elif [ -f "$__rd/bun.lockb" ]         && command -v bun  >/dev/null 2>&1; then
+              __lock="$__rd/bun.lockb";         __pm=bun;  __install="bun install --frozen-lockfile"
+            else
+              continue
+            fi
+            __sentinel="$__rd/node_modules/.sandboxed-install-done"
+            [ "$__lock" -nt "$__sentinel" ] || continue
+            echo "[sandboxed] $__pm install: $__rd" >>"$__runlog"
+            if (cd "$__rd" && eval "$__install" >>"$__runlog" 2>&1); then
+              touch "$__sentinel" 2>/dev/null || true
+              echo "[sandboxed] $__pm install ok: $__rd" >>"$__runlog"
+            else
+              echo "[sandboxed] $__pm install FAILED: $__rd (continuing)" >>"$__runlog"
+            fi
+          done
         fi
       fi
     ) >/dev/null 2>&1 </dev/null &
