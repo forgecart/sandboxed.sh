@@ -70,12 +70,43 @@ if [ -z "${SANDBOXED_BASHENV_DONE:-}" ] && command -v dockerd >/dev/null 2>&1; t
     # Background side-task. All file markers + heavy I/O happen here
     # so the foreground shell returns immediately.
     (
+      # ── lock helpers ────────────────────────────────────────────
+      # mkdir-based mutex. Two bugs used to live here:
+      #   1. each critical section installed its OWN `trap … EXIT`, and
+      #      the second one silently REPLACED the first (bash EXIT traps
+      #      are not additive) — so the login lock below was never
+      #      released by its trap and leaked into /var/run for the life
+      #      of the pod.
+      #   2. a SIGKILL (OOM / pod eviction / probe timeout) bypasses the
+      #      trap entirely, leaking the lock. The autostack lock lives on
+      #      the /workspaces PVC, which SURVIVES pod restarts, so a single
+      #      leak wedged compose-up + dep-install for every later exec AND
+      #      every later pod on that workspace until someone rmdir'd it by
+      #      hand. That is the "initial docker run still doesn't run".
+      # Fix: a single trap that releases every lock THIS subshell holds,
+      # plus stale-lock recovery so a dead holder's lock self-heals.
+      __held_locks=""
+      __release_locks() { for __l in $__held_locks; do rmdir "$__l" 2>/dev/null || true; done; }
+      trap __release_locks EXIT INT TERM
+      __acquire_lock() {
+        __lk="$1"
+        if mkdir "$__lk" 2>/dev/null; then __held_locks="$__held_locks $__lk"; return 0; fi
+        # Held by someone else. Steal only if clearly abandoned (dir
+        # older than 30 min — longer than any real compose-pull +
+        # install, so a live holder is never robbed).
+        if [ -n "$(find "$__lk" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
+          echo "[sandboxed] stealing stale lock $__lk" >>"$__runlog"
+          rmdir "$__lk" 2>/dev/null || true
+          if mkdir "$__lk" 2>/dev/null; then __held_locks="$__held_locks $__lk"; return 0; fi
+        fi
+        return 1
+      }
+
       __login_marker="/var/run/.sandboxed-docker-login-done"
       if [ ! -f "$__login_marker" ]; then
         # Lock so only one bash session at a time runs the logins
         # (others see the marker once it lands).
-        if mkdir /var/run/.sandboxed-bashenv-lock 2>/dev/null; then
-          trap 'rmdir /var/run/.sandboxed-bashenv-lock 2>/dev/null || true' EXIT
+        if __acquire_lock /var/run/.sandboxed-bashenv-lock; then
           __dlogin() {
             __reg="$1"; __user_var="$2"; __token_var="$3"
             eval "__user=\${$__user_var:-}"
@@ -105,17 +136,41 @@ if [ -z "${SANDBOXED_BASHENV_DONE:-}" ] && command -v dockerd >/dev/null 2>&1; t
         # later execs after the stack is already up — e.g. when a
         # repo is cloned, or its lockfile changes, after the first
         # compose-up has already been marked done.
-        if mkdir /workspaces/.sandboxed-autostack-lock 2>/dev/null; then
-          trap 'rmdir /workspaces/.sandboxed-autostack-lock 2>/dev/null || true' EXIT
+        if __acquire_lock /workspaces/.sandboxed-autostack-lock; then
 
           # --- docker compose up -d (once per pod) ------------------
           # Marker-gated: the stack only needs bringing up once.
           __marker=/workspaces/.sandboxed-autostack-done
           if [ ! -f "$__marker" ]; then
             __upped=0
+            # Opt-in allowlist: when SANDBOXED_AUTOSTACK_REPOS is set, only
+            # the named repos (space- or comma-separated basenames) are
+            # brought up; everything else is skipped. Unset/empty keeps the
+            # broad behaviour (every repo) — but the skip-build guard still
+            # applies. This is what scopes a mission to e.g. just `shop-beta`
+            # instead of every compose file under /workspaces/repos.
+            __allow="${SANDBOXED_AUTOSTACK_REPOS:-}"; __allow="${__allow//,/ }"
             for __cf in /workspaces/repos/*/docker-compose.yml /workspaces/repos/*/compose.yml; do
               [ -f "$__cf" ] || continue
               __repo_dir="$(dirname "$__cf")"
+              __repo_name="$(basename "$__repo_dir")"
+              # Allowlist gate (only enforced when the var is set).
+              if [ -n "$__allow" ]; then
+                case " $__allow " in
+                  *" $__repo_name "*) : ;;
+                  *) echo "[sandboxed] autostack skip $__repo_name (not in SANDBOXED_AUTOSTACK_REPOS)" >>"$__runlog"; continue ;;
+                esac
+              fi
+              # Skip-self: never `up` a compose that builds its image from
+              # source (e.g. sandboxed.sh's own docker-compose.yml with
+              # `build: .`). That triggered a multi-minute rebuild of the
+              # whole product image and starved the backing-service stack the
+              # mission actually needs. Backing stacks (shop-beta, …) are pure
+              # `image:` pulls and pass this guard.
+              if grep -Eq '^[[:space:]]*build[[:space:]]*:' "$__cf"; then
+                echo "[sandboxed] autostack skip $__repo_name (compose builds from source)" >>"$__runlog"
+                continue
+              fi
               echo "[sandboxed] compose up: $__repo_dir" >>"$__runlog"
               if (set -o pipefail; cd "$__repo_dir" && docker compose up -d >>"$__runlog" 2>&1); then
                 __upped=$((__upped + 1))
@@ -184,9 +239,22 @@ fi
 # otherwise hammer the disk on every agent tool call. The
 # marker is keyed on the SHA-256 of the env value so rotating
 # the kubeconfig at the control plane forces a re-decode.
-if [ -n "${KUBECONFIG_CONTENT:-}" ] && [ -z "${SANDBOXED_KUBECONFIG_DONE:-}" ]; then
-  export SANDBOXED_KUBECONFIG_DONE=1
-  __kube_dir=/root/.kube
+# Write to $HOME/.kube/config — the path kubectl actually reads — NOT a
+# hardcoded /root/.kube. In a mission pod $HOME is the per-mission PVC dir
+# (e.g. /root/.sandboxed-sh/.../mission-<id>), so a config written to
+# /root/.kube was invisible to the agent: kubectl silently fell back to the
+# in-cluster SA (system:serviceaccount:sandboxed-sh:default), which has no
+# cluster RBAC, and every kubectl/terraform call failed Forbidden. The cloud
+# repo's own docs promise this kubeconfig "is materialised at ~/.kube/config";
+# this aligns the code with that contract.
+#
+# No SANDBOXED_KUBECONFIG_DONE env guard: it was `export`ed, so it leaked into
+# child shells and made them skip materialisation even when their own $HOME
+# had no config (the bug above). The per-$HOME checksum marker below is the
+# only idempotency gate needed — a single stat on the fast path — and it
+# re-materialises correctly for each distinct $HOME.
+if [ -n "${KUBECONFIG_CONTENT:-}" ]; then
+  __kube_dir="${HOME:-/root}/.kube"
   __kube_cfg="$__kube_dir/config"
   __cksum=$(printf '%s' "$KUBECONFIG_CONTENT" | sha256sum | awk '{print $1}')
   __marker="$__kube_dir/.sandboxed-kubeconfig-$__cksum"

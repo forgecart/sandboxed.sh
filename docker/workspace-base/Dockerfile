@@ -72,6 +72,40 @@ RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
         "typescript-language-server@${TS_LSP_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
+# --- playwright (browser automation / E2E) ---------------------------------
+# Bakes the same browser set forgecart/shop-beta provisions in its e2e
+# runner images (app/dashboard-e2e/Dockerfile:51,
+# app/forgecart/Dockerfile.test:50): `playwright install --with-deps
+# chromium` — Chromium plus its OS package deps — in its own layer so it
+# caches across rebuilds of the layers below. Add firefox/webkit to the
+# install line if a workspace needs them.
+#
+# Two deviations from shop-beta, both forced by this being a generic
+# toolchain image rather than shop-beta's single-image build-and-run:
+#   * shop-beta runs `pnpm exec playwright …` (Playwright is a workspace
+#     dep). There is no project on disk here, so the identical CLI is
+#     fetched transiently via `pnpm dlx playwright@<ver>` (pnpm + the npm
+#     registry are already wired up by the node block above).
+#   * PLAYWRIGHT_BROWSERS_PATH is pinned to a fixed /ms-playwright rather
+#     than the default $HOME/.cache/ms-playwright. shop-beta installs and
+#     runs in one image with one HOME, so the default is stable for it. Here
+#     HOME differs between build and run: the image sets HOME=/root, but the
+#     mission agent runs with HOME pointing at the per-mission PVC dir — the
+#     SAME split that broke the kubeconfig (see bashenv.sh). Browsers baked
+#     under /root/.cache would be invisible to the runtime resolver, which
+#     looks under the mission HOME. A fixed, HOME-independent path makes the
+#     build-time install and the runtime resolver agree; ENV persists it into
+#     the pod, and the mission pod mounts only /workspaces, /var/lib/docker
+#     and /etc/sandboxed (src/k8s_pod.rs), so nothing shadows /ms-playwright.
+#
+# Version tracks shop-beta's pin: its `@playwright/test` resolves to
+# playwright 1.58.2 in pnpm-lock.yaml — bump in lockstep. `--with-deps` needs
+# root, which holds at build time.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ARG PLAYWRIGHT_VERSION=1.58.2
+RUN pnpm dlx playwright@${PLAYWRIGHT_VERSION} install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
+
 # --- gh ---------------------------------------------------------------------
 RUN curl -fsSL -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
         https://cli.github.com/packages/githubcli-archive-keyring.gpg \
