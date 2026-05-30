@@ -318,12 +318,26 @@ async fn run_fork(
             "Creating VolumeSnapshots",
         )
         .await;
-        create_and_wait_snapshot_with_retry(&k8s, &ws_snap, &src_ws_pvc, SNAPSHOT_TIMEOUT)
+        // Create both snapshots, then wait for each ready.
+        // `wait_snapshot_ready` is patient with the snapshot-controller's
+        // own transient errors (409 "object has been modified" reconcile
+        // loop, "VolumeSnapshotBeingCreated annotation" race) and only
+        // short-circuits on RBAC / missing-class / missing-source-PVC
+        // errors. The previous "delete and recreate on first error"
+        // retry strategy fought the controller's own retry loop and
+        // made the race permanent — see commit history.
+        k8s.create_volume_snapshot(&ws_snap, &src_ws_pvc)
             .await
-            .context("workspaces snapshot")?;
-        create_and_wait_snapshot_with_retry(&k8s, &docker_snap, &src_docker_pvc, SNAPSHOT_TIMEOUT)
+            .context("create workspaces snapshot")?;
+        k8s.create_volume_snapshot(&docker_snap, &src_docker_pvc)
             .await
-            .context("docker snapshot")?;
+            .context("create docker snapshot")?;
+        k8s.wait_snapshot_ready(&ws_snap, SNAPSHOT_TIMEOUT)
+            .await
+            .context("wait workspaces snapshot ready")?;
+        k8s.wait_snapshot_ready(&docker_snap, SNAPSHOT_TIMEOUT)
+            .await
+            .context("wait docker snapshot ready")?;
 
         // Snapshot data is captured. Source dockerd can resume. We
         // unquiesce eagerly (not just via the guard's Drop) so the
@@ -420,81 +434,10 @@ async fn set_phase(
         .await;
 }
 
-/// Number of times to retry the create-snapshot + wait-ready cycle
-/// when the Harvester CSI snapshot controller hits a transient API
-/// conflict. Real failure modes (storage class missing, RBAC
-/// denied, source PVC gone) propagate immediately; the retry path
-/// only catches the "server rejected our request" / "operation
-/// timed out" / "context deadline exceeded" class of errors that
-/// Harvester emits when the snapshot-controller can't update the
-/// content's `VolumeSnapshotBeingCreated` annotation atomically.
-const SNAPSHOT_CREATE_RETRIES: u32 = 3;
-
-/// Create `snap_name` from `source_pvc` and wait for ready, with
-/// limited retry on the Harvester transient API-conflict class of
-/// errors. On retry we delete the half-created snapshot CR so the
-/// next attempt starts clean.
-async fn create_and_wait_snapshot_with_retry(
-    k8s: &K8sPodClient,
-    snap_name: &str,
-    source_pvc: &str,
-    timeout: Duration,
-) -> anyhow::Result<()> {
-    let mut last_err: Option<anyhow::Error> = None;
-    for attempt in 0..SNAPSHOT_CREATE_RETRIES {
-        if attempt > 0 {
-            tracing::warn!(
-                snap = %snap_name,
-                attempt,
-                "Retrying snapshot create after transient failure"
-            );
-            // Clear any stuck snapshot from the previous attempt
-            // so the next create_volume_snapshot doesn't hit
-            // "already exists" or pick up the failed status.
-            let _ = k8s.delete_volume_snapshot(snap_name).await;
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
-        match k8s.create_volume_snapshot(snap_name, source_pvc).await {
-            Ok(()) => match k8s.wait_snapshot_ready(snap_name, timeout).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    if is_transient_snapshot_error(&msg) {
-                        last_err = Some(e);
-                        continue;
-                    }
-                    return Err(e).context(format!("wait snapshot ready {snap_name}"));
-                }
-            },
-            Err(e) => {
-                let msg = format!("{e:#}");
-                if is_transient_snapshot_error(&msg) {
-                    last_err = Some(e);
-                    continue;
-                }
-                return Err(e).context(format!("create snapshot {snap_name}"));
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("snapshot exhausted retries")))
-}
-
-/// Heuristic for snapshot-controller transient errors that retry can
-/// recover from. The Harvester CSI emits these in the
-/// `status.error.message` of a `VolumeSnapshot` when the snapshot
-/// controller's annotation update races with another reconcile loop:
-///
-///   "failed to remove VolumeSnapshotBeingCreated annotation from
-///    the content … the server rejected our request due to an error
-///    in our request"
-///
-/// Real config errors (RBAC, missing snapshot class, source PVC
-/// not found) carry distinct messages and bypass retry.
-fn is_transient_snapshot_error(msg: &str) -> bool {
-    let m = msg.to_ascii_lowercase();
-    m.contains("server rejected our request")
-        || m.contains("the object has been modified")
-        || m.contains("operation timed out")
-        || m.contains("context deadline exceeded")
-        || m.contains("volumesnapshotbeingcreated")
-}
+// `create_and_wait_snapshot_with_retry` + `is_transient_snapshot_error`
+// were removed: they were racing the snapshot-controller's own retry
+// loop. The controller emits 409 "object has been modified" errors
+// during normal reconcile, and our delete-and-recreate strategy made
+// the race permanent. The fix lives in `K8sPodClient::wait_snapshot_ready`
+// + `is_terminal_snapshot_error` in `src/k8s_pod.rs` — we just poll
+// patiently alongside the controller and let it finish.

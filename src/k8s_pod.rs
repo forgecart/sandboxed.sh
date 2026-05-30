@@ -463,8 +463,29 @@ impl K8sPodClient {
 
     /// Poll the snapshot's `status.readyToUse` until it flips to
     /// `true`. Returns Err on timeout or terminal error.
+    ///
+    /// Transient errors emitted by the snapshot controller during
+    /// its own retry loop ("the object has been modified",
+    /// "operation cannot be fulfilled", "the server rejected our
+    /// request", "VolumeSnapshotBeingCreated") are NOT treated as
+    /// failure — they're surfaced in `status.error.message` for
+    /// telemetry purposes but the controller will keep trying.
+    /// We just keep polling alongside it. Only `wait_snapshot_ready`
+    /// terminates the wait, either on readyToUse=true or on the
+    /// overall timeout.
+    ///
+    /// This is the key fix for the live Harvester install: the
+    /// snapshot does eventually become ready on the Harvester side,
+    /// but the workload-cluster's snapshot-controller takes several
+    /// reconcile cycles to update the workload-side CR status
+    /// (because its own update API call races with itself,
+    /// producing the 409 "the object has been modified" loop). An
+    /// earlier version of this code bailed on the first such error
+    /// and re-created the snapshot — which made the race
+    /// permanent. Patience here lets the controller finish.
     pub async fn wait_snapshot_ready(&self, snap_name: &str, timeout: Duration) -> Result<()> {
         let start = Instant::now();
+        let mut last_warn_at: Option<Instant> = None;
         loop {
             let snap = self
                 .snapshots()
@@ -480,22 +501,41 @@ impl K8sPodClient {
             if ready {
                 return Ok(());
             }
-            // CSI surfaces hard failures via `status.error.message`.
-            // Treat them as terminal — retry isn't going to help.
-            if let Some(err_msg) = snap
+            // Surface terminal errors (RBAC, missing class, source PVC
+            // gone) immediately. Everything else is treated as
+            // transient — the snapshot-controller's own reconcile
+            // loop will retry. We log at most once every 15 s so the
+            // backend log doesn't get flooded during a long wait.
+            let err_msg = snap
                 .data
                 .get("status")
                 .and_then(|s| s.get("error"))
                 .and_then(|e| e.get("message"))
                 .and_then(|m| m.as_str())
-            {
-                bail!("VolumeSnapshot {} failed: {}", snap_name, err_msg);
+                .map(|s| s.to_string());
+            if let Some(msg) = err_msg.as_deref() {
+                if is_terminal_snapshot_error(msg) {
+                    bail!("VolumeSnapshot {} failed (terminal): {}", snap_name, msg);
+                }
+                let should_warn = last_warn_at
+                    .map(|t| t.elapsed() > Duration::from_secs(15))
+                    .unwrap_or(true);
+                if should_warn {
+                    tracing::debug!(
+                        snap = snap_name,
+                        error = msg,
+                        "VolumeSnapshot has a transient error in status; snapshot-controller will retry"
+                    );
+                    last_warn_at = Some(Instant::now());
+                }
             }
             if start.elapsed() > timeout {
+                let last_status = err_msg.unwrap_or_else(|| "(no status.error)".to_string());
                 bail!(
-                    "VolumeSnapshot {} not ready within {:?}",
+                    "VolumeSnapshot {} not ready within {:?} (last status: {})",
                     snap_name,
-                    timeout
+                    timeout,
+                    last_status
                 );
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1843,6 +1883,37 @@ fn is_404(e: &kube::Error) -> bool {
         e,
         kube::Error::Api(api_err) if api_err.code == 404
     )
+}
+
+/// True when a VolumeSnapshot's `status.error.message` represents a
+/// failure mode that the snapshot-controller can't recover from on
+/// its own. Examples:
+///
+/// - RBAC denied ("forbidden", "cannot get", "not allowed")
+/// - Source PVC missing ("not found")
+/// - SnapshotClass missing
+///
+/// Everything else (the "object has been modified" 409 conflict
+/// loop, the "VolumeSnapshotBeingCreated" annotation race, generic
+/// "server rejected our request" 4xx blips, controller timeouts)
+/// is treated as **transient**: `wait_snapshot_ready` keeps polling
+/// alongside the controller's own retry loop, and the controller
+/// eventually wins.
+///
+/// This classification is deliberately narrow on "terminal" — false
+/// negatives just mean we wait out the overall snapshot timeout
+/// (default 5 min), which is much better than the previous
+/// behaviour of treating every controller hiccup as terminal and
+/// re-creating the snapshot in a doomed retry loop that fought the
+/// controller until both gave up.
+fn is_terminal_snapshot_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("forbidden")
+        || m.contains("cannot get")
+        || m.contains("not allowed")
+        || m.contains("source persistent volume claim")
+            && (m.contains("not found") || m.contains("does not exist"))
+        || m.contains("volumesnapshotclass") && m.contains("not found")
 }
 
 #[allow(dead_code)]
