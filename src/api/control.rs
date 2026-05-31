@@ -2806,14 +2806,15 @@ pub enum AgentEvent {
         mission_id: Uuid,
         services: Vec<crate::k8s_pod::DockerServiceStatus>,
     },
-    /// Live CI watch progress for a mission. Emitted by the
-    /// pr-ci-watcher (`src/api/pr_ci_watcher.rs`) every ~10 s while
-    /// a `gh ... --watch` subprocess is in flight for a registered
-    /// CI invocation. Final result lands separately as a
-    /// `<system-reminder>` in the mission's event stream when the
-    /// run terminates; the watcher.remove call also yields a
-    /// terminal `MissionPrCiUpdate` with `status="completed"` so
-    /// the dashboard's pending-CI panel knows to drop the row.
+    /// Live CI run notification for a mission. Emitted by the
+    /// repo-ci-listener (`src/api/repo_ci_listener.rs`) when a
+    /// GitHub Actions run on any repo cloned under
+    /// `/workspaces/repos/` reaches `status=completed`. Two events
+    /// fire per detected completion: one with `status="completed"`
+    /// (so the dashboard panel can flash the verdict) and one with
+    /// `status="removed"` immediately after the matching
+    /// `<system-reminder>` lands in the mission queue. The
+    /// dashboard uses `removed` to drop the row.
     MissionPrCiUpdate {
         mission_id: Uuid,
         tool_use_id: String,
@@ -3360,12 +3361,6 @@ pub struct ControlState {
     /// `mission_runner::run_mission_turn` writes to it on every
     /// `Bash(run_in_background:true)` tool_use → tool_result pair.
     pub bg_watcher: super::background_watcher::SharedBackgroundWatcher,
-    /// Per-mission registry of pending CI watches (gh pr create /
-    /// gh pr merge / gh run rerun / gh workflow run / git push). Each
-    /// registration owns a backend-spawned `gh ... --watch`
-    /// subprocess that injects a `<system-reminder>` when CI terminates.
-    /// See `src/api/pr_ci_watcher.rs`.
-    pub pr_ci_watcher: super::pr_ci_watcher::SharedPrCiWatcher,
 }
 
 /// Control session manager for per-user sessions.
@@ -6257,14 +6252,11 @@ fn spawn_control_session(
     let bg_watcher = super::background_watcher::SharedBackgroundWatcher::new();
     super::background_watcher::install_global_watcher(bg_watcher.clone());
 
-    // PR-CI watcher: shares ControlState's command sender so the
-    // backend-owned `gh ... --watch` subprocesses can inject their
-    // verdict via the existing InjectSystemReminder path. No tick
-    // loop — one tokio task per registered CI invocation, spawned
-    // by `mission_runner` on the matching ToolResult.
-    let pr_ci_watcher = super::pr_ci_watcher::SharedPrCiWatcher::new();
-    super::pr_ci_watcher::install_global_deps(super::pr_ci_watcher::CiWatcherDeps {
-        watcher: pr_ci_watcher.clone(),
+    // Repo CI listener: long-running poll daemon that watches
+    // `/workspaces/repos/*` in every active K8sPod mission for
+    // GitHub Actions completions and injects a `<system-reminder>`
+    // when any run finishes. See `src/api/repo_ci_listener.rs`.
+    super::repo_ci_listener::spawn(super::repo_ci_listener::RepoCiListenerDeps {
         cmd_tx: cmd_tx.clone(),
         events_tx: events_tx.clone(),
         mission_store: Arc::clone(&mission_store),
@@ -6285,7 +6277,6 @@ fn spawn_control_session(
         mission_store: Arc::clone(&mission_store),
         mission_search_cache,
         bg_watcher: bg_watcher.clone(),
-        pr_ci_watcher,
     };
 
     // Spawn the main control actor

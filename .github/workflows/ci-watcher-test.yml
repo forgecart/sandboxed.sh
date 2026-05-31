@@ -1,0 +1,23 @@
+name: CI Watcher Test
+
+# Tiny smoke workflow used to exercise the repo-ci-listener
+# end-to-end (`docs/repo-ci-listener.md`). Scoped to the
+# `ci-watcher-test` branch so day-to-day pushes don't burn
+# Actions minutes, and `workflow_dispatch` so we can also fire
+# it manually from a mission without pushing.
+on:
+  push:
+    branches: [ci-watcher-test]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Emit a few markers
+        run: |
+          echo "ci-watcher-test: starting"
+          date
+          sleep 5
+          echo "ci-watcher-test: done"

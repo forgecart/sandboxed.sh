@@ -2080,12 +2080,13 @@ function DockerServicesPanel({
   );
 }
 
-// PR-CI watcher live panel. Mirrors DockerServicesPanel's styling.
-// Each row = one backend-owned `gh ... --watch` subprocess in flight.
-// Rows disappear as the corresponding `mission_pr_ci_update` event
-// reports `completed` / `failed` / `removed` (the system-reminder
-// with the final verdict + log tail has already landed in the
-// mission's event stream by that point).
+// Repo CI listener panel. Mirrors DockerServicesPanel's styling.
+// Each row = one freshly detected GitHub Actions completion the
+// backend's repo-ci-listener (`src/api/repo_ci_listener.rs`) is
+// surfacing. Rows are short-lived: the listener emits a `completed`
+// event with the verdict, then a `removed` event immediately after
+// the matching `<system-reminder>` has been injected into the
+// mission queue (so the chat already has the full detail).
 function PrCiWatchPanel({
   tasks,
 }: {
@@ -2623,9 +2624,11 @@ function MissionWorkbenchPanel({
    *  populated for K8sPod missions whose initial_repos brought up a
    *  compose stack). Empty / undefined hides the panel. */
   dockerServices?: import("@/lib/api").DockerServiceStatus[];
-  /** Live pending CI watches for the per-mission pod. Each entry is
-   *  one backend-spawned `gh ... --watch` subprocess in flight (see
-   *  src/api/pr_ci_watcher.rs). Empty / undefined hides the panel. */
+  /** Freshly detected GitHub Actions completions from the
+   *  repo-ci-listener (see `src/api/repo_ci_listener.rs`). Each
+   *  entry shows the run verdict briefly before being removed
+   *  once the matching system-reminder lands. Empty / undefined
+   *  hides the panel. */
   pendingCiTasks?: Record<
     string,
     {
@@ -5592,15 +5595,14 @@ export default function ControlClient() {
     Record<string, import("@/lib/api").DockerServiceStatus[]>
   >({});
 
-  // Per-mission CI watches in flight, keyed by mission_id then by
-  // tool_use_id. Populated by `mission_pr_ci_update` SSE events from
-  // the pr-ci-watcher (`src/api/pr_ci_watcher.rs`). Each entry tracks
-  // one `gh ... --watch` subprocess the backend spawned in response
-  // to the agent firing `gh pr create` / `gh pr merge` / `gh run
-  // rerun` / `gh workflow run` / `git push`. Status `watching`
-  // updates the row in-place; `completed`/`failed`/`removed` deletes
-  // it (the system-reminder with the final verdict has already
-  // landed in the mission's event stream by then).
+  // Per-mission CI completions newly detected by the repo-ci-listener
+  // (`src/api/repo_ci_listener.rs`), keyed by mission_id then by a
+  // `<owner>/<repo>#<runId>` stable key. The listener polls every
+  // repo cloned under `/workspaces/repos/` and emits a `completed`
+  // event with the verdict, then a `removed` event immediately
+  // after the matching `<system-reminder>` lands in the mission
+  // queue. The dashboard flashes the panel row briefly and then
+  // drops it on `removed`.
   const [pendingCiByMission, setPendingCiByMission] = useState<
     Record<
       string,
@@ -10055,13 +10057,12 @@ export default function ControlClient() {
         return;
       }
 
-      // Live PR-CI watcher progress. Each watch task (one per agent
-      // `gh pr create` / `gh pr merge` / `gh run rerun` /
-      // `gh workflow run` / `git push`) emits one `watching` event
-      // immediately on spawn, then one every ~10s while the
-      // backend's `gh ... --watch` subprocess is in flight, then a
-      // final `completed`/`failed`/`removed` event when it
-      // terminates. See `src/api/pr_ci_watcher.rs::spawn_watch_task`.
+      // Repo-CI-listener notifications. The backend listener (see
+      // `src/api/repo_ci_listener.rs`) emits a `completed` event
+      // when any GitHub Actions run on a repo cloned at
+      // `/workspaces/repos/` finishes, then a `removed` event
+      // immediately after the matching `<system-reminder>` is
+      // injected into the mission queue.
       if (event.type === "mission_pr_ci_update" && isRecord(data)) {
         const missionId =
           typeof data["mission_id"] === "string"

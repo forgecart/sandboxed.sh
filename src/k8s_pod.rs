@@ -1701,19 +1701,23 @@ done
                correct `/workspaces/repos/<name>/` subdir, not at `/workspaces` root.\n",
         );
         md.push_str(
-            "\n## Background CI watcher\n\n\
-             When you run `gh pr create`, `gh pr merge`, `gh run rerun`, \
-             `gh workflow run`, or `git push`, the backend automatically watches \
-             the resulting CI run and will inject a `<system-reminder>` carrying \
-             the verdict, check list, and (on failure) failed-job log tail when \
-             it completes. You don't need to do anything to opt in.\n\n\
-             **Do not** call `gh run watch`, `gh pr checks --watch`, or \
-             `gh actions watch` yourself. They block your turn and waste minutes \
-             of context. The shell wrapper in this pod also intercepts those \
-             subcommands and exits with a hint instead of running them — your \
-             call would just be rejected. Fire-and-forget your push or PR \
-             command and continue with other work; the watcher will deliver the \
-             outcome.\n",
+            "\n## Repo CI listener\n\n\
+             Any GitHub repository you clone under `/workspaces/repos/<name>/` \
+             is automatically watched for GitHub Actions completions by the \
+             backend. The listener polls `gh run list` against every repo's \
+             origin remote every ~30 s; when a run completes (success or \
+             failure), you receive a `<system-reminder>` with the verdict, \
+             the job rollup, and (on failure) the failed-job log tail. The \
+             reminder lands on your next turn — you don't need to do anything \
+             to opt in.\n\n\
+             You do **not** need to call `gh run watch`, `gh pr checks --watch`, \
+             or `gh actions watch` yourself; the backend already polls. Fire \
+             your `gh pr create` / `gh pr merge` / `git push` / `gh workflow run` \
+             and continue with other work — the listener will deliver the \
+             outcome.\n\n\
+             The first poll for a freshly cloned repo seeds the cursor to the \
+             latest existing run id and emits no reminders, so cloning a new \
+             repo won't flood you with historical completions.\n",
         );
 
         // Write the file via a small heredoc-style exec to avoid
