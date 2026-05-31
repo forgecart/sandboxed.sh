@@ -364,10 +364,10 @@ fn parse_github_origin(url: &str) -> Option<(String, String)> {
         rest
     } else if let Some(rest) = s.strip_prefix("http://github.com/") {
         rest
-    } else if let Some(rest) = s.strip_prefix("github.com:") {
-        rest
     } else {
-        return None;
+        // Not a github.com remote in any accepted form → `?`
+        // short-circuits the whole fn to None (clippy: question_mark).
+        s.strip_prefix("github.com:")?
     };
     let stripped = path_part
         .strip_suffix(".git")
