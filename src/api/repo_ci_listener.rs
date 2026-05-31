@@ -129,18 +129,34 @@ async fn poll_once(deps: &RepoCiListenerDeps, state: &mut ListenerState) -> Resu
         .list_missions(MAX_MISSIONS_PER_CYCLE, 0)
         .await
         .map_err(|e| anyhow::anyhow!("mission_store.list_missions: {e}"))?;
+    let total = missions.len();
+    let mut active = 0usize;
+    let mut k8s_pod = 0usize;
     for mission in missions {
         if mission.status != MissionStatus::Active {
             continue;
         }
+        active += 1;
         // Skip non-K8sPod workspaces — `/workspaces/repos` only
         // exists in K8sPod pods.
         let Some(workspace) = deps.workspaces.get(mission.workspace_id).await else {
+            tracing::debug!(
+                mid = %mission.id,
+                wid = %mission.workspace_id,
+                "repo_ci_listener: workspace lookup miss"
+            );
             continue;
         };
         if workspace.workspace_type != WorkspaceType::K8sPod {
+            tracing::debug!(
+                mid = %mission.id,
+                wid = %mission.workspace_id,
+                wtype = ?workspace.workspace_type,
+                "repo_ci_listener: skip non-K8sPod workspace"
+            );
             continue;
         }
+        k8s_pod += 1;
         if let Err(err) = poll_mission(deps, state, &mission, workspace).await {
             tracing::debug!(
                 mid = %mission.id,
@@ -149,6 +165,7 @@ async fn poll_once(deps: &RepoCiListenerDeps, state: &mut ListenerState) -> Resu
             );
         }
     }
+    tracing::debug!(total, active, k8s_pod, "repo_ci_listener: poll cycle done");
     Ok(())
 }
 
@@ -160,6 +177,12 @@ async fn poll_mission(
 ) -> Result<()> {
     let exec = WorkspaceExec::for_mission(workspace, mission.id);
     let repos = list_workspace_repos(&exec).await?;
+    tracing::debug!(
+        mid = %mission.id,
+        repos_count = repos.len(),
+        repos = ?repos,
+        "repo_ci_listener: poll mission"
+    );
     if repos.is_empty() {
         return Ok(());
     }
@@ -187,6 +210,13 @@ async fn poll_repo(
     let runs = gh_run_list(exec, owner, repo).await?;
     let key = (mission_id, owner.to_string(), repo.to_string());
     let completed: Vec<&RunSummary> = runs.iter().filter(|r| r.status == "completed").collect();
+    tracing::debug!(
+        mid = %mission_id,
+        repo = %format!("{owner}/{repo}"),
+        runs = runs.len(),
+        completed = completed.len(),
+        "repo_ci_listener: poll repo"
+    );
     if completed.is_empty() {
         return Ok(());
     }
