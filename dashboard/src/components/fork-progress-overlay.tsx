@@ -18,7 +18,7 @@
 //   - on error, the row that was active at error time turns red and
 //     `pod_message.error` is shown beneath it.
 
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { CheckCircle, Circle, Loader, AlertTriangle } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -243,7 +243,6 @@ function LogTail({ lines }: { lines: string[] }) {
   useEffect(() => {
     if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
   }, [lines.length]);
-  if (lines.length === 0) return null;
   // Render the last 30 lines — older lines stay in the ring buffer
   // but the visible tail is bounded so a long pull doesn't blow the
   // overlay layout.
@@ -251,10 +250,81 @@ function LogTail({ lines }: { lines: string[] }) {
   return (
     <pre
       ref={ref}
-      className="mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap break-words rounded bg-black/30 px-2 py-1 font-mono text-[10px] leading-snug text-white/50"
+      className="max-h-32 overflow-y-auto whitespace-pre-wrap break-words bg-black/40 px-2 py-1.5 font-mono text-[10px] leading-snug text-white/60"
     >
-      {visible.join("\n")}
+      {visible.length === 0 ? (
+        <span className="italic text-white/30">
+          (waiting for `docker compose up -d` output…)
+        </span>
+      ) : (
+        visible.join("\n")
+      )}
     </pre>
+  );
+}
+
+// Console-style log panel: small tab strip (one per repo) above a
+// shared scrolling pane. Active tab auto-switches to whichever repo
+// gained the most lines this render — unless the operator clicked
+// a specific tab, in which case the auto-switch is suspended until
+// the overlay closes (next ready phase).
+function ComposeLogConsole({ logs }: { logs: Record<string, string[]> }) {
+  const repos = useMemo(() => Object.keys(logs).sort(), [logs]);
+  const [activeRepo, setActiveRepo] = useState<string | null>(null);
+  const [manualPick, setManualPick] = useState(false);
+  const lastCounts = useRef<Record<string, number>>({});
+  useEffect(() => {
+    if (manualPick) return;
+    let next: string | null = activeRepo;
+    let bestDelta = 0;
+    for (const r of repos) {
+      const prev = lastCounts.current[r] ?? 0;
+      const delta = (logs[r]?.length ?? 0) - prev;
+      if (delta > bestDelta) {
+        bestDelta = delta;
+        next = r;
+      }
+    }
+    for (const r of repos) lastCounts.current[r] = logs[r]?.length ?? 0;
+    if (next === null && repos.length > 0) {
+      next = repos.reduce((a, b) =>
+        (logs[a]?.length ?? 0) >= (logs[b]?.length ?? 0) ? a : b,
+      );
+    }
+    if (next !== activeRepo) setActiveRepo(next);
+  }, [logs, repos, activeRepo, manualPick]);
+  if (repos.length === 0) return null;
+  const lines = activeRepo ? (logs[activeRepo] ?? []) : [];
+  return (
+    <div className="mt-2 ml-6 overflow-hidden rounded-md border border-white/[0.06] bg-black/30">
+      <div className="flex items-center gap-0.5 overflow-x-auto border-b border-white/[0.06] bg-white/[0.02] px-1 py-0.5">
+        {repos.map((r) => {
+          const count = logs[r]?.length ?? 0;
+          const isActive = r === activeRepo;
+          return (
+            <button
+              key={r}
+              type="button"
+              onClick={() => {
+                setManualPick(true);
+                setActiveRepo(r);
+              }}
+              className={cn(
+                "shrink-0 rounded px-2 py-0.5 font-mono text-[10px] transition-colors",
+                isActive
+                  ? "bg-white/10 text-white/90"
+                  : "text-white/40 hover:bg-white/[0.04] hover:text-white/70",
+              )}
+              title={`${r}: ${count} lines`}
+            >
+              {r}
+              <span className="ml-1 text-white/30">{count}</span>
+            </button>
+          );
+        })}
+      </div>
+      <LogTail lines={lines} />
+    </div>
   );
 }
 
@@ -370,25 +440,12 @@ export function ForkProgressOverlay({
                     <ComposeServiceList services={detail.services} />
                   )}
 
-                {/* Per-repo `docker compose up` stdout tail.
-                    Streamed from the backend's
-                    run_compose_up_with_logs during the
-                    compose_starting phase. */}
+                {/* Tabbed console for `docker compose up -d` output —
+                    one tab per repo, shared scrolling pane. Streamed
+                    by `src/api/repo-… run_compose_up_with_logs`. */}
                 {isCurrent &&
                   rowPhase === "compose_starting" &&
-                  composeLogs &&
-                  Object.keys(composeLogs).length > 0 && (
-                    <div className="mt-2 space-y-2 pl-6">
-                      {Object.entries(composeLogs).map(([repo, lines]) => (
-                        <div key={repo}>
-                          <p className="text-[10px] uppercase tracking-wide text-white/30">
-                            {repo} · {lines.length} lines
-                          </p>
-                          <LogTail lines={lines} />
-                        </div>
-                      ))}
-                    </div>
-                  )}
+                  composeLogs && <ComposeLogConsole logs={composeLogs} />}
 
                 {/* Plaintext sub-message if backend used a non-JSON pod_message
                     (legacy) and this row is active. */}

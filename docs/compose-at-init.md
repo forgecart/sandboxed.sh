@@ -1,5 +1,35 @@
 # Compose at pod init (with log streaming)
 
+## Setup checklist for a workspace
+
+To make compose-at-init useful on a workspace, set two env vars
+in the workspace's secret (e.g. `sandboxed-sh-env` for the
+default workspace, or whatever the per-workspace env_vars
+mechanism is in your deployment):
+
+| Var | Example | Effect |
+|-----|---------|--------|
+| `INITIAL_REPOS` | `forgecart/shop-beta,forgecart/sandboxed.sh` | Every fresh mission created via `POST /api/control/missions` *without* an explicit `initial_repos` field gets these cloned into `/workspaces/repos/` before compose-up runs. Tokens accept `owner/repo` or `owner/repo#branch`. |
+| `SANDBOXED_AUTOSTACK_REPOS` | `shop-beta` | Subset of repos under `/workspaces/repos/` whose `docker-compose.yml` should be brought up. Unset = every repo with a compose file. |
+
+Both vars are read by the backend at *mission create* time.
+Updating them only affects newly-created missions; existing
+ones keep their seeded list.
+
+## Image freshness
+
+Mission pods set `imagePullPolicy: Always` (`src/k8s_pod.rs`
+build_pod_spec). The reason: the workspace image
+(`SANDBOXED_SH_K8S_WORKSPACE_IMAGE`) defaults to a mutable
+`:latest` tag. `IfNotPresent` would let nodes pin a stale
+digest forever — verified live when the
+`/etc/docker/daemon.json` change never propagated. With
+`Always`, kubelet does one manifest HEAD per pod create and
+re-pulls only the layers that changed; the bulk of the layers
+stay cached on the node.
+
+
+
 ## Why
 
 Before: `docker compose up -d` for each `/workspaces/repos/*/`

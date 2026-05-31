@@ -723,7 +723,7 @@ impl K8sPodClient {
         workspace_id: Uuid,
         with_init_script: bool,
         env_vars: &HashMap<String, String>,
-        force_pull: bool,
+        _force_pull: bool,
     ) -> Pod {
         let mut volumes = vec![
             Volume {
@@ -864,13 +864,17 @@ impl K8sPodClient {
         let container = Container {
             name: "workspace".to_string(),
             image: Some(self.image.clone()),
-            // IfNotPresent: once the node has the workspace-base image
-            // cached, every subsequent mission on that node skips the
-            // 30-60s pull. First mission per node still pays the cost.
-            // Forks force `Always` so they land on the current
-            // `:latest` even if the node has a stale digest cached —
-            // the point of a fork is "same data, new image."
-            image_pull_policy: Some(if force_pull { "Always" } else { "IfNotPresent" }.to_string()),
+            // `Always` for every mission pod (not just forks). Reason:
+            // `SANDBOXED_SH_K8S_WORKSPACE_IMAGE` defaults to a mutable
+            // `:latest` tag and `IfNotPresent` would let nodes pin a
+            // stale digest forever — verified live with the
+            // workspace-base daemon.json change that never landed
+            // because the node had `:latest` cached. The cost of
+            // `Always` is one HEAD request per pod create (kube
+            // re-pulls layers only when the manifest digest moved);
+            // actual layer bytes stay cached. `force_pull` is now a
+            // no-op kept for callsite compat.
+            image_pull_policy: Some("Always".to_string()),
             env: if env_list.is_empty() {
                 None
             } else {

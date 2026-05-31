@@ -4426,7 +4426,44 @@ pub async fn create_mission(
         }
     }
 
-    let initial_repos = req.initial_repos.clone();
+    // Auto-seed `initial_repos` from the workspace's
+    // `INITIAL_REPOS` env var when the caller didn't supply
+    // any. Workspaces declare a list like
+    // `forgecart/shop-beta,forgecart/sandboxed.sh` so that
+    // every fresh mission lands with the same repo set
+    // cloned into `/workspaces/repos/` without the dashboard
+    // having to pass the list per-mission. Mirrors the
+    // `SANDBOXED_AUTOSTACK_REPOS` allowlist pattern that
+    // controls compose-up scoping.
+    let mut initial_repos = req.initial_repos.clone();
+    if initial_repos.is_empty() {
+        let wid = workspace_id.unwrap_or(workspace::DEFAULT_WORKSPACE_ID);
+        if let Some(ws) = state.workspaces.get(wid).await {
+            if let Some(csv) = ws.env_vars.get("INITIAL_REPOS") {
+                let mut seeded = Vec::new();
+                for raw in csv.split([',', ' ', '\t', '\n']) {
+                    let t = raw.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    // Accept `owner/repo` and `owner/repo#branch`.
+                    let (full_name, branch) = match t.split_once('#') {
+                        Some((n, b)) => (n.trim().to_string(), Some(b.trim().to_string())),
+                        None => (t.to_string(), None),
+                    };
+                    seeded.push(crate::api::github_app::RepoSelection { full_name, branch });
+                }
+                if !seeded.is_empty() {
+                    tracing::info!(
+                        workspace_id = %wid,
+                        count = seeded.len(),
+                        "seeded initial_repos from workspace INITIAL_REPOS env"
+                    );
+                    initial_repos = seeded;
+                }
+            }
+        }
+    }
     let control = control_for_user(&state, &user).await;
     control
         .cmd_tx
@@ -8912,8 +8949,7 @@ async fn control_actor_loop(
                 // it returns, poll until all services are healthy.
                 let detail = serde_json::json!({
                     "label": "Starting compose services",
-                    "services": [],
-                    "logs_active": true
+                    "services": []
                 })
                 .to_string();
                 let _ = mission_store
