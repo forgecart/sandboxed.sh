@@ -2806,6 +2806,33 @@ pub enum AgentEvent {
         mission_id: Uuid,
         services: Vec<crate::k8s_pod::DockerServiceStatus>,
     },
+    /// Live CI watch progress for a mission. Emitted by the
+    /// pr-ci-watcher (`src/api/pr_ci_watcher.rs`) every ~10 s while
+    /// a `gh ... --watch` subprocess is in flight for a registered
+    /// CI invocation. Final result lands separately as a
+    /// `<system-reminder>` in the mission's event stream when the
+    /// run terminates; the watcher.remove call also yields a
+    /// terminal `MissionPrCiUpdate` with `status="completed"` so
+    /// the dashboard's pending-CI panel knows to drop the row.
+    MissionPrCiUpdate {
+        mission_id: Uuid,
+        tool_use_id: String,
+        /// Human-readable target identifier (e.g. "PR #123 in foo/bar"
+        /// or "run 1234567 in foo/bar"). Stable across ticks so the
+        /// dashboard can dedupe rows on this string.
+        target: String,
+        /// `watching` | `completed` | `failed` | `removed`. `removed`
+        /// means the registration was dropped (the system-reminder
+        /// already landed); the dashboard should remove the row.
+        status: String,
+        /// Per-check rollup. Each entry is one job/workflow check
+        /// the agent will see in the eventual reminder. Empty until
+        /// the first poll resolves the target.
+        checks: Vec<serde_json::Value>,
+        /// Optional URL for the operator to click through to the
+        /// full run on GitHub (deep-link to the PR or actions run).
+        url: Option<String>,
+    },
     /// Mission run settings changed (backend/model/agent/config profile)
     MissionSettingsUpdated {
         mission_id: Uuid,
@@ -2973,6 +3000,7 @@ impl AgentEvent {
             AgentEvent::MissionMetadataUpdated { .. } => "mission_metadata_updated",
             AgentEvent::MissionPodStartup { .. } => "mission_pod_startup",
             AgentEvent::MissionDockerStatus { .. } => "mission_docker_status",
+            AgentEvent::MissionPrCiUpdate { .. } => "mission_pr_ci_update",
             AgentEvent::SubagentToolCall { .. } => "subagent_tool_call",
             AgentEvent::SubagentToolResult { .. } => "subagent_tool_result",
             AgentEvent::SubagentText { .. } => "subagent_text",
@@ -3004,6 +3032,7 @@ impl AgentEvent {
             AgentEvent::MissionMetadataUpdated { mission_id, .. } => Some(*mission_id),
             AgentEvent::MissionPodStartup { mission_id, .. } => Some(*mission_id),
             AgentEvent::MissionDockerStatus { mission_id, .. } => Some(*mission_id),
+            AgentEvent::MissionPrCiUpdate { mission_id, .. } => Some(*mission_id),
             AgentEvent::SubagentToolCall { mission_id, .. } => *mission_id,
             AgentEvent::SubagentToolResult { mission_id, .. } => *mission_id,
             AgentEvent::SubagentText { mission_id, .. } => *mission_id,
@@ -6237,6 +6266,7 @@ fn spawn_control_session(
     super::pr_ci_watcher::install_global_deps(super::pr_ci_watcher::CiWatcherDeps {
         watcher: pr_ci_watcher.clone(),
         cmd_tx: cmd_tx.clone(),
+        events_tx: events_tx.clone(),
         mission_store: Arc::clone(&mission_store),
         workspaces: workspaces.clone(),
     });
@@ -8803,8 +8833,7 @@ async fn control_actor_loop(
             // run_fork`; this branch covers the fresh-mission path.
             if reached_ready {
                 // dockerd_starting
-                let detail =
-                    serde_json::json!({ "label": "Starting Docker daemon" }).to_string();
+                let detail = serde_json::json!({ "label": "Starting Docker daemon" }).to_string();
                 let _ = mission_store
                     .update_mission_pod_phase(mission_id, Some("dockerd_starting"), Some(&detail))
                     .await;
@@ -8834,11 +8863,7 @@ async fn control_actor_loop(
                 })
                 .to_string();
                 let _ = mission_store
-                    .update_mission_pod_phase(
-                        mission_id,
-                        Some("compose_starting"),
-                        Some(&detail),
-                    )
+                    .update_mission_pod_phase(mission_id, Some("compose_starting"), Some(&detail))
                     .await;
                 let _ = events_tx.send(AgentEvent::MissionPodStartup {
                     mission_id,

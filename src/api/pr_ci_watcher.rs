@@ -52,10 +52,11 @@ use std::time::Duration;
 use anyhow::{anyhow, Context as _, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::api::control::{ControlCommand, MissionStatus};
+use crate::api::control::{AgentEvent, ControlCommand, MissionStatus};
 use crate::api::mission_store::MissionStore;
 use crate::workspace::{SharedWorkspaceStore, WorkspaceType};
 use crate::workspace_exec::WorkspaceExec;
@@ -203,6 +204,10 @@ impl SharedPrCiWatcher {
 pub struct CiWatcherDeps {
     pub watcher: SharedPrCiWatcher,
     pub cmd_tx: mpsc::Sender<ControlCommand>,
+    /// SSE broadcaster for live `MissionPrCiUpdate` events so the
+    /// dashboard's pending-CI panel can render real-time progress
+    /// while the `gh ... --watch` subprocess is still in flight.
+    pub events_tx: broadcast::Sender<AgentEvent>,
     pub mission_store: Arc<dyn MissionStore>,
     pub workspaces: SharedWorkspaceStore,
 }
@@ -469,16 +474,57 @@ pub fn spawn_watch_task(deps: CiWatcherDeps, mission_id: Uuid, task: CiTask) {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(DEFAULT_MAX_WATCH_SECS);
 
-        let content = match tokio::time::timeout(
+        // Side-poll: a sibling task that polls the CI check rollup
+        // every ~10 s and broadcasts a `MissionPrCiUpdate` SSE event
+        // so the dashboard's pending-CI panel can render live
+        // status while the main watch subprocess is still in
+        // flight. CancellationToken is signalled when the main
+        // watch returns so the poll loop exits in step.
+        let poll_cancel = CancellationToken::new();
+        let poll_handle = {
+            let deps = deps.clone();
+            let task = task.clone();
+            let cancel = poll_cancel.clone();
+            tokio::spawn(async move {
+                run_status_poll_loop(deps, mission_id, task, cancel).await;
+            })
+        };
+
+        let watch_outcome = tokio::time::timeout(
             Duration::from_secs(cap_secs),
             run_watch(&deps, mission_id, &task),
         )
-        .await
-        {
-            Ok(Ok(report)) => format_completion(&task, &report),
+        .await;
+        // Cancel the side-poll once the main watch is done. The
+        // poll loop's tokio::select! awaits cancel.cancelled() so
+        // this is immediate.
+        poll_cancel.cancel();
+        let _ = poll_handle.await;
+
+        let content = match &watch_outcome {
+            Ok(Ok(report)) => format_completion(&task, report),
             Ok(Err(e)) => format_watcher_error(&task, &format!("{e:#}")),
             Err(_) => format_timeout(&task, cap_secs),
         };
+
+        // Final SSE update — tell the dashboard panel to drop this
+        // task. Status is `completed` for happy-path success,
+        // `failed` for non-zero exit, `removed` for any other
+        // terminal state (timeout, watcher error). The system-
+        // reminder injection below carries the full body.
+        let final_status = match &watch_outcome {
+            Ok(Ok(rep)) if rep.exit_code == 0 => "completed",
+            Ok(Ok(_)) => "failed",
+            _ => "removed",
+        };
+        let _ = deps.events_tx.send(AgentEvent::MissionPrCiUpdate {
+            mission_id,
+            tool_use_id: task.tool_use_id.clone(),
+            target: task.target.human(),
+            status: final_status.to_string(),
+            checks: vec![],
+            url: None,
+        });
 
         if let Err(e) = deps
             .cmd_tx
@@ -497,6 +543,139 @@ pub fn spawn_watch_task(deps: CiWatcherDeps, mission_id: Uuid, task: CiTask) {
         }
         watcher.remove(mission_id, &task.tool_use_id).await;
     });
+}
+
+/// Sibling poll loop spawned alongside the main `gh ... --watch`
+/// subprocess in `spawn_watch_task`. Fires every 10 s while the
+/// watch is in flight, broadcasting `MissionPrCiUpdate` SSE events
+/// with the current check rollup so the dashboard's pending-CI
+/// panel renders live. Stops when the parent signals `cancel`.
+async fn run_status_poll_loop(
+    deps: CiWatcherDeps,
+    mission_id: Uuid,
+    task: CiTask,
+    cancel: CancellationToken,
+) {
+    const POLL_INTERVAL: Duration = Duration::from_secs(10);
+    // Emit an immediate "watching" event so the panel shows the row
+    // as soon as the watch is spawned (before the first 10 s poll).
+    let _ = deps.events_tx.send(AgentEvent::MissionPrCiUpdate {
+        mission_id,
+        tool_use_id: task.tool_use_id.clone(),
+        target: task.target.human(),
+        status: "watching".to_string(),
+        checks: vec![],
+        url: None,
+    });
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(POLL_INTERVAL) => {}
+        }
+        // Skip the poll until the mission's workspace is still
+        // active. `fetch_check_rollup` itself is resilient to a
+        // missing pod / target — it just returns empty checks.
+        let (checks, url) = fetch_check_rollup(&deps, mission_id, &task)
+            .await
+            .unwrap_or_else(|_| (vec![], None));
+        let _ = deps.events_tx.send(AgentEvent::MissionPrCiUpdate {
+            mission_id,
+            tool_use_id: task.tool_use_id.clone(),
+            target: task.target.human(),
+            status: "watching".to_string(),
+            checks,
+            url,
+        });
+    }
+}
+
+/// One-shot `gh pr view --json statusCheckRollup,url` or
+/// `gh run view --json jobs,conclusion,url` inside the mission
+/// pod. Returns the parsed checks + the run URL. Used by the
+/// poll loop above to feed the dashboard's live status panel.
+async fn fetch_check_rollup(
+    deps: &CiWatcherDeps,
+    mission_id: Uuid,
+    task: &CiTask,
+) -> Result<(Vec<serde_json::Value>, Option<String>)> {
+    let mission = deps
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(|e| anyhow!("mission_store.get_mission failed: {e}"))?
+        .ok_or_else(|| anyhow!("mission not found"))?;
+    let workspace = deps
+        .workspaces
+        .get(mission.workspace_id)
+        .await
+        .ok_or_else(|| anyhow!("workspace not in store"))?;
+    if workspace.workspace_type != WorkspaceType::K8sPod {
+        return Ok((vec![], None));
+    }
+    let exec = WorkspaceExec::for_mission(workspace, mission_id);
+    type Parser = fn(&str) -> (Vec<serde_json::Value>, Option<String>);
+    let (cmd, parser): (String, Parser) = match &task.target {
+            CiTarget::Pr {
+                owner,
+                repo,
+                number,
+            } => (
+                format!("gh pr view {number} --json statusCheckRollup,url -R {owner}/{repo} 2>&1"),
+                parse_pr_rollup,
+            ),
+            CiTarget::Run {
+                owner,
+                repo,
+                run_id,
+            } => (
+                format!(
+                    "gh run view {run_id} --json jobs,conclusion,status,url -R {owner}/{repo} 2>&1"
+                ),
+                parse_run_jobs,
+            ),
+            CiTarget::Commit { .. } => {
+                // Commit hasn't been resolved to a Run yet; the
+                // panel just shows "watching" with no detail.
+                return Ok((vec![], None));
+            }
+        };
+    let out = exec
+        .output(
+            std::path::Path::new("/tmp"),
+            "bash",
+            &["-lc".to_string(), cmd],
+            HashMap::new(),
+        )
+        .await
+        .context("status poll exec failed")?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    Ok(parser(&stdout))
+}
+
+fn parse_pr_rollup(stdout: &str) -> (Vec<serde_json::Value>, Option<String>) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
+        return (vec![], None);
+    };
+    let url = v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string());
+    let rollup = v
+        .get("statusCheckRollup")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    (rollup, url)
+}
+
+fn parse_run_jobs(stdout: &str) -> (Vec<serde_json::Value>, Option<String>) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
+        return (vec![], None);
+    };
+    let url = v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string());
+    let jobs = v
+        .get("jobs")
+        .and_then(|j| j.as_array())
+        .cloned()
+        .unwrap_or_default();
+    (jobs, url)
 }
 
 #[derive(Debug)]

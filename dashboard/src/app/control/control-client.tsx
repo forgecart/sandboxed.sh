@@ -2080,6 +2080,115 @@ function DockerServicesPanel({
   );
 }
 
+// PR-CI watcher live panel. Mirrors DockerServicesPanel's styling.
+// Each row = one backend-owned `gh ... --watch` subprocess in flight.
+// Rows disappear as the corresponding `mission_pr_ci_update` event
+// reports `completed` / `failed` / `removed` (the system-reminder
+// with the final verdict + log tail has already landed in the
+// mission's event stream by that point).
+function PrCiWatchPanel({
+  tasks,
+}: {
+  tasks: Record<
+    string,
+    {
+      target: string;
+      status: string;
+      checks: unknown[];
+      url: string | null;
+    }
+  >;
+}) {
+  const ids = Object.keys(tasks);
+  if (ids.length === 0) return null;
+  return (
+    <section className="space-y-2">
+      <p className="text-[10px] uppercase tracking-wide text-white/30">
+        CI watches ({ids.length})
+      </p>
+      <ul className="space-y-1.5 rounded-md border border-white/[0.05] bg-white/[0.02] p-2 max-h-64 overflow-y-auto">
+        {ids.map((id) => {
+          const t = tasks[id];
+          const checks = Array.isArray(t.checks)
+            ? (t.checks as Array<Record<string, unknown>>)
+            : [];
+          return (
+            <li
+              key={id}
+              className="rounded border border-white/[0.04] bg-black/20 px-2 py-1.5 text-[11px]"
+            >
+              <div className="flex items-center gap-2">
+                <Loader className="h-3 w-3 shrink-0 animate-spin text-indigo-400" />
+                {t.url ? (
+                  <a
+                    href={t.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="truncate text-white/80 hover:text-indigo-300 hover:underline"
+                  >
+                    {t.target}
+                  </a>
+                ) : (
+                  <span className="truncate text-white/80">{t.target}</span>
+                )}
+              </div>
+              {checks.length > 0 && (
+                <ul className="mt-1 space-y-0.5 pl-5 text-[10px]">
+                  {checks.slice(0, 8).map((c, i) => {
+                    const name =
+                      (c["name"] as string | undefined) ??
+                      (c["context"] as string | undefined) ??
+                      (c["workflowName"] as string | undefined) ??
+                      `#${i + 1}`;
+                    const state =
+                      (c["status"] as string | undefined) ??
+                      (c["state"] as string | undefined) ??
+                      "";
+                    const conclusion =
+                      (c["conclusion"] as string | undefined) ?? "";
+                    const isSuccess = ["success", "neutral", "skipped"].includes(
+                      conclusion.toLowerCase(),
+                    );
+                    const isFailure = [
+                      "failure",
+                      "cancelled",
+                      "timed_out",
+                      "action_required",
+                    ].includes(conclusion.toLowerCase());
+                    return (
+                      <li
+                        key={`${name}-${i}`}
+                        className="flex items-center gap-1.5"
+                      >
+                        {isSuccess ? (
+                          <CheckCircle className="h-3 w-3 text-emerald-400" />
+                        ) : isFailure ? (
+                          <AlertTriangle className="h-3 w-3 text-rose-400" />
+                        ) : (
+                          <Loader className="h-3 w-3 animate-spin text-indigo-400" />
+                        )}
+                        <span className="truncate text-white/70">{name}</span>
+                        <span className="text-white/40">
+                          {conclusion || state.toLowerCase()}
+                        </span>
+                      </li>
+                    );
+                  })}
+                  {checks.length > 8 && (
+                    <li className="text-white/30">
+                      … and {checks.length - 8} more
+                    </li>
+                  )}
+                </ul>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
 // Strip of clickable tabs above the chat: "Main thread" + one
 // tab per Agent tool call. Switches the chat view scope below.
 function SubagentTabStrip({
@@ -2489,6 +2598,7 @@ function MissionWorkbenchPanel({
   onSetStatus,
   runSettingsSlot,
   dockerServices,
+  pendingCiTasks,
   usage,
   className,
 }: {
@@ -2513,6 +2623,18 @@ function MissionWorkbenchPanel({
    *  populated for K8sPod missions whose initial_repos brought up a
    *  compose stack). Empty / undefined hides the panel. */
   dockerServices?: import("@/lib/api").DockerServiceStatus[];
+  /** Live pending CI watches for the per-mission pod. Each entry is
+   *  one backend-spawned `gh ... --watch` subprocess in flight (see
+   *  src/api/pr_ci_watcher.rs). Empty / undefined hides the panel. */
+  pendingCiTasks?: Record<
+    string,
+    {
+      target: string;
+      status: string;
+      checks: unknown[];
+      url: string | null;
+    }
+  >;
   /** Token usage stats aggregated from this mission's
    *  assistant_message events. Hidden until at least one turn
    *  reports usage. */
@@ -2676,6 +2798,8 @@ function MissionWorkbenchPanel({
             {dockerServices && dockerServices.length > 0 && (
               <DockerServicesPanel services={dockerServices} />
             )}
+
+            {pendingCiTasks && <PrCiWatchPanel tasks={pendingCiTasks} />}
 
             {/* Token usage gauges. The "Context" gauge is the input
                 side of the most recent turn (raw + cache_read +
@@ -5466,6 +5590,30 @@ export default function ControlClient() {
   // DockerServicesPanel in the workbench column.
   const [dockerServicesByMission, setDockerServicesByMission] = useState<
     Record<string, import("@/lib/api").DockerServiceStatus[]>
+  >({});
+
+  // Per-mission CI watches in flight, keyed by mission_id then by
+  // tool_use_id. Populated by `mission_pr_ci_update` SSE events from
+  // the pr-ci-watcher (`src/api/pr_ci_watcher.rs`). Each entry tracks
+  // one `gh ... --watch` subprocess the backend spawned in response
+  // to the agent firing `gh pr create` / `gh pr merge` / `gh run
+  // rerun` / `gh workflow run` / `git push`. Status `watching`
+  // updates the row in-place; `completed`/`failed`/`removed` deletes
+  // it (the system-reminder with the final verdict has already
+  // landed in the mission's event stream by then).
+  const [pendingCiByMission, setPendingCiByMission] = useState<
+    Record<
+      string,
+      Record<
+        string,
+        {
+          target: string;
+          status: string;
+          checks: unknown[];
+          url: string | null;
+        }
+      >
+    >
   >({});
 
   // Sub-agent (Claude Code `Agent` tool sidechain) activity, keyed
@@ -9907,6 +10055,51 @@ export default function ControlClient() {
         return;
       }
 
+      // Live PR-CI watcher progress. Each watch task (one per agent
+      // `gh pr create` / `gh pr merge` / `gh run rerun` /
+      // `gh workflow run` / `git push`) emits one `watching` event
+      // immediately on spawn, then one every ~10s while the
+      // backend's `gh ... --watch` subprocess is in flight, then a
+      // final `completed`/`failed`/`removed` event when it
+      // terminates. See `src/api/pr_ci_watcher.rs::spawn_watch_task`.
+      if (event.type === "mission_pr_ci_update" && isRecord(data)) {
+        const missionId =
+          typeof data["mission_id"] === "string"
+            ? data["mission_id"]
+            : undefined;
+        const toolUseId =
+          typeof data["tool_use_id"] === "string"
+            ? data["tool_use_id"]
+            : undefined;
+        const target =
+          typeof data["target"] === "string" ? data["target"] : undefined;
+        const status =
+          typeof data["status"] === "string" ? data["status"] : undefined;
+        const checks = Array.isArray(data["checks"])
+          ? (data["checks"] as unknown[])
+          : [];
+        const url =
+          typeof data["url"] === "string" ? (data["url"] as string) : null;
+        if (missionId && toolUseId && status) {
+          setPendingCiByMission((prev) => {
+            const m = { ...(prev[missionId] ?? {}) };
+            if (status === "watching") {
+              m[toolUseId] = {
+                target: target ?? "",
+                status,
+                checks,
+                url,
+              };
+            } else {
+              // completed | failed | removed → drop the row
+              delete m[toolUseId];
+            }
+            return { ...prev, [missionId]: m };
+          });
+        }
+        return;
+      }
+
       // Sub-agent sidechain activity. Each event carries
       // `parent_tool_use_id` pointing at the boss's `Agent` tool
       // call. We bucket by that id so the dashboard can render one
@@ -12756,6 +12949,11 @@ export default function ControlClient() {
                   dockerServices={
                     activeMission
                       ? dockerServicesByMission[activeMission.id]
+                      : undefined
+                  }
+                  pendingCiTasks={
+                    activeMission
+                      ? pendingCiByMission[activeMission.id]
                       : undefined
                   }
                   usage={missionUsage}
