@@ -6271,8 +6271,26 @@ pub fn run_claudecode_turn<'a>(
                                                             };
                                                         let mid = mission_id;
                                                         let w = watcher.clone();
+                                                        // `workspace` (local binding above)
+                                                        // is the K8sPod workspace this
+                                                        // turn runs in — clone it so the
+                                                        // detached log-stream spawner can
+                                                        // `kubectl exec tail -F` into the
+                                                        // right pod without re-resolving.
+                                                        let ws_for_stream = workspace.clone();
+                                                        let events_tx_for_stream =
+                                                            events_tx.clone();
+                                                        let task_for_stream = task.clone();
                                                         tokio::spawn(async move {
                                                             w.register(mid, task).await;
+                                                            crate::api::background_watcher::spawn_log_stream(
+                                                                mid,
+                                                                &task_for_stream,
+                                                                ws_for_stream,
+                                                                w.clone(),
+                                                                events_tx_for_stream,
+                                                            )
+                                                            .await;
                                                         });
                                                         tracing::info!(
                                                             mission_id = %mission_id,

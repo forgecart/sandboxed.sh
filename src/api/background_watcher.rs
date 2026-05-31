@@ -48,8 +48,11 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
-use crate::workspace::{SharedWorkspaceStore, Workspace};
+use crate::api::control::AgentEvent;
+use crate::workspace::{SharedWorkspaceStore, Workspace, WorkspaceType};
 use crate::workspace_exec::WorkspaceExec;
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 /// Caps for the output capture sent to the classifier and emitted on
 /// `DONE`. 8 KB head + 8 KB tail = 16 KB total, plus a one-line marker
@@ -95,6 +98,10 @@ pub enum Verdict {
 #[derive(Debug, Clone, Default)]
 pub struct SharedBackgroundWatcher {
     state: Arc<RwLock<HashMap<Uuid, Vec<BgTask>>>>,
+    /// Per-task cancellation tokens for the live log-tail streams.
+    /// `remove()` cancels the matching token so the tail subprocess
+    /// shuts down promptly instead of leaking until the bash exits.
+    log_streams: Arc<RwLock<HashMap<(Uuid, String), CancellationToken>>>,
 }
 
 /// Process-global handle to the live watcher. Set once at startup
@@ -143,6 +150,26 @@ impl SharedBackgroundWatcher {
                 guard.remove(&mission_id);
             }
         }
+        drop(guard);
+        // Tear down the matching tail subprocess if one was spawned
+        // for this task — otherwise `tail -F` runs forever.
+        let mut streams = self.log_streams.write().await;
+        if let Some(token) = streams.remove(&(mission_id, shell_id.to_string())) {
+            token.cancel();
+        }
+    }
+
+    /// Register a `CancellationToken` so a subsequent `remove()` can
+    /// signal the live-tail subprocess to exit. Called by
+    /// `spawn_log_stream` once it has its token.
+    async fn install_stream_token(
+        &self,
+        mission_id: Uuid,
+        shell_id: String,
+        token: CancellationToken,
+    ) {
+        let mut streams = self.log_streams.write().await;
+        streams.insert((mission_id, shell_id), token);
     }
 
     pub async fn list_for_mission(&self, mission_id: Uuid) -> Vec<BgTask> {
@@ -157,6 +184,227 @@ impl SharedBackgroundWatcher {
     pub async fn snapshot(&self) -> HashMap<Uuid, Vec<BgTask>> {
         self.state.read().await.clone()
     }
+}
+
+/// Spawn a tokio task that streams the bg-bash's stdout into the SSE
+/// channel as `AgentEvent::MissionBgTaskLog` events. The tail
+/// subprocess runs `tail -F -n +1 <output_path>` inside the mission
+/// pod and is cancelled on `watcher.remove(mission_id, shell_id)`.
+/// Caller fires this once, right after `watcher.register(...)`.
+///
+/// **Why a separate spawner?** The classifier-driven `tick_loop`
+/// runs every 10 minutes and only fetches a head+tail snapshot. The
+/// dashboard's bg-task chip wants real-time line streaming so the
+/// operator can watch a long install / e2e run as it progresses
+/// without waiting for the next tick.
+///
+/// **Why K8sPod only?** The tail mechanism uses `kubectl exec` to
+/// run `tail` inside the mission pod against the agent's own
+/// `<id>.output` file. For nspawn / Host workspaces the file is on
+/// the same machine; a future revision can switch on
+/// `workspace.workspace_type` and use `tokio::fs::watch` or a local
+/// `tail` instead. Today's missions that hit this race are all
+/// K8sPod (verified live on mission 4b8eba44).
+pub async fn spawn_log_stream(
+    mission_id: Uuid,
+    task: &BgTask,
+    workspace: Workspace,
+    watcher: SharedBackgroundWatcher,
+    events_tx: broadcast::Sender<AgentEvent>,
+) {
+    if workspace.workspace_type != WorkspaceType::K8sPod {
+        return;
+    }
+    let token = CancellationToken::new();
+    watcher
+        .install_stream_token(mission_id, task.shell_id.clone(), token.clone())
+        .await;
+
+    // Emit the "started" event up front so the chip appears before any
+    // output lands (some bg tasks take 5-10 s to produce the first line).
+    let label = short_label(&task.command);
+    let _ = events_tx.send(AgentEvent::MissionBgTaskStarted {
+        mission_id,
+        shell_id: task.shell_id.clone(),
+        label,
+        started_at: task.started_at.to_rfc3339(),
+    });
+
+    let shell_id = task.shell_id.clone();
+    let output_path = task.output_path.clone();
+    let cancel = token.clone();
+    let watcher_for_finished = watcher.clone();
+    let events_tx_for_finished = events_tx.clone();
+    let shell_id_for_finished = shell_id.clone();
+    tokio::spawn(async move {
+        let outcome = run_tail(
+            mission_id,
+            &shell_id,
+            &workspace,
+            &output_path,
+            &events_tx,
+            cancel,
+        )
+        .await;
+        // Always emit Finished — either because the tail exited
+        // (process closed its fds, file rotated, kubectl exec ended)
+        // or because watcher.remove cancelled us mid-stream.
+        let _ = events_tx_for_finished.send(AgentEvent::MissionBgTaskFinished {
+            mission_id,
+            shell_id: shell_id_for_finished.clone(),
+            ok: outcome.unwrap_or(false),
+            completed_at: Utc::now().to_rfc3339(),
+        });
+        // Defensive: drop the token entry if remove() wasn't called
+        // (e.g. tail naturally EOF'd).
+        let mut streams = watcher_for_finished.log_streams.write().await;
+        streams.remove(&(mission_id, shell_id_for_finished));
+    });
+}
+
+/// One-line label for the bg-task chip. Truncates the command to the
+/// first 80 chars + an ellipsis. Strips leading wrapper words
+/// (`setsid bash -lc '…'`, `nohup …`) so the chip shows the
+/// agent-intended command rather than our PTY-detach wrapper.
+fn short_label(command: &str) -> String {
+    let stripped = command
+        .trim()
+        .strip_prefix("setsid bash -lc ")
+        .or_else(|| command.trim().strip_prefix("nohup bash -lc "))
+        .map(|rest| rest.trim().trim_matches('\''))
+        .unwrap_or(command.trim());
+    let one_line = stripped.lines().next().unwrap_or("").trim();
+    if one_line.chars().count() <= 80 {
+        one_line.to_string()
+    } else {
+        let truncated: String = one_line.chars().take(77).collect();
+        format!("{truncated}…")
+    }
+}
+
+/// Run `tail -F` in the pod, streaming each line to `events_tx` as a
+/// `MissionBgTaskLog`. Returns Ok(true) if the tail exited cleanly,
+/// Ok(false) on cancellation, Err on spawn failure.
+async fn run_tail(
+    mission_id: Uuid,
+    shell_id: &str,
+    workspace: &Workspace,
+    output_path: &str,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    cancel: CancellationToken,
+) -> Result<bool> {
+    let exec = WorkspaceExec::for_mission(workspace.clone(), mission_id);
+    // `tail -F` follows by name, so a rotation / atomic rename
+    // (which Claude Code does at task start) doesn't end the stream.
+    // `-n +1` includes the file's current content from line 1 — the
+    // user might attach the dashboard mid-task; we still want them
+    // to see the head.
+    let cmd = format!(
+        "tail -F -n +1 {} 2>/dev/null",
+        shell_quote_for_bash(output_path)
+    );
+    // WorkspaceExec doesn't have a stream API, so we drop down to
+    // tokio::process::Command directly (same pattern as
+    // `k8s_pod::stream_docker_compose_status`).
+    let pod_name = crate::k8s_pod::pod_name(mission_id);
+    let namespace = std::env::var("SANDBOXED_SH_K8S_WORKSPACE_NAMESPACE")
+        .ok()
+        .unwrap_or_else(|| "sandboxed-sh".to_string());
+    let api_server = std::env::var("KUBERNETES_SERVICE_HOST")
+        .ok()
+        .map(|host| {
+            let port = std::env::var("KUBERNETES_SERVICE_PORT").unwrap_or_else(|_| "443".into());
+            format!("https://{host}:{port}")
+        })
+        .unwrap_or_else(|| "https://kubernetes.default.svc".into());
+    let token = std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/token")
+        .unwrap_or_default();
+
+    let mut command = tokio::process::Command::new("kubectl");
+    command
+        .arg("--token")
+        .arg(&token)
+        .arg("--certificate-authority")
+        .arg("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+        .arg("--server")
+        .arg(&api_server)
+        .arg("--namespace")
+        .arg(&namespace)
+        .arg("exec")
+        .arg(&pod_name)
+        .arg("--")
+        .arg("/bin/bash")
+        .arg("-lc")
+        .arg(&cmd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .context("failed to spawn kubectl exec for bg-task tail")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("tail subprocess produced no stdout")?;
+
+    use tokio::io::AsyncBufReadExt;
+    let reader = tokio::io::BufReader::new(stdout);
+    let mut lines = reader.lines();
+    let _ = workspace; // already moved into exec snapshot; keep linter quiet
+    let _ = exec;
+    let _ = (events_tx,); // silence unused
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                let _ = child.kill().await;
+                return Ok(false);
+            }
+            next = lines.next_line() => {
+                match next {
+                    Ok(Some(line)) => {
+                        let _ = events_tx.send(AgentEvent::MissionBgTaskLog {
+                            mission_id,
+                            shell_id: shell_id.to_string(),
+                            line,
+                        });
+                    }
+                    Ok(None) => {
+                        // tail -F should never EOF on a live file —
+                        // hitting this branch means the kubectl exec
+                        // session died (pod restart, network blip).
+                        // Surface as a clean exit; the agent's next
+                        // tick may re-spawn the stream.
+                        return Ok(true);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            mission_id = %mission_id,
+                            shell_id = %shell_id,
+                            error = %e,
+                            "bg-task tail read error",
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn shell_quote_for_bash(s: &str) -> String {
+    // Single-quote the path; embedded `'` becomes `'\''`. Matches the
+    // standard shell-escape pattern used elsewhere in this crate.
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────

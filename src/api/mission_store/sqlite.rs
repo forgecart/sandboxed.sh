@@ -3728,6 +3728,9 @@ impl MissionStore for SqliteMissionStore {
             | AgentEvent::MissionPodStartup { .. }
             | AgentEvent::MissionDockerStatus { .. }
             | AgentEvent::MissionComposeLog { .. }
+            | AgentEvent::MissionBgTaskStarted { .. }
+            | AgentEvent::MissionBgTaskLog { .. }
+            | AgentEvent::MissionBgTaskFinished { .. }
             | AgentEvent::MissionPrCiUpdate { .. }
             | AgentEvent::SubagentToolCall { .. }
             | AgentEvent::SubagentToolResult { .. }

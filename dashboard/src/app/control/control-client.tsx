@@ -32,6 +32,7 @@ import {
   ForkProgressOverlay,
   shouldBlockComposer,
 } from "@/components/fork-progress-overlay";
+import { BgTaskTabs } from "@/components/bg-task-tabs";
 import { deriveAssistantTurnStatus } from "@/lib/assistant-turn-status";
 import { perfBus } from "@/lib/perf-bus";
 import { isStreamContinuation } from "@/lib/stream-continuation";
@@ -5604,6 +5605,27 @@ export default function ControlClient() {
     Record<string, Record<string, string[]>>
   >({});
 
+  // Per-mission, per-shell-id live background-task log ring buffer.
+  // Populated by `mission_bg_task_log` SSE events from the backend's
+  // `background_watcher::spawn_log_stream`. Each chip in the
+  // BgTaskTabs strip (above the composer) reads from this state.
+  // Lifecycle:
+  //   - mission_bg_task_started → entry created, status="running"
+  //   - mission_bg_task_log     → line appended (500-line ring)
+  //   - mission_bg_task_finished → status flips to "done"/"failed",
+  //     a 30 s setTimeout schedules removal so the operator sees the
+  //     final state briefly before the chip auto-dismisses.
+  type BgTaskEntry = {
+    label: string;
+    startedAt: number;
+    completedAt?: number;
+    status: "running" | "done" | "failed";
+    lines: string[];
+  };
+  const [bgTasksByMission, setBgTasksByMission] = useState<
+    Record<string, Record<string, BgTaskEntry>>
+  >({});
+
   // Per-mission CI completions newly detected by the repo-ci-listener
   // (`src/api/repo_ci_listener.rs`), keyed by mission_id then by a
   // `<owner>/<repo>#<runId>` stable key. The listener polls every
@@ -10096,6 +10118,128 @@ export default function ControlClient() {
         return;
       }
 
+      // Bg-task chip lifecycle: 3 event types from the backend's
+      // background-watcher (`src/api/background_watcher.rs`).
+      //   started  → create chip, status="running"
+      //   log      → append a line (ring buffer cap 500)
+      //   finished → flip status, schedule 30 s auto-dismiss
+      if (event.type === "mission_bg_task_started" && isRecord(data)) {
+        const missionId =
+          typeof data["mission_id"] === "string"
+            ? data["mission_id"]
+            : undefined;
+        const shellId =
+          typeof data["shell_id"] === "string" ? data["shell_id"] : undefined;
+        const label =
+          typeof data["label"] === "string" ? data["label"] : "(bg task)";
+        const startedAtStr =
+          typeof data["started_at"] === "string" ? data["started_at"] : "";
+        const startedAt = Date.parse(startedAtStr) || Date.now();
+        if (missionId && shellId) {
+          setBgTasksByMission((prev) => {
+            const byShell = prev[missionId] ?? {};
+            if (byShell[shellId]) return prev;
+            return {
+              ...prev,
+              [missionId]: {
+                ...byShell,
+                [shellId]: {
+                  label,
+                  startedAt,
+                  status: "running",
+                  lines: [],
+                },
+              },
+            };
+          });
+        }
+        return;
+      }
+      if (event.type === "mission_bg_task_log" && isRecord(data)) {
+        const missionId =
+          typeof data["mission_id"] === "string"
+            ? data["mission_id"]
+            : undefined;
+        const shellId =
+          typeof data["shell_id"] === "string" ? data["shell_id"] : undefined;
+        const line =
+          typeof data["line"] === "string" ? data["line"] : undefined;
+        if (missionId && shellId && line !== undefined) {
+          setBgTasksByMission((prev) => {
+            const byShell = prev[missionId] ?? {};
+            const existing = byShell[shellId];
+            // Lazy create — a log event arriving before `started`
+            // (race on a slow first kubectl exec) should still
+            // produce a chip.
+            const entry: BgTaskEntry = existing ?? {
+              label: "(bg task)",
+              startedAt: Date.now(),
+              status: "running",
+              lines: [],
+            };
+            const trimmed =
+              entry.lines.length >= 500 ? entry.lines.slice(-499) : entry.lines;
+            return {
+              ...prev,
+              [missionId]: {
+                ...byShell,
+                [shellId]: { ...entry, lines: [...trimmed, line] },
+              },
+            };
+          });
+        }
+        return;
+      }
+      if (event.type === "mission_bg_task_finished" && isRecord(data)) {
+        const missionId =
+          typeof data["mission_id"] === "string"
+            ? data["mission_id"]
+            : undefined;
+        const shellId =
+          typeof data["shell_id"] === "string" ? data["shell_id"] : undefined;
+        const ok = data["ok"] === true;
+        const completedStr =
+          typeof data["completed_at"] === "string" ? data["completed_at"] : "";
+        const completedAt = Date.parse(completedStr) || Date.now();
+        if (missionId && shellId) {
+          setBgTasksByMission((prev) => {
+            const byShell = prev[missionId] ?? {};
+            const existing = byShell[shellId];
+            if (!existing) return prev;
+            return {
+              ...prev,
+              [missionId]: {
+                ...byShell,
+                [shellId]: {
+                  ...existing,
+                  status: ok ? "done" : "failed",
+                  completedAt,
+                },
+              },
+            };
+          });
+          // Auto-dismiss after 30 s. If the user is no longer
+          // viewing this mission when the timer fires the chip is
+          // already off-screen anyway.
+          setTimeout(() => {
+            setBgTasksByMission((prev) => {
+              const byShell = prev[missionId];
+              if (!byShell || !byShell[shellId]) return prev;
+              const rest = Object.fromEntries(
+                Object.entries(byShell).filter(([k]) => k !== shellId),
+              );
+              if (Object.keys(rest).length === 0) {
+                const next = { ...prev };
+                delete next[missionId];
+                return next;
+              }
+              return { ...prev, [missionId]: rest };
+            });
+          }, 30_000);
+        }
+        return;
+      }
+
       // Repo-CI-listener notifications. The backend listener (see
       // `src/api/repo_ci_listener.rs`) emits a `completed` event
       // when any GitHub Actions run on a repo cloned at
@@ -12872,6 +13016,11 @@ export default function ControlClient() {
                       bottom. Mimics ChatGPT / Anthropic console — saves
                       horizontal real estate on mobile (~30% width) and
                       keeps the buttons within thumb reach. */}
+                  {viewingMission && (
+                    <BgTaskTabs
+                      tasks={bgTasksByMission[viewingMission.id] ?? null}
+                    />
+                  )}
                   <div className="rounded-2xl border border-white/[0.08] bg-white/[0.03] focus-within:border-indigo-500/40 transition-colors">
                     <div className="px-3 pt-2 pb-1">
                       <EnhancedInput

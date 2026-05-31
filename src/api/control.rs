@@ -2865,6 +2865,42 @@ pub enum AgentEvent {
         repo: String,
         line: String,
     },
+    /// A `Bash(run_in_background:true)` task has been registered with
+    /// the background watcher (see `src/api/background_watcher.rs`).
+    /// Dashboard renders a small chip in the bg-task strip above the
+    /// composer. Fires once per task on the first line of output (or
+    /// immediately after registration if the file already has content).
+    MissionBgTaskStarted {
+        mission_id: Uuid,
+        shell_id: String,
+        /// First line of the command, truncated to ~80 chars for the
+        /// tab label. The agent's original full command is also
+        /// available — we send a short label for the chip.
+        label: String,
+        /// ISO-8601 timestamp; client uses this for elapsed display.
+        started_at: String,
+    },
+    /// One newly-appended line from a background bash's output file.
+    /// Streamed via `tail -F` inside the mission pod. The dashboard
+    /// accumulates a 500-line ring buffer per `(mission, shell_id)`
+    /// and renders the last ~50 in the popover.
+    MissionBgTaskLog {
+        mission_id: Uuid,
+        shell_id: String,
+        line: String,
+    },
+    /// A background bash task has reached its terminal state — either
+    /// the pod-side daemon's `.complete` marker landed (success/exit)
+    /// or the classifier verdict surfaced Done. Dashboard flips the
+    /// chip to ✓/✗ and starts a 30 s grace timer before dismissing.
+    MissionBgTaskFinished {
+        mission_id: Uuid,
+        shell_id: String,
+        /// `true` when the underlying process exit was clean (best
+        /// effort — we don't always have the exit code).
+        ok: bool,
+        completed_at: String,
+    },
     /// Live CI run notification for a mission. Emitted by the
     /// repo-ci-listener (`src/api/repo_ci_listener.rs`) when a
     /// GitHub Actions run on any repo cloned under
@@ -3061,6 +3097,9 @@ impl AgentEvent {
             AgentEvent::MissionPodStartup { .. } => "mission_pod_startup",
             AgentEvent::MissionDockerStatus { .. } => "mission_docker_status",
             AgentEvent::MissionComposeLog { .. } => "mission_compose_log",
+            AgentEvent::MissionBgTaskStarted { .. } => "mission_bg_task_started",
+            AgentEvent::MissionBgTaskLog { .. } => "mission_bg_task_log",
+            AgentEvent::MissionBgTaskFinished { .. } => "mission_bg_task_finished",
             AgentEvent::MissionPrCiUpdate { .. } => "mission_pr_ci_update",
             AgentEvent::SubagentToolCall { .. } => "subagent_tool_call",
             AgentEvent::SubagentToolResult { .. } => "subagent_tool_result",
@@ -3102,6 +3141,9 @@ impl AgentEvent {
             AgentEvent::GoalIteration { mission_id, .. } => *mission_id,
             AgentEvent::GoalStatus { mission_id, .. } => *mission_id,
             AgentEvent::MissionComposeLog { mission_id, .. } => Some(*mission_id),
+            AgentEvent::MissionBgTaskStarted { mission_id, .. } => Some(*mission_id),
+            AgentEvent::MissionBgTaskLog { mission_id, .. } => Some(*mission_id),
+            AgentEvent::MissionBgTaskFinished { mission_id, .. } => Some(*mission_id),
         }
     }
 }
