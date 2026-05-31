@@ -418,38 +418,56 @@ fn parse_run_id_from_command_or_result(content: &str) -> Option<(String, String,
 }
 
 fn parse_push_commit(content: &str) -> Option<(String, String)> {
-    // Look for `git push` summary lines:
-    //   `   abc1234..def5678  main -> main`
-    //   ` * [new branch]      foo -> foo`
-    //   ` + def5678...abc1234 main -> main (forced update)`
-    // We want the branch name and the new commit SHA.
+    // Look for `git push` summary lines. Several shapes appear in
+    // the wild — handle all three:
+    //   `   abc1234..def5678  main -> main`       (fast-forward)
+    //   ` + def5678...abc1234 main -> main (forced update)`  (forced)
+    //   ` * [new branch]      foo -> foo`         (first push)
+    //   ` * [new tag]         v1.0.0 -> v1.0.0`   (tag push)
+    //
+    // For a fast-forward / forced push, the leading token gives the
+    // new SHA after `..` / `...`. For a `[new branch]` push there's
+    // no SHA in the line — we return the branch with sentinel SHA
+    // `HEAD` and let `resolve_target` look up the latest run for
+    // the branch (no commit filter).
     for line in content.lines() {
         let l = line.trim_start();
         if l.is_empty() {
             continue;
         }
+        let arrow_idx = match l.split_whitespace().position(|p| p == "->") {
+            Some(i) => i,
+            None => continue,
+        };
         let parts: Vec<&str> = l.split_whitespace().collect();
-        if parts.len() < 4 {
+        let branch = match parts.get(arrow_idx + 1) {
+            Some(b) => b.to_string(),
+            None => continue,
+        };
+        if branch.is_empty() {
             continue;
         }
-        if !parts.contains(&"->") {
+        // Skip tag pushes — CI only fires on branch refs in the
+        // overwhelming majority of GH Actions workflows. (The
+        // operator can still `gh run watch` directly.)
+        if l.contains("[new tag]") {
             continue;
         }
-        // The first token is a range like `abc..def` (fast-forward) or
-        // `def...abc` (forced) — split on the last `.` group.
         let range = parts[0];
         let sha = if let Some(idx) = range.rfind("...") {
             range[idx + 3..].to_string()
         } else if let Some(idx) = range.rfind("..") {
             range[idx + 2..].to_string()
+        } else if l.contains("[new branch]") {
+            // First push to a branch has no SHA in the summary
+            // line — use HEAD as a sentinel. `resolve_target`
+            // treats sha=="HEAD" as "drop the --commit filter and
+            // look up the latest run for the branch".
+            "HEAD".to_string()
         } else {
-            // `* [new branch]` and similar non-range tokens don't
-            // carry a SHA in the summary line; skip them.
             continue;
         };
-        let arrow_idx = parts.iter().position(|p| *p == "->")?;
-        let branch = parts.get(arrow_idx + 1)?.to_string();
-        if sha.len() < 7 || branch.is_empty() {
+        if (sha != "HEAD" && sha.len() < 7) || branch.is_empty() {
             continue;
         }
         return Some((branch, sha));
@@ -822,13 +840,23 @@ async fn resolve_target(exec: &WorkspaceExec, target: &CiTarget) -> Result<CiTar
                 (owner.clone(), repo.clone())
             };
 
-            // 2. Poll `gh run list --branch X --commit Y` until we
-            //    find a databaseId, then upgrade to Run.
+            // 2. Poll `gh run list` until we find a databaseId, then
+            //    upgrade to Run. For a `[new branch]` push,
+            //    `parse_push_commit` returns sha="HEAD" as a
+            //    sentinel — that case drops the --commit filter and
+            //    just picks the latest run for the branch.
             for attempt in 0..COMMIT_RESOLVE_RETRIES {
-                let cmd = format!(
-                    "gh run list --branch {branch} --commit {sha} --limit 1 \
-                     --json databaseId -R {owner}/{repo} 2>&1",
-                );
+                let cmd = if sha == "HEAD" {
+                    format!(
+                        "gh run list --branch {branch} --limit 1 \
+                         --json databaseId -R {owner}/{repo} 2>&1",
+                    )
+                } else {
+                    format!(
+                        "gh run list --branch {branch} --commit {sha} --limit 1 \
+                         --json databaseId -R {owner}/{repo} 2>&1",
+                    )
+                };
                 let out = exec
                     .output(
                         std::path::Path::new("/tmp"),
@@ -1151,6 +1179,24 @@ mod tests {
         let (branch, sha) = parse_push_commit(content).unwrap();
         assert_eq!(branch, "main");
         assert_eq!(sha, "abc1234");
+    }
+
+    #[test]
+    fn parses_git_push_new_branch() {
+        // First push to a brand-new branch: no SHA range, just
+        // `[new branch]`. We return HEAD as a sentinel so
+        // resolve_target falls back to branch-only lookup.
+        let content = "To github.com:owner/repo.git\n * [new branch]      feat/foo -> feat/foo\n";
+        let (branch, sha) = parse_push_commit(content).unwrap();
+        assert_eq!(branch, "feat/foo");
+        assert_eq!(sha, "HEAD");
+    }
+
+    #[test]
+    fn skips_git_push_new_tag() {
+        // Tag pushes don't trigger PR CI in practice — bypass.
+        let content = "To github.com:owner/repo.git\n * [new tag]         v1.0.0 -> v1.0.0\n";
+        assert_eq!(parse_push_commit(content), None);
     }
 
     #[test]
