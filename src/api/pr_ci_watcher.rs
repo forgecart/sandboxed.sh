@@ -361,11 +361,19 @@ pub fn parse_ci_target(kind: CiKind, content: &str) -> Option<CiTarget> {
                 }
             })
         }
-        CiKind::Push => parse_push_commit(content).map(|(branch, sha)| CiTarget::Commit {
-            owner: String::new(),
-            repo: String::new(),
-            branch,
-            sha,
+        CiKind::Push => parse_push_commit(content).map(|(branch, sha)| {
+            // Pre-populate owner/repo from the push output's
+            // `To git@github.com:owner/repo.git` line when possible
+            // — that lets `resolve_target` skip the `gh repo view`
+            // fallback (which is unreliable because it runs from
+            // /tmp, not the agent's cloned dir).
+            let (owner, repo) = parse_push_remote(content).unwrap_or_default();
+            CiTarget::Commit {
+                owner,
+                repo,
+                branch,
+                sha,
+            }
         }),
     }
 }
@@ -415,6 +423,47 @@ fn parse_run_id_from_command_or_result(content: &str) -> Option<(String, String,
         }
     }
     None
+}
+
+/// Try to pull owner/repo out of the `To github.com:owner/repo.git`
+/// (or `To https://github.com/owner/repo.git`) line that `git push`
+/// emits before the per-ref summary. The watcher uses this to skip
+/// the brittle `gh repo view` cwd-dependent fallback.
+fn parse_push_remote(content: &str) -> Option<(String, String)> {
+    for line in content.lines() {
+        let l = line.trim_start();
+        if !l.starts_with("To ") {
+            continue;
+        }
+        let rest = &l[3..];
+        // Match git@github.com:owner/repo[.git]
+        if let Some(after_colon) = rest
+            .strip_prefix("git@github.com:")
+            .or_else(|| rest.strip_prefix("github.com:"))
+        {
+            return parse_nwo_path(after_colon);
+        }
+        // Match https://github.com/owner/repo[.git]
+        if let Some(after_host) = rest
+            .strip_prefix("https://github.com/")
+            .or_else(|| rest.strip_prefix("http://github.com/"))
+        {
+            return parse_nwo_path(after_host);
+        }
+    }
+    None
+}
+
+fn parse_nwo_path(s: &str) -> Option<(String, String)> {
+    let trimmed = s.trim();
+    let stripped = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let mut parts = stripped.split('/');
+    let owner = parts.next()?.to_string();
+    let repo = parts.next()?.split_whitespace().next()?.to_string();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner, repo))
 }
 
 fn parse_push_commit(content: &str) -> Option<(String, String)> {
@@ -633,30 +682,30 @@ async fn fetch_check_rollup(
     let exec = WorkspaceExec::for_mission(workspace, mission_id);
     type Parser = fn(&str) -> (Vec<serde_json::Value>, Option<String>);
     let (cmd, parser): (String, Parser) = match &task.target {
-            CiTarget::Pr {
-                owner,
-                repo,
-                number,
-            } => (
-                format!("gh pr view {number} --json statusCheckRollup,url -R {owner}/{repo} 2>&1"),
-                parse_pr_rollup,
+        CiTarget::Pr {
+            owner,
+            repo,
+            number,
+        } => (
+            format!("gh pr view {number} --json statusCheckRollup,url -R {owner}/{repo} 2>&1"),
+            parse_pr_rollup,
+        ),
+        CiTarget::Run {
+            owner,
+            repo,
+            run_id,
+        } => (
+            format!(
+                "gh run view {run_id} --json jobs,conclusion,status,url -R {owner}/{repo} 2>&1"
             ),
-            CiTarget::Run {
-                owner,
-                repo,
-                run_id,
-            } => (
-                format!(
-                    "gh run view {run_id} --json jobs,conclusion,status,url -R {owner}/{repo} 2>&1"
-                ),
-                parse_run_jobs,
-            ),
-            CiTarget::Commit { .. } => {
-                // Commit hasn't been resolved to a Run yet; the
-                // panel just shows "watching" with no detail.
-                return Ok((vec![], None));
-            }
-        };
+            parse_run_jobs,
+        ),
+        CiTarget::Commit { .. } => {
+            // Commit hasn't been resolved to a Run yet; the
+            // panel just shows "watching" with no detail.
+            return Ok((vec![], None));
+        }
+    };
     let out = exec
         .output(
             std::path::Path::new("/tmp"),
@@ -893,7 +942,13 @@ async fn resolve_target(exec: &WorkspaceExec, target: &CiTarget) -> Result<CiTar
 }
 
 async fn gh_repo_nwo(exec: &WorkspaceExec) -> Result<String> {
-    let cmd = "gh repo view --json nameWithOwner --jq .nameWithOwner 2>&1";
+    // Run gh ONLY on stdout (no `2>&1`). gh's error output ("failed
+    // to run git: fatal: not a git repository …") goes to stderr;
+    // bundling it into stdout previously made the validator below
+    // accept the error text because it happened to contain `/`. The
+    // fork orchestrator's WorkspaceExec captures stderr separately,
+    // so dropping the redirect is safe.
+    let cmd = "gh repo view --json nameWithOwner --jq .nameWithOwner";
     let out = exec
         .output(
             std::path::Path::new("/tmp"),
@@ -904,10 +959,22 @@ async fn gh_repo_nwo(exec: &WorkspaceExec) -> Result<String> {
         .await
         .context("workspace_exec for gh repo view failed")?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.contains('/') {
+    // owner/repo is single-line `owner/repo`. Reject anything with
+    // whitespace, multiple lines, colons, etc. — those shapes are
+    // always error output, not a real nwo.
+    let valid = !s.is_empty()
+        && !s.contains(char::is_whitespace)
+        && !s.contains(':')
+        && s.split('/').count() == 2
+        && s.split('/').all(|p| !p.is_empty());
+    if valid {
         Ok(s)
     } else {
-        Err(anyhow!("gh repo view returned: {s}"))
+        Err(anyhow!(
+            "gh repo view returned unparseable nwo: {:?} (exit {:?}; cwd /tmp has no git repo? this exec runs outside the agent's cloned dir)",
+            s,
+            out.status.code()
+        ))
     }
 }
 
@@ -1197,6 +1264,33 @@ mod tests {
         // Tag pushes don't trigger PR CI in practice — bypass.
         let content = "To github.com:owner/repo.git\n * [new tag]         v1.0.0 -> v1.0.0\n";
         assert_eq!(parse_push_commit(content), None);
+    }
+
+    #[test]
+    fn parses_push_remote_ssh() {
+        let content = "To github.com:forgecart/cloud.git\n * [new branch]      foo -> foo\n";
+        assert_eq!(
+            parse_push_remote(content),
+            Some(("forgecart".into(), "cloud".into()))
+        );
+    }
+
+    #[test]
+    fn parses_push_remote_https() {
+        let content = "To https://github.com/forgecart/cloud.git\n   abc..def main -> main\n";
+        assert_eq!(
+            parse_push_remote(content),
+            Some(("forgecart".into(), "cloud".into()))
+        );
+    }
+
+    #[test]
+    fn parses_push_remote_no_git_suffix() {
+        let content = "To git@github.com:owner/repo\n   abc..def main -> main";
+        assert_eq!(
+            parse_push_remote(content),
+            Some(("owner".into(), "repo".into()))
+        );
     }
 
     #[test]
