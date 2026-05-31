@@ -1562,6 +1562,45 @@ COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 
 # Skip if empty or already wrapped
 if [ -z "$COMMAND" ]; then exit 0; fi
+
+# Background-task detachment.
+# When run_in_background=true, Claude Code's Bash tool spawns the
+# command without redirecting stdin. The child inherits Claude Code's
+# PTY stdin fd, which keeps the PTY's master side alive after Claude
+# Code's --print subprocess exits → backend's mission_runner blocks
+# on `reader_handle.await` (mission_runner.rs:6422) → "Mission turn
+# finished" log never fires → mission stays `active` → the next user
+# message is queued but never starts a new turn. Verified live on
+# mission 4b8eba44 (long `nx e2e` held the PTY).
+#
+# Wrap the command with `setsid bash -lc '<cmd>' </dev/null`:
+#   (1) `setsid` detaches from the controlling terminal (new session)
+#   (2) `</dev/null` replaces stdin so the PTY slave fd is released
+# stdout/stderr inheritance is handled by Claude Code's own
+# task-output capture and the agent's explicit `> /tmp/foo 2>&1`
+# redirects in the command body.
+#
+# Skip when the agent already wrapped explicitly (`nohup …` or
+# `setsid …`) so we don't double-wrap. Applies to compound commands
+# too — bg detachment is needed regardless of the command shape.
+RUN_BG=$(echo "$INPUT" | jq -r '.tool_input.run_in_background // false')
+if [ "$RUN_BG" = "true" ]; then
+  case "$COMMAND" in
+    setsid\ *|nohup\ *) ;;
+    *)
+      QUOTED=$(printf '%q' "$COMMAND")
+      jq -n --arg cmd "setsid bash -lc $QUOTED </dev/null" '{{
+        hookSpecificOutput: {{
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          updatedInput: {{ command: $cmd }}
+        }}
+      }}'
+      exit 0
+      ;;
+  esac
+fi
+
 case "$COMMAND" in
   rtk\ *|/*/rtk\ *) exit 0 ;;
 esac
