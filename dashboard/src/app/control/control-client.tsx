@@ -5595,6 +5595,15 @@ export default function ControlClient() {
     Record<string, import("@/lib/api").DockerServiceStatus[]>
   >({});
 
+  // Per-mission, per-repo compose-up log ring buffer. Populated by
+  // `mission_compose_log` SSE events from the backend's
+  // `run_compose_up_with_logs` during the `compose_starting` phase
+  // (see `src/k8s_pod.rs`). Capped at 200 lines per repo to keep
+  // memory bounded; ForkProgressOverlay only renders the last ~30.
+  const [composeLogsByMission, setComposeLogsByMission] = useState<
+    Record<string, Record<string, string[]>>
+  >({});
+
   // Per-mission CI completions newly detected by the repo-ci-listener
   // (`src/api/repo_ci_listener.rs`), keyed by mission_id then by a
   // `<owner>/<repo>#<runId>` stable key. The listener polls every
@@ -10057,6 +10066,36 @@ export default function ControlClient() {
         return;
       }
 
+      // K8sPod backend: per-line compose-up stdout during the
+      // `compose_starting` phase. Emitted by the backend's
+      // `run_compose_up_with_logs` in `src/k8s_pod.rs`. The
+      // dashboard tail is rendered beneath the matching repo's
+      // service group in `ForkProgressOverlay`.
+      if (event.type === "mission_compose_log" && isRecord(data)) {
+        const missionId =
+          typeof data["mission_id"] === "string"
+            ? data["mission_id"]
+            : undefined;
+        const repo =
+          typeof data["repo"] === "string" ? data["repo"] : undefined;
+        const line =
+          typeof data["line"] === "string" ? data["line"] : undefined;
+        if (missionId && repo && line !== undefined) {
+          setComposeLogsByMission((prev) => {
+            const byRepo = prev[missionId] ?? {};
+            const existing = byRepo[repo] ?? [];
+            // Cap at 200 lines per repo — ring buffer.
+            const trimmed =
+              existing.length >= 200 ? existing.slice(-199) : existing;
+            return {
+              ...prev,
+              [missionId]: { ...byRepo, [repo]: [...trimmed, line] },
+            };
+          });
+        }
+        return;
+      }
+
       // Repo-CI-listener notifications. The backend listener (see
       // `src/api/repo_ci_listener.rs`) emits a `completed` event
       // when any GitHub Actions run on a repo cloned at
@@ -12305,6 +12344,7 @@ export default function ControlClient() {
                   phase={viewingMission.pod_phase ?? null}
                   message={viewingMission.pod_message ?? null}
                   title={viewingMission.title ?? null}
+                  composeLogs={composeLogsByMission[viewingMission.id] ?? null}
                 />
               </div>
             ) : (

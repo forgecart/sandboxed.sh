@@ -2806,6 +2806,17 @@ pub enum AgentEvent {
         mission_id: Uuid,
         services: Vec<crate::k8s_pod::DockerServiceStatus>,
     },
+    /// Per-line stdout from the backend-owned `docker compose up -d`
+    /// that runs during a fresh mission's `compose_starting` phase
+    /// (see `src/k8s_pod.rs::run_compose_up_with_logs`). The
+    /// dashboard accumulates a bounded ring buffer per
+    /// (mission_id, repo) and renders the tail beneath the
+    /// matching repo's service group in `ForkProgressOverlay`.
+    MissionComposeLog {
+        mission_id: Uuid,
+        repo: String,
+        line: String,
+    },
     /// Live CI run notification for a mission. Emitted by the
     /// repo-ci-listener (`src/api/repo_ci_listener.rs`) when a
     /// GitHub Actions run on any repo cloned under
@@ -3001,6 +3012,7 @@ impl AgentEvent {
             AgentEvent::MissionMetadataUpdated { .. } => "mission_metadata_updated",
             AgentEvent::MissionPodStartup { .. } => "mission_pod_startup",
             AgentEvent::MissionDockerStatus { .. } => "mission_docker_status",
+            AgentEvent::MissionComposeLog { .. } => "mission_compose_log",
             AgentEvent::MissionPrCiUpdate { .. } => "mission_pr_ci_update",
             AgentEvent::SubagentToolCall { .. } => "subagent_tool_call",
             AgentEvent::SubagentToolResult { .. } => "subagent_tool_result",
@@ -3041,6 +3053,7 @@ impl AgentEvent {
             AgentEvent::FidoSignRequest { .. } => None,
             AgentEvent::GoalIteration { mission_id, .. } => *mission_id,
             AgentEvent::GoalStatus { mission_id, .. } => *mission_id,
+            AgentEvent::MissionComposeLog { mission_id, .. } => Some(*mission_id),
         }
     }
 }
@@ -8844,13 +8857,15 @@ async fn control_actor_loop(
                     );
                 }
 
-                // compose_starting — poll until all services are healthy,
-                // surfacing each tick's service list into pod_message so
-                // the dashboard's per-service sub-rows walk
-                // starting → healthy live.
+                // compose_starting — drive `docker compose up -d`
+                // ourselves (used to be lazy-fired by bashenv.sh on the
+                // first agent exec), streaming per-line stdout back to
+                // the dashboard via MissionComposeLog events. After
+                // it returns, poll until all services are healthy.
                 let detail = serde_json::json!({
                     "label": "Starting compose services",
-                    "services": []
+                    "services": [],
+                    "logs_active": true
                 })
                 .to_string();
                 let _ = mission_store
@@ -8861,6 +8876,40 @@ async fn control_actor_loop(
                     phase: "compose_starting".to_string(),
                     message: "Starting compose services".to_string(),
                 });
+
+                // Pull the SANDBOXED_AUTOSTACK_REPOS allowlist out of
+                // the workspace env (same place bashenv.sh used to
+                // read it). Unset / empty = every cloned repo.
+                let allowlist: Option<String> = workspaces
+                    .get(workspace_id)
+                    .await
+                    .and_then(|w| w.env_vars.get("SANDBOXED_AUTOSTACK_REPOS").cloned())
+                    .filter(|s| !s.trim().is_empty());
+                let log_events_tx = events_tx.clone();
+                let compose_up_outcome = k8s
+                    .run_compose_up_with_logs(
+                        mission_id,
+                        allowlist.as_deref(),
+                        tokio_util::sync::CancellationToken::new(),
+                        move |repo, line| {
+                            let tx = log_events_tx.clone();
+                            async move {
+                                let _ = tx.send(AgentEvent::MissionComposeLog {
+                                    mission_id,
+                                    repo,
+                                    line,
+                                });
+                            }
+                        },
+                    )
+                    .await;
+                if let Err(e) = compose_up_outcome {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        error = %e,
+                        "compose-up exec failed during bootstrap (continuing to convergence wait — wait_compose_healthy may still find services started by an earlier bashenv pass)"
+                    );
+                }
                 let mission_store_for_cb = mission_store.clone();
                 let events_tx_for_cb = events_tx.clone();
                 let compose_outcome = k8s

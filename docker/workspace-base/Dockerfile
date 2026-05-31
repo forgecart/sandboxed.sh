@@ -49,6 +49,19 @@ RUN install -m 0755 -d /etc/apt/keyrings \
         docker-buildx-plugin docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
+# --- in-pod dockerd config (Nexus registry mirror) --------------------------
+# Route `docker pull` (and `docker compose up`'s implicit pull) through
+# the in-cluster Nexus group repo. Port 8089 proxies docker-hub, ghcr,
+# gcr, quay, k8s, elastic and the hosted registry in that priority
+# order. `registry-mirrors` only transparently mirrors Docker Hub — non-Hub
+# references (`ghcr.io/foo`, `quay.io/bar`) still hit upstream directly —
+# but that captures the bulk of compose pulls (postgres, redis,
+# clickhouse, rabbitmq, …). The `insecure-registries` entry is required
+# because the in-cluster Nexus serves plain HTTP; the endpoint is not
+# exposed outside the cluster.
+RUN mkdir -p /etc/docker
+COPY docker/workspace-base/daemon.json /etc/docker/daemon.json
+
 # --- node + pnpm + claude --------------------------------------------------
 # Pinned to the same version sandboxed.sh's resolver expects
 # (`desired_claudecode_version()` in src/api/mission_runner.rs). Pinning

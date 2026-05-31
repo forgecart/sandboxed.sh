@@ -1062,6 +1062,170 @@ impl K8sPodClient {
         }
     }
 
+    /// Run `docker compose up -d` for every repo under
+    /// `/workspaces/repos/<name>/` that ships a `docker-compose.yml`
+    /// or `compose.yml` (subject to the
+    /// `SANDBOXED_AUTOSTACK_REPOS` allowlist, read from the pod's
+    /// env), and stream each output line through `log_cb` as
+    /// `(repo_name, line)`. Returns when the outer bash script
+    /// exits — convergence of the per-service state is handled by
+    /// the subsequent `wait_compose_healthy` call.
+    ///
+    /// **Why a single bash script instead of N concurrent execs?**
+    /// One `kubectl exec` gives us one ordered stdout stream. The
+    /// script prefixes each repo's output with a private
+    /// `@@@COMPOSE@@@ <repo_name>` sentinel so the reader knows
+    /// which repo the next batch of lines belongs to without
+    /// juggling N exec processes. The sentinel never reaches the
+    /// dashboard — the parser swallows it.
+    ///
+    /// **Why `--pull=missing` (default)?** Compose caches images
+    /// after first pull; forcing `--pull=always` would re-download
+    /// every service image on every pod start, defeating the whole
+    /// point of the Nexus mirror cache.
+    ///
+    /// Streaming pattern copied from `stream_docker_compose_status`
+    /// above — `tokio::process::Command::new("kubectl")` with
+    /// `.stdout(Stdio::piped())`, then `BufReader::lines()` in a
+    /// `tokio::select!` cancellation loop.
+    pub async fn run_compose_up_with_logs<F, Fut>(
+        &self,
+        mission_id: Uuid,
+        repos_allowlist: Option<&str>,
+        stop: tokio_util::sync::CancellationToken,
+        mut log_cb: F,
+    ) -> Result<()>
+    where
+        F: FnMut(String, String) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        // Script-side env var lets the pod's bash honour the same
+        // allowlist semantics bashenv.sh used to: space-or-comma
+        // separated repo names; unset/empty = every repo.
+        let allow_env = repos_allowlist.unwrap_or("");
+        // The script:
+        //  1. Walks /workspaces/repos/*/
+        //  2. Skips entries without a compose file
+        //  3. Skips entries where compose has `build:` (self-builds —
+        //     would rebuild the product image and starve the backing
+        //     services)
+        //  4. For each remaining repo: prints sentinel line, then
+        //     runs `docker compose up -d 2>&1`, continuing past
+        //     per-repo failures.
+        let script = format!(
+            r#"set +e
+            SANDBOXED_AUTOSTACK_REPOS="{allow}"
+            __allow="${{SANDBOXED_AUTOSTACK_REPOS//,/ }}"
+            for __cf in /workspaces/repos/*/docker-compose.yml /workspaces/repos/*/compose.yml; do
+              [ -f "$__cf" ] || continue
+              __repo_dir="$(dirname "$__cf")"
+              __repo_name="$(basename "$__repo_dir")"
+              if [ -n "$__allow" ]; then
+                case " $__allow " in
+                  *" $__repo_name "*) : ;;
+                  *) continue ;;
+                esac
+              fi
+              # Skip composes that build from local source (sandboxed.sh's
+              # own docker-compose.yml has `build: .`).
+              if grep -Eq '^[[:space:]]*build[[:space:]]*:' "$__cf"; then
+                continue
+              fi
+              echo "@@@COMPOSE@@@ $__repo_name"
+              ( cd "$__repo_dir" && docker compose up -d 2>&1 ) || true
+            done
+            echo "@@@COMPOSE@@@ __DONE__"
+            "#,
+            allow = allow_env.replace('"', r#"\""#),
+        );
+
+        let pod = pod_name(mission_id);
+        let api_server = std::env::var("KUBERNETES_SERVICE_HOST")
+            .ok()
+            .map(|host| {
+                let port =
+                    std::env::var("KUBERNETES_SERVICE_PORT").unwrap_or_else(|_| "443".to_string());
+                format!("https://{host}:{port}")
+            })
+            .unwrap_or_else(|| "https://kubernetes.default.svc".to_string());
+        let mut cmd = tokio::process::Command::new("kubectl");
+        cmd.arg("--token")
+            .arg(read_sa_token().unwrap_or_default())
+            .arg("--certificate-authority")
+            .arg("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+            .arg("--server")
+            .arg(&api_server)
+            .arg("--namespace")
+            .arg(&self.namespace)
+            .arg("exec")
+            .arg(&pod)
+            .arg("--")
+            .arg("/bin/bash")
+            .arg("-lc")
+            .arg(&script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd
+            .spawn()
+            .context("failed to spawn compose-up kubectl exec")?;
+        let stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                let _ = child.kill().await;
+                anyhow::bail!("compose-up exec produced no stdout pipe");
+            }
+        };
+        use tokio::io::AsyncBufReadExt;
+        let reader = tokio::io::BufReader::new(stdout);
+        let mut lines = reader.lines();
+        let mut current_repo: Option<String> = None;
+        loop {
+            tokio::select! {
+                _ = stop.cancelled() => {
+                    let _ = child.kill().await;
+                    return Ok(());
+                }
+                next = lines.next_line() => {
+                    match next {
+                        Ok(Some(line)) => {
+                            if let Some(repo) = line.strip_prefix("@@@COMPOSE@@@ ") {
+                                let trimmed = repo.trim();
+                                if trimmed == "__DONE__" {
+                                    break;
+                                }
+                                current_repo = Some(trimmed.to_string());
+                                continue;
+                            }
+                            if let Some(repo) = current_repo.clone() {
+                                log_cb(repo, line).await;
+                            } else {
+                                // Output before the first sentinel — typically
+                                // bashenv noise. Discard.
+                                tracing::trace!(
+                                    mission_id = %mission_id,
+                                    line = %line,
+                                    "compose-up: pre-sentinel line discarded"
+                                );
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                error = %e,
+                                "compose-up read error"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let _ = child.wait().await;
+        Ok(())
+    }
+
     /// Run a one-shot command inside the workspace pod. Mirrors
     /// `std::process::Command::output()`'s return shape so callers in
     /// `workspace_exec.rs::output()` can use it as a drop-in.

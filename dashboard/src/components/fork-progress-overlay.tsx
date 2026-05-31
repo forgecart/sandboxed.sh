@@ -18,6 +18,7 @@
 //   - on error, the row that was active at error time turns red and
 //     `pod_message.error` is shown beneath it.
 
+import { useEffect, useRef } from "react";
 import { CheckCircle, Circle, Loader, AlertTriangle } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -231,6 +232,30 @@ export interface ForkProgressOverlayProps {
   message: string | null | undefined;
   /** Mission title for the header */
   title: string | null | undefined;
+  /** Per-repo `docker compose up` stdout tail, streamed by the
+   *  backend's `run_compose_up_with_logs`. Rendered beneath the
+   *  compose_starting row, one collapsible block per repo. */
+  composeLogs?: Record<string, string[]> | null;
+}
+
+function LogTail({ lines }: { lines: string[] }) {
+  const ref = useRef<HTMLPreElement>(null);
+  useEffect(() => {
+    if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
+  }, [lines.length]);
+  if (lines.length === 0) return null;
+  // Render the last 30 lines — older lines stay in the ring buffer
+  // but the visible tail is bounded so a long pull doesn't blow the
+  // overlay layout.
+  const visible = lines.slice(-30);
+  return (
+    <pre
+      ref={ref}
+      className="mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap break-words rounded bg-black/30 px-2 py-1 font-mono text-[10px] leading-snug text-white/50"
+    >
+      {visible.join("\n")}
+    </pre>
+  );
 }
 
 /** Returns true when the overlay should block the chat. */
@@ -250,6 +275,7 @@ export function ForkProgressOverlay({
   phase,
   message,
   title,
+  composeLogs,
 }: ForkProgressOverlayProps) {
   const detail = parseDetail(message);
   const isError = phase === "error";
@@ -342,6 +368,26 @@ export function ForkProgressOverlay({
                   rowPhase === "compose_starting" &&
                   detail?.services && (
                     <ComposeServiceList services={detail.services} />
+                  )}
+
+                {/* Per-repo `docker compose up` stdout tail.
+                    Streamed from the backend's
+                    run_compose_up_with_logs during the
+                    compose_starting phase. */}
+                {isCurrent &&
+                  rowPhase === "compose_starting" &&
+                  composeLogs &&
+                  Object.keys(composeLogs).length > 0 && (
+                    <div className="mt-2 space-y-2 pl-6">
+                      {Object.entries(composeLogs).map(([repo, lines]) => (
+                        <div key={repo}>
+                          <p className="text-[10px] uppercase tracking-wide text-white/30">
+                            {repo} · {lines.length} lines
+                          </p>
+                          <LogTail lines={lines} />
+                        </div>
+                      ))}
+                    </div>
                   )}
 
                 {/* Plaintext sub-message if backend used a non-JSON pod_message

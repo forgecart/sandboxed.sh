@@ -114,59 +114,14 @@ if [ -z "${SANDBOXED_BASHENV_DONE:-}" ] && command -v dockerd >/dev/null 2>&1; t
       fi
 
       if [ -d /workspaces/repos ]; then
-        # One lock guards both the compose-up and the dependency
-        # install passes so two parallel bashes don't race on the
-        # same repo set. Acquired up-front (not behind the
-        # compose-done marker) so the install pass still runs on
-        # later execs after the stack is already up — e.g. when a
-        # repo is cloned, or its lockfile changes, after the first
-        # compose-up has already been marked done.
+        # The compose-up pass that used to live here has moved to the
+        # backend's `spawn_mission_pod_bootstrap` orchestrator (see
+        # `src/k8s_pod.rs::run_compose_up_with_logs` + `docs/compose-at-init.md`)
+        # so it can run at pod boot instead of waiting for the first agent
+        # `bash -lc`, and so per-line stdout can be streamed back to the
+        # dashboard as `MissionComposeLog` SSE events. The lock below now
+        # guards only the dep-install pass.
         if __acquire_lock /var/run/.sandboxed-autostack-lock; then
-
-          # --- docker compose up -d (once per pod) ------------------
-          # Marker-gated: the stack only needs bringing up once.
-          __marker=/workspaces/.sandboxed-autostack-done
-          if [ ! -f "$__marker" ]; then
-            __upped=0
-            # Opt-in allowlist: when SANDBOXED_AUTOSTACK_REPOS is set, only
-            # the named repos (space- or comma-separated basenames) are
-            # brought up; everything else is skipped. Unset/empty keeps the
-            # broad behaviour (every repo) — but the skip-build guard still
-            # applies. This is what scopes a mission to e.g. just `shop-beta`
-            # instead of every compose file under /workspaces/repos.
-            __allow="${SANDBOXED_AUTOSTACK_REPOS:-}"; __allow="${__allow//,/ }"
-            for __cf in /workspaces/repos/*/docker-compose.yml /workspaces/repos/*/compose.yml; do
-              [ -f "$__cf" ] || continue
-              __repo_dir="$(dirname "$__cf")"
-              __repo_name="$(basename "$__repo_dir")"
-              # Allowlist gate (only enforced when the var is set).
-              if [ -n "$__allow" ]; then
-                case " $__allow " in
-                  *" $__repo_name "*) : ;;
-                  *) echo "[sandboxed] autostack skip $__repo_name (not in SANDBOXED_AUTOSTACK_REPOS)" >>"$__runlog"; continue ;;
-                esac
-              fi
-              # Skip-self: never `up` a compose that builds its image from
-              # source (e.g. sandboxed.sh's own docker-compose.yml with
-              # `build: .`). That triggered a multi-minute rebuild of the
-              # whole product image and starved the backing-service stack the
-              # mission actually needs. Backing stacks (shop-beta, …) are pure
-              # `image:` pulls and pass this guard.
-              if grep -Eq '^[[:space:]]*build[[:space:]]*:' "$__cf"; then
-                echo "[sandboxed] autostack skip $__repo_name (compose builds from source)" >>"$__runlog"
-                continue
-              fi
-              echo "[sandboxed] compose up: $__repo_dir" >>"$__runlog"
-              if (set -o pipefail; cd "$__repo_dir" && docker compose up -d >>"$__runlog" 2>&1); then
-                __upped=$((__upped + 1))
-              else
-                echo "[sandboxed] compose up FAILED in $__repo_dir (continuing)" >>"$__runlog"
-              fi
-            done
-            if [ "$__upped" -gt 0 ]; then
-              touch "$__marker" 2>/dev/null || true
-            fi
-          fi
 
           # --- JS workspace dependency install ----------------------
           # `node_modules` isn't baked into the image and isn't part
