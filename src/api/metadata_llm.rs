@@ -76,14 +76,20 @@ impl MetadataLlmClient {
         }
     }
 
-    /// Generate a title and short description for a mission.
+    /// Generate a title and short description for a mission from a digest of the
+    /// whole conversation.
+    ///
+    /// The title names the mission's *current phase* — what it is working on
+    /// right now — rather than a fixed restatement of the opening request, and
+    /// is expected to evolve as the mission progresses. Pass a digest covering
+    /// the conversation arc (original ask plus recent activity); see the
+    /// caller's `build_conversation_digest`.
     ///
     /// Returns `(title, short_description)` — either or both may be `None` if
     /// the LLM is unavailable or the call fails.
     pub async fn summarize_mission(
         &self,
-        user_message: &str,
-        assistant_reply: &str,
+        conversation_digest: &str,
         existing_title: Option<&str>,
         is_refresh: bool,
     ) -> (Option<String>, Option<String>) {
@@ -98,32 +104,30 @@ impl MetadataLlmClient {
             }
         }; // lock released here before HTTP call
 
-        let user_excerpt = truncate_to(user_message, 600);
-        let assistant_excerpt = truncate_to(assistant_reply, 600);
+        let digest_excerpt = truncate_to(conversation_digest, 4000);
 
         let system_prompt = if is_refresh && existing_title.is_some() {
             format!(
-                "You summarize coding missions. The current title is: \"{}\"\n\
-                 Based on the latest conversation, generate:\n\
-                 1. A short title (3-7 words) summarizing the mission goal. Keep it if still accurate, or update if the focus changed.\n\
+                "You name and track coding missions. You are given a digest of the \
+                 whole conversation, oldest message first. The current title is: \"{}\".\n\
+                 Generate:\n\
+                 1. A short title (3-7 words) naming what the mission is working on RIGHT NOW — its current phase, not a restatement of the original goal. The mission evolves: update the title when the focus has moved on, and keep it only if the current phase still matches.\n\
                  2. A one-sentence status description (max 15 words) of what's currently happening.\n\n\
                  Reply ONLY in this exact format:\n\
                  TITLE: <title>\nSTATUS: <status>",
                 existing_title.unwrap_or("")
             )
         } else {
-            "You summarize coding missions. Given a user request and assistant response, generate:\n\
-             1. A short title (3-7 words) summarizing the mission goal.\n\
+            "You name and track coding missions. You are given a digest of the \
+             conversation so far, oldest message first. Generate:\n\
+             1. A short title (3-7 words) naming what the mission is currently working on — its current phase or focus, not just the opening request.\n\
              2. A one-sentence status description (max 15 words) of what's currently happening.\n\n\
              Reply ONLY in this exact format:\n\
              TITLE: <title>\nSTATUS: <status>"
                 .to_string()
         };
 
-        let user_content = format!(
-            "User request:\n{}\n\nAssistant response:\n{}",
-            user_excerpt, assistant_excerpt
-        );
+        let user_content = format!("Conversation digest:\n{}", digest_excerpt);
 
         let (url, body, auth_header) = match cfg.api_format {
             ApiFormat::Anthropic => {

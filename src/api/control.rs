@@ -1622,6 +1622,81 @@ fn should_accept_metadata_candidate(
         .unwrap_or(true)
 }
 
+/// Build a compact digest of the whole conversation for metadata summarization.
+///
+/// The metadata model needs to see the mission's arc — the original ask plus
+/// what's happening now — to title it by its current phase instead of by just
+/// the first or most recent exchange. We include every user/assistant turn
+/// (tool spam is skipped), collapse and truncate each turn, and cap the total
+/// size. When the conversation is long we keep the first turn (the original
+/// ask) plus the most recent turns and elide the middle, so both ends survive.
+fn build_conversation_digest(history: &[(String, String)]) -> String {
+    const MAX_TURNS: usize = 24;
+    const PER_TURN_BYTES: usize = 240;
+    const MAX_TOTAL_BYTES: usize = 4000;
+
+    let turns: Vec<(&str, &str)> = history
+        .iter()
+        .filter(|(role, content)| {
+            (role == "user" || role == "assistant") && !content.trim().is_empty()
+        })
+        .map(|(role, content)| (role.as_str(), content.trim()))
+        .collect();
+
+    if turns.is_empty() {
+        return String::new();
+    }
+
+    // When there are more turns than we can afford, keep the first turn (the
+    // original ask) plus the most recent turns and elide the middle.
+    let selected: Vec<(usize, (&str, &str))> = if turns.len() > MAX_TURNS {
+        let mut v: Vec<(usize, (&str, &str))> = Vec::with_capacity(MAX_TURNS);
+        v.push((0, turns[0]));
+        let tail_start = turns.len() - (MAX_TURNS - 1);
+        for (idx, turn) in turns.iter().enumerate().skip(tail_start) {
+            v.push((idx, *turn));
+        }
+        v
+    } else {
+        turns.iter().enumerate().map(|(idx, t)| (idx, *t)).collect()
+    };
+
+    let mut out = String::new();
+    let mut last_idx: Option<usize> = None;
+    for (idx, (role, content)) in selected {
+        if let Some(prev) = last_idx {
+            if idx > prev + 1 {
+                out.push_str("[…earlier steps omitted…]\n");
+            }
+        }
+        last_idx = Some(idx);
+
+        let label = if role == "user" { "User" } else { "Assistant" };
+        out.push_str(label);
+        out.push_str(": ");
+        out.push_str(&digest_snippet(content, PER_TURN_BYTES));
+        out.push('\n');
+
+        if out.len() >= MAX_TOTAL_BYTES {
+            out.push_str("[…truncated…]\n");
+            break;
+        }
+    }
+
+    out
+}
+
+/// Collapse a message onto a single line and truncate it to `max_bytes`
+/// (char-boundary safe) for inclusion in a conversation digest.
+fn digest_snippet(content: &str, max_bytes: usize) -> String {
+    let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.len() <= max_bytes {
+        return collapsed;
+    }
+    let end = safe_truncate_index(&collapsed, max_bytes);
+    format!("{}…", &collapsed[..end])
+}
+
 /// Try to generate metadata using the configured LLM provider.
 /// Returns `Some((title, status))` if the LLM was called successfully,
 /// `None` if no LLM is configured or the call failed.
@@ -1638,55 +1713,22 @@ async fn try_llm_metadata_summarization(
         }
     };
 
-    // Gather the most relevant user message and assistant reply
-    let (user_msg, assistant_msg) = if is_refresh {
-        // On refresh, use the most recent exchange
-        let user = history
-            .iter()
-            .rev()
-            .find(|(role, _)| role == "user")
-            .map(|(_, c)| c.as_str())
-            .unwrap_or("");
-        let assistant = history
-            .iter()
-            .rev()
-            .find(|(role, content)| role == "assistant" && assistant_reply_is_successful(content))
-            .map(|(_, c)| c.as_str())
-            .unwrap_or("");
-        (user, assistant)
-    } else {
-        // On bootstrap, use the first exchange
-        let user = history
-            .iter()
-            .find(|(role, _)| role == "user")
-            .map(|(_, c)| c.as_str())
-            .unwrap_or("");
-        let assistant = history
-            .iter()
-            .find(|(role, content)| role == "assistant" && assistant_reply_is_successful(content))
-            .map(|(_, c)| c.as_str())
-            .unwrap_or("");
-        (user, assistant)
-    };
-
-    if user_msg.is_empty() && assistant_msg.is_empty() {
+    // Feed the model a digest of the *whole* conversation (original ask plus
+    // recent activity) so the generated title reflects the mission's current
+    // phase rather than just the first or most recent exchange.
+    let digest = build_conversation_digest(history);
+    if digest.trim().is_empty() {
         return None;
     }
 
     tracing::info!(
-        "[MetadataLLM] Calling summarize_mission (is_refresh={}, user_len={}, assistant_len={})",
+        "[MetadataLLM] Calling summarize_mission (is_refresh={}, digest_len={})",
         is_refresh,
-        user_msg.len(),
-        assistant_msg.len()
+        digest.len()
     );
 
     let (title, status) = llm
-        .summarize_mission(
-            user_msg,
-            assistant_msg,
-            mission.title.as_deref(),
-            is_refresh,
-        )
+        .summarize_mission(&digest, mission.title.as_deref(), is_refresh)
         .await;
 
     tracing::info!(
@@ -1785,6 +1827,12 @@ fn conversational_message_count(history: &[(String, String)]) -> usize {
         .count()
 }
 
+/// How many conversational messages (user + assistant) must accumulate since the
+/// last metadata refresh before we re-summarize the mission's title/status. One
+/// refresh roughly every 20 messages keeps the evolving current-phase title up
+/// to date without re-summarizing on every turn.
+const METADATA_REFRESH_CADENCE_MESSAGES: usize = 20;
+
 fn should_refresh_metadata_by_cadence(
     mission_id: Uuid,
     mission: &Mission,
@@ -1814,7 +1862,7 @@ fn should_refresh_metadata_by_cadence(
         return false;
     }
 
-    conversational_count.saturating_sub(*baseline) >= 10
+    conversational_count.saturating_sub(*baseline) >= METADATA_REFRESH_CADENCE_MESSAGES
 }
 
 fn record_metadata_refresh_baseline(mission_id: Uuid, conversational_count: usize) {
@@ -17393,20 +17441,88 @@ And the report:
 
         clear_mission_metadata_refresh_state(mission.id);
 
+        // First observation with existing metadata seeds the baseline at 24.
         assert!(!should_refresh_metadata_by_cadence(
             mission.id, &mission, 24, false
         ));
+        // A shorter rewritten history rebases the baseline down to 4.
         assert!(!should_refresh_metadata_by_cadence(
             mission.id, &mission, 4, false
         ));
+        // One short of the cadence from the rebased baseline: still no refresh.
         assert!(!should_refresh_metadata_by_cadence(
-            mission.id, &mission, 13, false
+            mission.id,
+            &mission,
+            4 + METADATA_REFRESH_CADENCE_MESSAGES - 1,
+            false
         ));
+        // Reaching the cadence threshold triggers a refresh.
         assert!(should_refresh_metadata_by_cadence(
-            mission.id, &mission, 14, false
+            mission.id,
+            &mission,
+            4 + METADATA_REFRESH_CADENCE_MESSAGES,
+            false
         ));
 
         clear_mission_metadata_refresh_state(mission.id);
+    }
+
+    #[test]
+    fn test_build_conversation_digest_includes_turns_and_skips_tool_noise() {
+        let history = vec![
+            ("user".to_string(), "Fix the flaky CI pipeline".to_string()),
+            (
+                "assistant".to_string(),
+                "Looking at the retry logic now".to_string(),
+            ),
+            ("tool".to_string(), "{\"ran\": \"pytest\"}".to_string()),
+            ("system".to_string(), "ignored noise".to_string()),
+            (
+                "assistant".to_string(),
+                "Found a race in the auth fixture".to_string(),
+            ),
+        ];
+
+        let digest = build_conversation_digest(&history);
+
+        assert!(digest.contains("User: Fix the flaky CI pipeline"));
+        assert!(digest.contains("Assistant: Looking at the retry logic now"));
+        assert!(digest.contains("Assistant: Found a race in the auth fixture"));
+        // Non-conversational entries (tool/system) are excluded.
+        assert!(!digest.contains("pytest"));
+        assert!(!digest.contains("ignored noise"));
+        // A short conversation is included contiguously, with no elision marker.
+        assert!(!digest.contains("omitted"));
+    }
+
+    #[test]
+    fn test_build_conversation_digest_elides_middle_of_long_conversations() {
+        let mut history: Vec<(String, String)> =
+            vec![("user".to_string(), "ORIGINAL ASK".to_string())];
+        for idx in 0..60 {
+            let role = if idx % 2 == 0 { "assistant" } else { "user" };
+            history.push((role.to_string(), format!("middle turn {idx}")));
+        }
+        history.push(("assistant".to_string(), "LATEST ACTIVITY".to_string()));
+
+        let digest = build_conversation_digest(&history);
+
+        // Both ends of the conversation survive: the original ask and the most
+        // recent activity.
+        assert!(digest.contains("ORIGINAL ASK"));
+        assert!(digest.contains("LATEST ACTIVITY"));
+        // The middle is elided rather than dumped wholesale.
+        assert!(digest.contains("earlier steps omitted"));
+        assert!(!digest.contains("middle turn 10"));
+    }
+
+    #[test]
+    fn test_digest_snippet_collapses_whitespace_and_truncates() {
+        assert_eq!(digest_snippet("  hello \n\n   world  ", 100), "hello world");
+
+        let truncated = digest_snippet("abcdefghijklmnopqrstuvwxyz", 10);
+        assert!(truncated.starts_with("abcdefghij"));
+        assert!(truncated.ends_with('…'));
     }
 
     #[tokio::test]
@@ -17463,14 +17579,25 @@ And the report:
 
         record_metadata_refresh_baseline_from_mission(mission.id, &mission);
 
+        // Baseline was rebased to the mission's 3 conversational messages (the
+        // tool entry does not count).
         assert!(!should_refresh_metadata_by_cadence(
-            mission.id, &mission, 11, false
+            mission.id,
+            &mission,
+            3 + METADATA_REFRESH_CADENCE_MESSAGES - 2,
+            false
         ));
         assert!(!should_refresh_metadata_by_cadence(
-            mission.id, &mission, 12, false
+            mission.id,
+            &mission,
+            3 + METADATA_REFRESH_CADENCE_MESSAGES - 1,
+            false
         ));
         assert!(should_refresh_metadata_by_cadence(
-            mission.id, &mission, 13, false
+            mission.id,
+            &mission,
+            3 + METADATA_REFRESH_CADENCE_MESSAGES,
+            false
         ));
 
         clear_mission_metadata_refresh_state(mission.id);
