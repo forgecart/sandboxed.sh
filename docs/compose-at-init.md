@@ -56,8 +56,6 @@ phase=ready — without ever having typed anything.
 
 | Where | What |
 |-------|------|
-| `docker/workspace-base/daemon.json` | Pinned at build time. `registry-mirrors: ["http://nexus.nexus.svc.cluster.local:8089"]` + `insecure-registries`. Routes Docker-Hub pulls through the cluster-internal Nexus group repo. |
-| `docker/workspace-base/Dockerfile` | `COPY` the daemon.json into `/etc/docker/`. No entrypoint changes — `dockerd` reads daemon.json on start. |
 | `docker/workspace-base/bashenv.sh` | The old autostack compose-up block is gone. Docker login + JS dep install pass remain. |
 | `src/k8s_pod.rs::run_compose_up_with_logs` | The new owner. One `kubectl exec` runs a bash script that walks `/workspaces/repos/*/`, applies the `SANDBOXED_AUTOSTACK_REPOS` allowlist, skips composes with `build:` directives, and `docker compose up -d 2>&1` per repo. Per-line stdout streams through a `(repo, line) -> Fut` callback. |
 | `src/api/control.rs::spawn_mission_pod_bootstrap` | Inserts a `run_compose_up_with_logs` call between `dockerd_starting` and `wait_compose_healthy` for fresh K8sPod missions. |
@@ -65,37 +63,40 @@ phase=ready — without ever having typed anything.
 | `dashboard/src/app/control/control-client.tsx` | `composeLogsByMission` state + `mission_compose_log` SSE handler (200-line ring buffer per repo). |
 | `dashboard/src/components/fork-progress-overlay.tsx` | `LogTail` renders the last 30 lines per repo beneath `compose_starting` row. Auto-scrolls on update. |
 
-## Nexus mirror behaviour
+## Registry auth
 
-`registry-mirrors` only mirrors **Docker Hub** transparently. So:
+The in-pod dockerd has no `daemon.json` and no Nexus
+`registry-mirrors` — pulls go to the upstream registries directly
+(Docker Hub, ghcr.io, quay.io, `registry.forgecart.com`). For
+private registries (`registry.forgecart.com/forgecart/*`), the
+backend's `run_compose_up_with_logs` script does a foreground
+`docker login` (silent, fail-soft) for each registry whose
+`*_USERNAME` + `*_TOKEN` env vars are set on the workspace before
+running `docker compose up -d`. This avoids the race that bit us
+when `bashenv.sh` ran the same logins in a backgrounded subshell.
 
-| Compose image ref | Where Docker pulls it from |
-|-------------------|---------------------------|
-| `postgres:15` | Nexus 8089 (Hub proxy) |
-| `redis:7-alpine` | Nexus 8089 (Hub proxy) |
-| `clickhouse/clickhouse-server:24` | Nexus 8089 (Hub proxy) |
-| `ghcr.io/foo/bar:1.0` | ghcr.io direct (bypasses Nexus) |
-| `quay.io/x/y:2.3` | quay.io direct |
-| `registry.forgecart.com/foo:bar` | registry.forgecart.com direct |
+Recognised env-var pairs:
 
-To capture non-Hub upstreams transparently you'd need a
-containerd-based runtime with per-registry `hosts.toml` mirror
-config. That's an explicit non-goal here — the Docker-Hub mirror
-is the 80/20.
+| Registry | Username var | Token var |
+|----------|--------------|-----------|
+| `registry.forgecart.com` | `FORGECART_REGISTRY_USERNAME` | `FORGECART_REGISTRY_TOKEN` |
+| `index.docker.io` | `DOCKERHUB_USERNAME` | `DOCKERHUB_TOKEN` |
+| `ghcr.io` | `GHCR_USERNAME` | `GH_TOKEN` |
 
 ## Verification
 
-1. Build + push workspace-base image with the new daemon.json:
-   `gh workflow run build-and-publish.yml`.
-2. `kubectl --kubeconfig=…workload -n sandboxed-sh rollout restart deploy/sandboxed-sh`.
-3. Create a fresh K8sPod mission with compose repos cloned.
-4. Open the mission immediately. Within ~20 s of pod scheduling
+1. CI builds + rolls a new workspace-base image with the
+   `imagePullPolicy: Always` + bashenv autostack changes.
+2. Create a fresh K8sPod mission against a workspace with
+   `INITIAL_REPOS` set.
+3. Open the mission immediately. Within ~20 s of pod scheduling
    the `compose_starting` row should appear in the overlay with:
    - Per-service status rows from `pod_message.services`.
    - One log block per repo showing the last 30 lines of
-     `docker compose up -d` output.
-5. Composer is hard-blocked until phase=ready.
-6. After ready, send a message. Verify the agent's `bash` shell
+     `docker compose up -d` output, with a small tab strip if
+     multiple repos brought compose stacks up.
+4. Composer is hard-blocked until phase=ready.
+5. After ready, send a message. Verify the agent's `bash` shell
    does **not** re-trigger compose-up — the autostack block in
    bashenv.sh is gone.
 
@@ -104,6 +105,4 @@ is the 80/20.
 | Symptom | Cause | Mitigation |
 |---------|-------|------------|
 | `compose_starting` row appears but log tail stays empty | `kubectl exec` for the bash script failed; check backend warn log `compose-up exec failed during bootstrap` | Re-roll the deploy or inspect the pod with `kubectl describe`. |
-| Log lines show "no such host: nexus.nexus.svc.cluster.local" | Pod can't resolve in-cluster DNS — usually means CoreDNS is down, not a daemon.json issue | Check `kubectl -n kube-system get pods` |
-| Slow first-time pulls despite mirror | First-ever Nexus pull populates Hub cache from upstream | Subsequent pulls hit the cache; latency is one-time per image |
-| Compose log tail mentions ghcr.io / quay.io directly | Image ref is non-Hub — bypasses mirror by design | Replace with Hub-shaped tag if possible, or accept the egress |
+| Pull error `no basic auth credentials` for `registry.forgecart.com/...` | The matching `_USERNAME` / `_TOKEN` env vars aren't forwarded to the workspace pod | Add them to the workspace's env_vars (visible to the pod). |

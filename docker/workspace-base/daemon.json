@@ -1,4 +1,0 @@
-{
-  "registry-mirrors": ["http://nexus.nexus.svc.cluster.local:8089"],
-  "insecure-registries": ["nexus.nexus.svc.cluster.local:8089"]
-}

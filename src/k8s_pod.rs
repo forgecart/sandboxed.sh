@@ -1120,6 +1120,29 @@ impl K8sPodClient {
             r#"set +e
             SANDBOXED_AUTOSTACK_REPOS="{allow}"
             __allow="${{SANDBOXED_AUTOSTACK_REPOS//,/ }}"
+            # Docker logins for private registries. bashenv.sh runs
+            # the same logins in a backgrounded subshell, but compose-up
+            # is a *foreground* race against it — the first `docker
+            # pull` against `registry.forgecart.com/...` fires before
+            # the background login lands and fails with "no basic
+            # auth credentials". Run the logins inline here, silent,
+            # fail-soft. The bashenv marker still works for agent
+            # shells later.
+            __dlogin() {{
+              local reg="$1" uvar="$2" tvar="$3"
+              local user token
+              eval "user=\${{$uvar:-}}"
+              eval "token=\${{$tvar:-}}"
+              [ -z "$user" ] || [ -z "$token" ] && return 0
+              printf '%s' "$token" | docker login "$reg" -u "$user" --password-stdin >/dev/null 2>&1 || true
+            }}
+            echo "@@@COMPOSE@@@ __DLOGIN__"
+            echo "logging in to registries (best-effort) ..."
+            __dlogin "registry.forgecart.com"      FORGECART_REGISTRY_USERNAME FORGECART_REGISTRY_TOKEN
+            __dlogin "https://index.docker.io/v1/" DOCKERHUB_USERNAME           DOCKERHUB_TOKEN
+            __dlogin "ghcr.io"                     GHCR_USERNAME                GH_TOKEN
+            echo "logins done"
+
             for __cf in /workspaces/repos/*/docker-compose.yml /workspaces/repos/*/compose.yml; do
               [ -f "$__cf" ] || continue
               __repo_dir="$(dirname "$__cf")"
