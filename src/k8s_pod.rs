@@ -1958,14 +1958,47 @@ done
         md.push_str("```\n\n");
         md.push_str(
             "## Mission pod environment\n\n\
-             - **Docker** daemon runs inside this pod; if a project has `docker-compose.yml` \
-               (or `compose.yml`) it has already been brought up automatically by the \
-               BASH_ENV auto-stack hook. Inspect with `docker compose ps` from the repo dir.\n\
+             - **Docker** daemon runs inside this pod. Each cloned repo's `docker-compose.yml` \
+               (or `compose.yml`) is brought up at **pod boot** by the backend bootstrap \
+               orchestrator (`spawn_mission_pod_bootstrap` → `run_compose_up_with_logs`) — \
+               **not** the BASH_ENV hook — with per-line logs streamed to the dashboard. \
+               Inspect with `docker compose ps` from the repo dir. If the stack isn't up yet \
+               (still pulling) or a service is missing, bring it up yourself with \
+               `docker compose up -d` from the repo dir. When tearing down, use \
+               `docker compose down` **without** `-v` so seeded volumes survive.\n\
              - **Kubeconfig** (workload cluster) is at `~/.kube/config`.\n\
              - **Pre-installed**: `bash`, `git`, `gh`, `kubectl`, `terraform`, `node`, `pnpm`, \
                `docker`, `docker compose`, plus `claude` and `opencode` CLIs.\n\
              - **`/workspaces`** (this directory) is scratch — write per-project work into the \
                correct `/workspaces/repos/<name>/` subdir, not at `/workspaces` root.\n",
+        );
+        md.push_str(
+            "\n### Environment is pre-provisioned — use it as-is\n\n\
+             The pod provisions the environment before your first command, so in most cases \
+             you **just run the project's own commands** — no env setup, no hand-written \
+             `/tmp/*.env` files.\n\n\
+             - **Service connection env is already exported into every shell** via the \
+               `BASH_ENV` hook (`/etc/sandboxed-bashenv.sh`): e.g. `DB_HOST`, `DB_PORT`, \
+               `DB_USERNAME`, `DB_PASSWORD`, `DB_DATABASE`, \
+               `CLICKHOUSE_URL`/`_USERNAME`/`_PASSWORD`/`_DATABASE`, `REDIS_URL`, \
+               `RABBITMQ_URL`, `ELASTICSEARCH_URL`, plus `DOCKER_CONFIG`. **Don't re-export \
+               these or write a throwaway `/tmp/*.env`** — every `bash -c` inherits them. \
+               Run `env | sort` to confirm before assuming anything is missing.\n\
+             - **JS workspace deps are auto-installed** by the same hook (`pnpm install` / \
+               `npm ci` / `yarn` / `bun install`, picked from each repo's lockfile), so `nx` / \
+               jest / etc. exist without a manual install. No-op for non-JS repos — a Rust \
+               repo builds with `cargo` (and may require `cargo fmt --all` before CI passes; \
+               check its `agents.md`).\n\
+             - **Private-registry logins are already done** (`registry.forgecart.com`, \
+               Docker Hub, ghcr — when creds are forwarded), so `docker compose` can pull \
+               private images.\n\
+             - **One real caveat — the pre-set DB points at *dev*:** `DB_DATABASE`/\
+               `CLICKHOUSE_DATABASE` default to the **dev** databases. If a project's \
+               e2e/seed flow is destructive (a `seed:drop`/reset), override the DB name \
+               **inline, for that one command only** (e.g. prefix it with \
+               `DB_DATABASE=<project>_e2e`) so you don't drop and reseed the dev DB. That \
+               override is usually the *only* env change you ever need — everything else is \
+               inherited.\n",
         );
         md.push_str(
             "\n## Repo CI listener\n\n\
