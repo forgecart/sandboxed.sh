@@ -1221,6 +1221,18 @@ impl K8sPodClient {
                                 if trimmed == "__DONE__" {
                                     break;
                                 }
+                                // Sentinel-prefixed pseudo-names are
+                                // *control* messages (login phase,
+                                // setup phase, etc.) — they're not real
+                                // repos and should not surface as
+                                // dashboard tabs. Suppress them by
+                                // clearing current_repo so any output
+                                // until the next real `@@@COMPOSE@@@ <repo>`
+                                // is discarded.
+                                if trimmed.starts_with("__") && trimmed.ends_with("__") {
+                                    current_repo = None;
+                                    continue;
+                                }
                                 current_repo = Some(trimmed.to_string());
                                 continue;
                             }
