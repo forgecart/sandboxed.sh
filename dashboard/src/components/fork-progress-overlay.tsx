@@ -269,9 +269,22 @@ function LogTail({ lines }: { lines: string[] }) {
 // shared scrolling pane. Active tab auto-switches to whichever repo
 // gained the most lines this render — unless the operator clicked
 // a specific tab, in which case the auto-switch is suspended until
-// the overlay closes (next ready phase).
-function ComposeLogConsole({ logs }: { logs: Record<string, string[]> }) {
-  const repos = useMemo(() => Object.keys(logs).sort(), [logs]);
+// the next ready phase.
+//
+// Renders unconditionally while compose_starting is the active row
+// (parent passes `logs` defaulting to `{}` when no events have
+// arrived yet). The component renders its placeholder pre even
+// when there are no repos so React can preserve the activeRepo /
+// manualPick local state across the first batch of SSE events —
+// otherwise an unmount/mount transition would reset the tab choice
+// on every props change.
+function ComposeLogConsole({
+  logs,
+}: {
+  logs: Record<string, string[]> | null | undefined;
+}) {
+  const safeLogs = logs ?? {};
+  const repos = useMemo(() => Object.keys(safeLogs).sort(), [safeLogs]);
   const [activeRepo, setActiveRepo] = useState<string | null>(null);
   const [manualPick, setManualPick] = useState(false);
   const lastCounts = useRef<Record<string, number>>({});
@@ -281,49 +294,54 @@ function ComposeLogConsole({ logs }: { logs: Record<string, string[]> }) {
     let bestDelta = 0;
     for (const r of repos) {
       const prev = lastCounts.current[r] ?? 0;
-      const delta = (logs[r]?.length ?? 0) - prev;
+      const delta = (safeLogs[r]?.length ?? 0) - prev;
       if (delta > bestDelta) {
         bestDelta = delta;
         next = r;
       }
     }
-    for (const r of repos) lastCounts.current[r] = logs[r]?.length ?? 0;
-    if (next === null && repos.length > 0) {
+    for (const r of repos) lastCounts.current[r] = safeLogs[r]?.length ?? 0;
+    if ((next === null || !repos.includes(next)) && repos.length > 0) {
       next = repos.reduce((a, b) =>
-        (logs[a]?.length ?? 0) >= (logs[b]?.length ?? 0) ? a : b,
+        (safeLogs[a]?.length ?? 0) >= (safeLogs[b]?.length ?? 0) ? a : b,
       );
     }
     if (next !== activeRepo) setActiveRepo(next);
-  }, [logs, repos, activeRepo, manualPick]);
-  if (repos.length === 0) return null;
-  const lines = activeRepo ? (logs[activeRepo] ?? []) : [];
+  }, [safeLogs, repos, activeRepo, manualPick]);
+  const lines = activeRepo ? (safeLogs[activeRepo] ?? []) : [];
   return (
     <div className="mt-2 ml-6 overflow-hidden rounded-md border border-white/[0.06] bg-black/30">
       <div className="flex items-center gap-0.5 overflow-x-auto border-b border-white/[0.06] bg-white/[0.02] px-1 py-0.5">
-        {repos.map((r) => {
-          const count = logs[r]?.length ?? 0;
-          const isActive = r === activeRepo;
-          return (
-            <button
-              key={r}
-              type="button"
-              onClick={() => {
-                setManualPick(true);
-                setActiveRepo(r);
-              }}
-              className={cn(
-                "shrink-0 rounded px-2 py-0.5 font-mono text-[10px] transition-colors",
-                isActive
-                  ? "bg-white/10 text-white/90"
-                  : "text-white/40 hover:bg-white/[0.04] hover:text-white/70",
-              )}
-              title={`${r}: ${count} lines`}
-            >
-              {r}
-              <span className="ml-1 text-white/30">{count}</span>
-            </button>
-          );
-        })}
+        {repos.length === 0 ? (
+          <span className="px-2 py-0.5 font-mono text-[10px] italic text-white/30">
+            (no compose output yet)
+          </span>
+        ) : (
+          repos.map((r) => {
+            const count = safeLogs[r]?.length ?? 0;
+            const isActive = r === activeRepo;
+            return (
+              <button
+                key={r}
+                type="button"
+                onClick={() => {
+                  setManualPick(true);
+                  setActiveRepo(r);
+                }}
+                className={cn(
+                  "shrink-0 rounded px-2 py-0.5 font-mono text-[10px] transition-colors",
+                  isActive
+                    ? "bg-white/10 text-white/90"
+                    : "text-white/40 hover:bg-white/[0.04] hover:text-white/70",
+                )}
+                title={`${r}: ${count} lines`}
+              >
+                {r}
+                <span className="ml-1 text-white/30">{count}</span>
+              </button>
+            );
+          })
+        )}
       </div>
       <LogTail lines={lines} />
     </div>
@@ -444,10 +462,14 @@ export function ForkProgressOverlay({
 
                 {/* Tabbed console for `docker compose up -d` output —
                     one tab per repo, shared scrolling pane. Streamed
-                    by `src/api/repo-… run_compose_up_with_logs`. */}
-                {isCurrent &&
-                  rowPhase === "compose_starting" &&
-                  composeLogs && <ComposeLogConsole logs={composeLogs} />}
+                    by `run_compose_up_with_logs`. Always mounted
+                    while compose_starting is the active row so the
+                    local activeRepo / manualPick state survives the
+                    first SSE event (when composeLogs flips from
+                    null to a populated object). */}
+                {isCurrent && rowPhase === "compose_starting" && (
+                  <ComposeLogConsole logs={composeLogs ?? {}} />
+                )}
 
                 {/* Plaintext sub-message if backend used a non-JSON pod_message
                     (legacy) and this row is active. */}
