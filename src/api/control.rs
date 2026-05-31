@@ -8815,6 +8815,8 @@ async fn control_actor_loop(
         workspaces: &workspace::SharedWorkspaceStore,
         mission_store: &Arc<dyn MissionStore>,
         events_tx: &broadcast::Sender<AgentEvent>,
+        initial_repos: Vec<super::github_app::RepoSelection>,
+        github_app: Option<Arc<super::github_app::GithubAppClient>>,
     ) {
         let mission_id = mission.id;
         let workspace_id = mission.workspace_id;
@@ -8961,41 +8963,74 @@ async fn control_actor_loop(
                     message: "Starting compose services".to_string(),
                 });
 
-                // Wait for the main control thread's
-                // `clone_repos_in_pod` to drop its `/workspaces/.repos-cloned`
-                // sentinel. Without this, compose-up runs concurrent
-                // with the clone, finds `/workspaces/repos/` empty,
-                // and goes ready with no services actually started.
-                // Only blocks when the workspace declares
-                // `INITIAL_REPOS` (otherwise no clone is queued and
-                // the marker never appears — proceed immediately).
+                // repos_cloning — actually do the clone *inside* the
+                // bootstrap, between dockerd_starting and
+                // compose_starting. The lazy clone path in
+                // `run_mission_turn` only fires when the user sends
+                // their first message; if compose-up depended on
+                // that, fresh missions would always launch with an
+                // empty /workspaces/repos and the user would see
+                // "compose_starting → ready" instantly with no
+                // services. Verified live on mission 54488bee.
+                // `clone_repos_in_pod` is idempotent (probes for
+                // `.git` and skips), so the lazy clone in
+                // `run_mission_turn` will see everything already
+                // present and exit immediately.
                 let ws_snapshot = workspaces.get(workspace_id).await;
-                let expects_repos = ws_snapshot
-                    .as_ref()
-                    .and_then(|w| w.env_vars.get("INITIAL_REPOS"))
-                    .map(|s| !s.trim().is_empty())
-                    .unwrap_or(false);
-                if expects_repos {
-                    match k8s
-                        .wait_for_repos_cloned_marker(
+                if !initial_repos.is_empty() {
+                    if let Some(client) = github_app.as_ref() {
+                        let detail = serde_json::json!({
+                            "label": "Cloning repos",
+                            "count": initial_repos.len(),
+                        })
+                        .to_string();
+                        let _ = mission_store
+                            .update_mission_pod_phase(
+                                mission_id,
+                                Some("repos_cloning"),
+                                Some(&detail),
+                            )
+                            .await;
+                        let _ = events_tx.send(AgentEvent::MissionPodStartup {
                             mission_id,
-                            std::time::Duration::from_secs(180),
-                        )
-                        .await
-                    {
-                        Ok(true) => tracing::info!(
+                            phase: "repos_cloning".to_string(),
+                            message: format!(
+                                "Cloning {} repo{}",
+                                initial_repos.len(),
+                                if initial_repos.len() == 1 { "" } else { "s" }
+                            ),
+                        });
+                        match client.installation_token().await {
+                            Ok(token) => {
+                                let pod_dir = std::path::PathBuf::from("/workspaces");
+                                let results = k8s
+                                    .clone_repos_in_pod(
+                                        mission_id,
+                                        &initial_repos,
+                                        &token,
+                                        &pod_dir,
+                                    )
+                                    .await;
+                                let ok = results.iter().filter(|r| r.success).count();
+                                tracing::info!(
+                                    mission_id = %mission_id,
+                                    cloned = ok,
+                                    failed = results.len().saturating_sub(ok),
+                                    "bootstrap: in-pod clone complete"
+                                );
+                            }
+                            Err(e) => tracing::warn!(
+                                mission_id = %mission_id,
+                                error = %e,
+                                "bootstrap: could not mint GitHub App token; skipping clone"
+                            ),
+                        }
+                    } else {
+                        tracing::warn!(
                             mission_id = %mission_id,
-                            "compose-up gate: repos clone marker observed"
-                        ),
-                        Ok(false) => tracing::warn!(
-                            mission_id = %mission_id,
-                            "compose-up gate: timed out waiting for repos clone marker; proceeding"
-                        ),
-                        Err(e) => tracing::warn!(
-                            mission_id = %mission_id,
-                            error = %e,
-                            "compose-up gate: clone-marker probe errored; proceeding"
-                        ),
+                            count = initial_repos.len(),
+                            "bootstrap: initial_repos set but GitHub App not configured; skipping clone"
+                        );
                     }
                 }
 
@@ -9834,8 +9869,19 @@ async fn control_actor_loop(
                                 // mission's pod NOW (eager) so the
                                 // dashboard can render live boot
                                 // progress while the user composes
-                                // their first message.
-                                spawn_mission_pod_bootstrap(&mission, &workspaces, &mission_store, &events_tx);
+                                // their first message. The bootstrap
+                                // also drives the in-pod clone of
+                                // `initial_repos` so compose-up has
+                                // something to run against before the
+                                // first message lands.
+                                spawn_mission_pod_bootstrap(
+                                    &mission,
+                                    &workspaces,
+                                    &mission_store,
+                                    &events_tx,
+                                    initial_repos.clone(),
+                                    github_app.clone(),
+                                );
 
                                 let _ = respond.send(Ok(mission));
                             }

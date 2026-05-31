@@ -48,6 +48,7 @@ const FRESH_ORDER = [
   "container_ready",
   "init_script_running",
   "dockerd_starting",
+  "repos_cloning",
   "compose_starting",
   "ready",
 ] as const;
@@ -71,6 +72,7 @@ const PHASE_LABELS: Record<PhaseId, string> = {
   init_script_running: "Run workspace init script",
   // shared
   dockerd_starting: "Start Docker daemon",
+  repos_cloning: "Clone repos",
   compose_starting: "Start docker-compose services",
   ready: "Ready",
 };
