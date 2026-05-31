@@ -590,16 +590,25 @@ done
 #[derive(Deserialize)]
 struct ListCommitsParams {
     repo: String,
+    /// Page size — max commits to return in this call.
     #[serde(default)]
     limit: Option<usize>,
+    /// Commits to skip from HEAD before returning `limit` of them
+    /// (`git log --skip`). Drives infinite-scroll pagination:
+    /// page N requests offset = N * limit.
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 /// `git log` per repo. Returns one entry per commit:
 ///   { hash, short_hash, subject, author, timestamp }
 /// `timestamp` is a Unix epoch in seconds (number, not string)
-/// so the client can format with `Date()`. Default limit 100;
-/// hard-capped at 500 to keep the response bounded on very old
-/// repos.
+/// so the client can format with `Date()`.
+///
+/// Paginated: `limit` is the page size (default 50, capped 200)
+/// and `offset` skips that many commits from HEAD (`--skip`). The
+/// client requests successive pages until one comes back with
+/// fewer than `limit` entries (end of history).
 async fn list_commits(tx: &WsTx, id: &str, mission_id: Uuid, params: Value) {
     let p: ListCommitsParams = match serde_json::from_value(params) {
         Ok(p) => p,
@@ -608,7 +617,8 @@ async fn list_commits(tx: &WsTx, id: &str, mission_id: Uuid, params: Value) {
     if p.repo.is_empty() || p.repo.contains('/') || p.repo.contains("..") {
         return send_error(tx, Some(id), "invalid repo").await;
     }
-    let limit = p.limit.unwrap_or(100).clamp(1, 500);
+    let limit = p.limit.unwrap_or(50).clamp(1, 200);
+    let offset = p.offset.unwrap_or(0);
     let k8s = match crate::k8s_pod::global_client() {
         Some(c) => c,
         None => return send_error(tx, Some(id), "pod unavailable").await,
@@ -618,10 +628,19 @@ async fn list_commits(tx: &WsTx, id: &str, mission_id: Uuid, params: Value) {
     // Separator) between commits. These never appear in
     // reasonable commit subjects, so we don't need shell-escape
     // gymnastics on the parsing side.
+    //
+    // NOTE: git emits a raw byte only via its `%xNN` placeholder
+    // (e.g. `%x1f`). A bare `\x1f` is NOT a git escape — git
+    // prints the four characters `\x1f` verbatim. With that the
+    // real 0x1f/0x1e bytes the parser below splits on never
+    // appear, so every commit collapses into one garbage record
+    // (huge bogus hash, empty author/subject, timestamp 0). Keep
+    // the `%x..` form.
     let script = format!(
         "cd {} 2>/dev/null && \
-         git log -n {} --pretty=format:'%H\\x1f%h\\x1f%s\\x1f%an\\x1f%at\\x1e' 2>/dev/null || true",
+         git log --skip={} -n {} --pretty=format:'%H%x1f%h%x1f%s%x1f%an%x1f%at%x1e' 2>/dev/null || true",
         shell_quote(&repo_dir),
+        offset,
         limit,
     );
     let out = match k8s

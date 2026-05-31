@@ -1761,7 +1761,11 @@ done
                 "https://x-access-token:{token}@github.com/{}.git",
                 sel.full_name
             );
-            let mut clone_cmd = String::from("git clone --depth=1 ");
+            // Full clone (no --depth) so History can show the repo's
+            // complete commit history in the dashboard. Mirrors the
+            // host-workspace clone in github_app.rs; --branch below
+            // still controls the checkout while all history is fetched.
+            let mut clone_cmd = String::from("git clone ");
             if let Some(branch) = sel.branch.as_deref().filter(|b| !b.trim().is_empty()) {
                 clone_cmd.push_str(&format!("--branch {} ", shell_quote(branch)));
             }

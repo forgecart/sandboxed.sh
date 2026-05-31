@@ -366,7 +366,12 @@ impl GithubAppClient {
                 sel.full_name
             );
             let mut cmd = tokio::process::Command::new("git");
-            cmd.arg("clone").arg("--depth=1");
+            // Full clone (no --depth) so the dashboard's History panel
+            // can show the repo's complete commit history, not just the
+            // tip. Without --depth git also drops the implied
+            // --single-branch, so all branches + full history are
+            // fetched; --branch below still controls the checkout.
+            cmd.arg("clone");
             if let Some(branch) = sel.branch.as_deref().filter(|b| !b.trim().is_empty()) {
                 cmd.arg("--branch").arg(branch);
             }

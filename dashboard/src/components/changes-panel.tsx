@@ -1898,15 +1898,61 @@ interface CommitFile {
   status: string;
 }
 
+/** Commits fetched per page by the History panel. 50 rows
+ *  comfortably overflow the (short) History section, so the
+ *  first page is always tall enough to scroll. */
+const HISTORY_PAGE_SIZE = 50;
+/** Fetch the next page once the bottom sentinel comes within
+ *  this many px of the scroll viewport's bottom edge. */
+const HISTORY_SCROLL_BUFFER_PX = 300;
+
+/** Accumulated, paginated commit history for a single repo. */
+interface RepoHistory {
+  commits: GitCommit[];
+  /** Next `git log --skip` offset to request — equals the count
+   *  of commits the server has returned for this repo so far. */
+  offset: number;
+  /** False once a page returns fewer than HISTORY_PAGE_SIZE
+   *  commits (end of history). */
+  hasMore: boolean;
+  loading: boolean;
+  error: string | null;
+}
+
+const EMPTY_HISTORY: RepoHistory = {
+  commits: [],
+  offset: 0,
+  hasMore: true,
+  loading: false,
+  error: null,
+};
+
+/** Walk up from `el` to the nearest scrollable ancestor so the
+ *  IntersectionObserver can use it as `root` (the History panel
+ *  renders inside SectionShell's `overflow-y-auto` body, not its
+ *  own scroller). Falls back to the viewport (`null`). */
+function findScrollParent(el: HTMLElement | null): HTMLElement | null {
+  let node: HTMLElement | null = el?.parentElement ?? null;
+  while (node) {
+    const oy = getComputedStyle(node).overflowY;
+    if (oy === "auto" || oy === "scroll" || oy === "overlay") return node;
+    node = node.parentElement;
+  }
+  return null;
+}
+
 /**
  * History panel — picks a repo from a dropdown, lists its
- * recent commits, and on commit click expands inline to show
- * the files that commit changed. Clicking a file opens a diff
- * tab comparing parent vs commit.
+ * commits newest-first, and on commit click expands inline to
+ * show the files that commit changed. Clicking a file opens a
+ * diff tab comparing parent vs commit.
  *
- * Commit list lazy-loads per repo (one `git log` exec on first
- * select). Commit files lazy-load per commit (one `git
- * diff-tree` per expansion).
+ * Commits load a page at a time (`list_commits` with limit +
+ * offset). An IntersectionObserver on a bottom sentinel fetches
+ * the next page whenever the user scrolls within
+ * HISTORY_SCROLL_BUFFER_PX of the bottom, until a short page
+ * marks the end of history. Commit files lazy-load per commit
+ * (one `git diff-tree` per expansion).
  */
 function HistoryPanel({
   missionId,
@@ -1924,9 +1970,22 @@ function HistoryPanel({
   ) => void;
 }) {
   const [activeRepo, setActiveRepo] = useState<string | null>(null);
-  const [commits, setCommits] = useState<Record<string, GitCommit[]>>({});
-  const [loadingRepo, setLoadingRepo] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [histories, setHistories] = useState<Record<string, RepoHistory>>({});
+
+  // Latest snapshots for reads inside async callbacks / the
+  // observer, which would otherwise close over stale state.
+  const historiesRef = useRef(histories);
+  useEffect(() => {
+    historiesRef.current = histories;
+  }, [histories]);
+  const activeRepoRef = useRef(activeRepo);
+  useEffect(() => {
+    activeRepoRef.current = activeRepo;
+  }, [activeRepo]);
+
+  // Prevents two concurrent page loads for the same repo (the
+  // observer can tick repeatedly while a fetch is in flight).
+  const inFlightRef = useRef<Set<string>>(new Set());
 
   // Pick the first repo automatically. If allRepos changes
   // (e.g. comes back from list_repos) and we haven't picked
@@ -1937,34 +1996,99 @@ function HistoryPanel({
     }
   }, [allRepos, activeRepo]);
 
-  // Lazy-load commits for the active repo.
-  useEffect(() => {
-    if (!activeRepo || commits[activeRepo]) return;
-    let cancelled = false;
-    setLoadingRepo(activeRepo);
-    setError(null);
-    void (async () => {
+  // Fetch the next page for `repo` and append it. No-ops if a
+  // load is already in flight for that repo or its history is
+  // exhausted.
+  const loadMore = useCallback(
+    async (repo: string) => {
+      if (!repo || inFlightRef.current.has(repo)) return;
+      const cur = historiesRef.current[repo];
+      if (cur && !cur.hasMore) return;
+      const offset = cur?.offset ?? 0;
+
+      inFlightRef.current.add(repo);
+      setHistories((prev) => {
+        const existing = prev[repo] ?? EMPTY_HISTORY;
+        return { ...prev, [repo]: { ...existing, loading: true, error: null } };
+      });
+
       try {
         const stream = getWorkspaceStream(missionId);
         const body = await stream.call<{ commits: GitCommit[] }>(
           "list_commits",
-          { repo: activeRepo, limit: 100 },
+          { repo, limit: HISTORY_PAGE_SIZE, offset },
         );
-        if (!cancelled) {
-          setCommits((prev) => ({ ...prev, [activeRepo]: body.commits }));
-        }
+        const page = body.commits ?? [];
+        setHistories((prev) => {
+          const existing = prev[repo] ?? EMPTY_HISTORY;
+          // Defensive dedup by hash — pagination is positional so
+          // overlaps shouldn't occur, but a duplicate React key
+          // would break list rendering.
+          const seen = new Set(existing.commits.map((c) => c.hash));
+          const fresh = page.filter((c) => !seen.has(c.hash));
+          return {
+            ...prev,
+            [repo]: {
+              commits: existing.commits.concat(fresh),
+              // Advance by what the server returned (not by what
+              // survived dedup) so `--skip` stays aligned.
+              offset: offset + page.length,
+              hasMore: page.length === HISTORY_PAGE_SIZE,
+              loading: false,
+              error: null,
+            },
+          };
+        });
       } catch (e) {
-        if (!cancelled) {
-          setError(e instanceof Error ? e.message : String(e));
-        }
+        const msg = e instanceof Error ? e.message : String(e);
+        setHistories((prev) => {
+          const existing = prev[repo] ?? EMPTY_HISTORY;
+          return {
+            ...prev,
+            [repo]: { ...existing, loading: false, error: msg },
+          };
+        });
       } finally {
-        if (!cancelled) setLoadingRepo(null);
+        inFlightRef.current.delete(repo);
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [activeRepo, commits, missionId]);
+    },
+    [missionId],
+  );
+
+  // Kick off page 1 the first time a repo becomes active.
+  useEffect(() => {
+    if (activeRepo && !historiesRef.current[activeRepo]) {
+      void loadMore(activeRepo);
+    }
+  }, [activeRepo, loadMore]);
+
+  // Bottom sentinel → IntersectionObserver. The callback ref
+  // re-attaches when the node mounts; the observer's root is the
+  // panel's scrollable ancestor so `rootMargin` measures the
+  // buffer against the real scroll viewport.
+  const observerRef = useRef<IntersectionObserver | null>(null);
+  const attachSentinel = useCallback(
+    (node: HTMLDivElement | null) => {
+      observerRef.current?.disconnect();
+      observerRef.current = null;
+      if (!node) return;
+      const obs = new IntersectionObserver(
+        (entries) => {
+          if (!entries.some((e) => e.isIntersecting)) return;
+          const repo = activeRepoRef.current;
+          if (repo) void loadMore(repo);
+        },
+        {
+          root: findScrollParent(node),
+          rootMargin: `0px 0px ${HISTORY_SCROLL_BUFFER_PX}px 0px`,
+        },
+      );
+      obs.observe(node);
+      observerRef.current = obs;
+    },
+    [loadMore],
+  );
+  useEffect(() => () => observerRef.current?.disconnect(), []);
 
   if (allRepos.length === 0) {
     return (
@@ -1973,6 +2097,12 @@ function HistoryPanel({
       </p>
     );
   }
+
+  const history = activeRepo ? histories[activeRepo] : undefined;
+  const commits = history?.commits ?? [];
+  const initialLoading = !!history?.loading && commits.length === 0;
+  const loadingMore = !!history?.loading && commits.length > 0;
+
   return (
     <div>
       <div className="px-3 py-2 border-b border-white/[0.04]">
@@ -1988,17 +2118,26 @@ function HistoryPanel({
           ))}
         </select>
       </div>
-      {loadingRepo && (
+      {initialLoading && (
         <div className="px-3 py-2 text-[11px] text-white/40 flex items-center gap-2">
           <Loader2 className="h-3 w-3 animate-spin" /> Loading commits…
         </div>
       )}
-      {error && (
-        <div className="px-3 py-2 text-[11px] text-red-300/80">{error}</div>
+      {history?.error && (
+        <div className="px-3 py-2 text-[11px] text-red-300/80">
+          {history.error}
+        </div>
       )}
-      {!loadingRepo && activeRepo && commits[activeRepo] && (
+      {!initialLoading &&
+        activeRepo &&
+        history &&
+        commits.length === 0 &&
+        !history.error && (
+          <p className="px-3 py-2 text-[11px] text-white/40">No commits.</p>
+        )}
+      {activeRepo && commits.length > 0 && (
         <ul className="divide-y divide-white/[0.04]">
-          {commits[activeRepo].map((cp) => (
+          {commits.map((cp) => (
             <CommitRow
               key={cp.hash}
               missionId={missionId}
@@ -2008,6 +2147,23 @@ function HistoryPanel({
             />
           ))}
         </ul>
+      )}
+      {/* Sentinel + status row. Rendered whenever a repo is
+          selected so the observer always has a stable node to
+          watch as the list grows. */}
+      {activeRepo && (
+        <div ref={attachSentinel} className="px-3 py-2">
+          {loadingMore && (
+            <div className="flex items-center gap-2 text-[11px] text-white/40">
+              <Loader2 className="h-3 w-3 animate-spin" /> Loading more…
+            </div>
+          )}
+          {history && !history.loading && !history.hasMore && commits.length > 0 && (
+            <div className="text-center text-[10px] uppercase tracking-wide text-white/25">
+              · end of history ·
+            </div>
+          )}
+        </div>
       )}
     </div>
   );
