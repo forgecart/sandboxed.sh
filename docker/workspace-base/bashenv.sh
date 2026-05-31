@@ -62,6 +62,20 @@ export -f gh
 # bash returns immediately and the agent's command proceeds without
 # waiting on image pulls.
 
+# Docker credential parity — same $HOME split the kubeconfig block at the
+# bottom of this file handles. The `docker login` below runs in this
+# root-context background subshell, so by default it writes creds to
+# /root/.docker/config.json. But the AGENT's shell runs with $HOME = the
+# per-mission PVC dir, so its `docker` looked in $HOME/.docker and found
+# nothing: public images (Nexus-proxied, pulled anonymously) still worked,
+# but private `registry.forgecart.com/forgecart/*` images failed with
+# "no basic auth credentials" and aborted `docker compose up`. Pin
+# DOCKER_CONFIG to one fixed, pod-shared path so BOTH the login below and
+# every agent shell that sources this file read the same config. Exported
+# unconditionally (outside the dockerd guard) so the agent gets it even on
+# execs where the gated background work is skipped.
+export DOCKER_CONFIG="${DOCKER_CONFIG:-/root/.docker}"
+
 if [ -z "${SANDBOXED_BASHENV_DONE:-}" ] && command -v dockerd >/dev/null 2>&1; then
   export SANDBOXED_BASHENV_DONE=1
 
@@ -78,11 +92,18 @@ if [ -z "${SANDBOXED_BASHENV_DONE:-}" ] && command -v dockerd >/dev/null 2>&1; t
       #      released by its trap and leaked into /var/run for the life
       #      of the pod.
       #   2. a SIGKILL (OOM / pod eviction / probe timeout) bypasses the
-      #      trap entirely, leaking the lock. The autostack lock lives on
-      #      the /workspaces PVC, which SURVIVES pod restarts, so a single
-      #      leak wedged compose-up + dep-install for every later exec AND
-      #      every later pod on that workspace until someone rmdir'd it by
-      #      hand. That is the "initial docker run still doesn't run".
+      #      trap entirely, leaking the lock. BOTH locks therefore live on
+      #      ephemeral tmpfs under /var/run, NEVER on the /workspaces PVC.
+      #      The PVC survives pod restarts and is snapshot-copied into
+      #      forked missions, so a lock dir left there wedged compose-up +
+      #      dep-install for every later exec AND every later pod on that
+      #      workspace. Worse, PVC materialisation reset the leaked dir's
+      #      mtime to pod-boot time, so the 30-min stale-steal below never
+      #      fired within a pod's lifetime — a permanent wedge ("initial
+      #      docker run still doesn't run"). On tmpfs a fresh pod always
+      #      starts lock-free, and the dir mtime reflects real creation
+      #      time so the steal genuinely self-heals an in-pod leak. Keep
+      #      both lock paths on /var/run — do not move them to /workspaces.
       # Fix: a single trap that releases every lock THIS subshell holds,
       # plus stale-lock recovery so a dead holder's lock self-heals.
       __held_locks=""
@@ -136,7 +157,7 @@ if [ -z "${SANDBOXED_BASHENV_DONE:-}" ] && command -v dockerd >/dev/null 2>&1; t
         # later execs after the stack is already up — e.g. when a
         # repo is cloned, or its lockfile changes, after the first
         # compose-up has already been marked done.
-        if __acquire_lock /workspaces/.sandboxed-autostack-lock; then
+        if __acquire_lock /var/run/.sandboxed-autostack-lock; then
 
           # --- docker compose up -d (once per pod) ------------------
           # Marker-gated: the stack only needs bringing up once.
