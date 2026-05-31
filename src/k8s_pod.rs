@@ -1806,7 +1806,67 @@ done
             .write_mission_claude_md(mission_id, &results, pod_dest_root)
             .await;
 
+        // Sentinel for spawn_mission_pod_bootstrap's compose-up step
+        // to wait on. Without this, the bootstrap orchestrator
+        // (running concurrent with this clone in a separate tokio
+        // task) would race past `wait_dockerd_ready` into
+        // `run_compose_up_with_logs` while `/workspaces/repos/` is
+        // still empty, find nothing to do, and flip the pod_phase
+        // to `ready` with no compose services actually started.
+        // The bootstrap polls this marker via
+        // `wait_for_repos_cloned_marker` below.
+        let marker = pod_dest_root.join(".repos-cloned");
+        let _ = self
+            .exec_command(
+                mission_id,
+                None,
+                "/bin/sh",
+                &[
+                    "-lc".to_string(),
+                    format!("touch {}", shell_quote(&marker.to_string_lossy())),
+                ],
+                &HashMap::new(),
+            )
+            .await;
+
         results
+    }
+
+    /// Block until `/workspaces/.repos-cloned` exists inside the
+    /// mission pod, polled every 2 s, capped at `timeout`. Used by
+    /// `spawn_mission_pod_bootstrap` to gate `compose_up` on the
+    /// concurrent `clone_repos_in_pod` finishing. Returns `Ok(true)`
+    /// if the marker appeared, `Ok(false)` on timeout — the caller
+    /// proceeds either way (a workspace with no `INITIAL_REPOS`
+    /// never gets the marker; the bootstrap should still run
+    /// compose-up against whatever's on the volume).
+    pub async fn wait_for_repos_cloned_marker(
+        &self,
+        mission_id: Uuid,
+        timeout: Duration,
+    ) -> Result<bool> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let probe = self
+                .exec_command(
+                    mission_id,
+                    None,
+                    "/bin/sh",
+                    &[
+                        "-lc".to_string(),
+                        "[ -f /workspaces/.repos-cloned ]".to_string(),
+                    ],
+                    &HashMap::new(),
+                )
+                .await;
+            if probe.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
     }
 
     /// Generate a root `/workspaces/CLAUDE.md` listing every

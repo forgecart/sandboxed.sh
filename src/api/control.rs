@@ -8961,12 +8961,49 @@ async fn control_actor_loop(
                     message: "Starting compose services".to_string(),
                 });
 
+                // Wait for the main control thread's
+                // `clone_repos_in_pod` to drop its `/workspaces/.repos-cloned`
+                // sentinel. Without this, compose-up runs concurrent
+                // with the clone, finds `/workspaces/repos/` empty,
+                // and goes ready with no services actually started.
+                // Only blocks when the workspace declares
+                // `INITIAL_REPOS` (otherwise no clone is queued and
+                // the marker never appears — proceed immediately).
+                let ws_snapshot = workspaces.get(workspace_id).await;
+                let expects_repos = ws_snapshot
+                    .as_ref()
+                    .and_then(|w| w.env_vars.get("INITIAL_REPOS"))
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if expects_repos {
+                    match k8s
+                        .wait_for_repos_cloned_marker(
+                            mission_id,
+                            std::time::Duration::from_secs(180),
+                        )
+                        .await
+                    {
+                        Ok(true) => tracing::info!(
+                            mission_id = %mission_id,
+                            "compose-up gate: repos clone marker observed"
+                        ),
+                        Ok(false) => tracing::warn!(
+                            mission_id = %mission_id,
+                            "compose-up gate: timed out waiting for repos clone marker; proceeding"
+                        ),
+                        Err(e) => tracing::warn!(
+                            mission_id = %mission_id,
+                            error = %e,
+                            "compose-up gate: clone-marker probe errored; proceeding"
+                        ),
+                    }
+                }
+
                 // Pull the SANDBOXED_AUTOSTACK_REPOS allowlist out of
                 // the workspace env (same place bashenv.sh used to
                 // read it). Unset / empty = every cloned repo.
-                let allowlist: Option<String> = workspaces
-                    .get(workspace_id)
-                    .await
+                let allowlist: Option<String> = ws_snapshot
+                    .as_ref()
                     .and_then(|w| w.env_vars.get("SANDBOXED_AUTOSTACK_REPOS").cloned())
                     .filter(|s| !s.trim().is_empty());
                 let log_events_tx = events_tx.clone();
