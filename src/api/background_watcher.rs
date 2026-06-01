@@ -997,4 +997,156 @@ mod tests {
         assert_eq!(out, body);
         assert_eq!(omitted, 0);
     }
+
+    // ── Background-task lifecycle + teardown ──────────────────────────
+    // These guard the path that *ends* a task. The dashboard chip only
+    // leaves "running" when `MissionBgTaskFinished` fires, and that only
+    // fires when `run_tail` returns. Because `tail -F` never EOFs on a
+    // live file, the return is driven by the stream token being
+    // cancelled — which is what `remove()` does. A regression in this
+    // teardown is exactly the reported "stuck / never ends" symptom: a
+    // leaked `tail -F` that outlives the task it was following.
+
+    fn mk_task(shell_id: &str) -> BgTask {
+        BgTask {
+            shell_id: shell_id.to_string(),
+            command: format!("echo {shell_id}"),
+            description: None,
+            output_path: format!("/tmp/{shell_id}.output"),
+            tool_use_id: format!("tu-{shell_id}"),
+            started_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_lists_then_remove_clears() {
+        let w = SharedBackgroundWatcher::new();
+        let mid = Uuid::new_v4();
+        w.register(mid, mk_task("s1")).await;
+        assert_eq!(w.list_for_mission(mid).await.len(), 1);
+        w.remove(mid, "s1").await;
+        assert!(
+            w.list_for_mission(mid).await.is_empty(),
+            "remove() must drop the task so the tick loop stops re-classifying it forever"
+        );
+        // The mission key is reclaimed once its last task is removed.
+        assert!(w.snapshot().await.get(&mid).is_none());
+    }
+
+    #[tokio::test]
+    async fn register_is_idempotent_per_shell_id() {
+        let w = SharedBackgroundWatcher::new();
+        let mid = Uuid::new_v4();
+        w.register(mid, mk_task("s1")).await;
+        w.register(mid, mk_task("s1")).await; // replayed ToolUse → no phantom dup
+        assert_eq!(w.list_for_mission(mid).await.len(), 1);
+        w.register(mid, mk_task("s2")).await;
+        assert_eq!(w.list_for_mission(mid).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn remove_cancels_the_tail_stream_token() {
+        // The core anti-"never ends" invariant: removing a task must
+        // cancel its live-tail token so `run_tail`'s select! wakes on
+        // `cancel.cancelled()`, kills `tail -F`, and emits Finished.
+        let w = SharedBackgroundWatcher::new();
+        let mid = Uuid::new_v4();
+        w.register(mid, mk_task("s1")).await;
+        let token = CancellationToken::new();
+        w.install_stream_token(mid, "s1".to_string(), token.clone())
+            .await;
+        assert!(!token.is_cancelled());
+        w.remove(mid, "s1").await;
+        assert!(
+            token.is_cancelled(),
+            "remove() must cancel the tail token, else `tail -F` leaks forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_cancels_only_the_matching_shell() {
+        // Removing one finished task must not tear down a sibling task's
+        // still-running tail.
+        let w = SharedBackgroundWatcher::new();
+        let mid = Uuid::new_v4();
+        w.register(mid, mk_task("s1")).await;
+        w.register(mid, mk_task("s2")).await;
+        let t1 = CancellationToken::new();
+        let t2 = CancellationToken::new();
+        w.install_stream_token(mid, "s1".to_string(), t1.clone())
+            .await;
+        w.install_stream_token(mid, "s2".to_string(), t2.clone())
+            .await;
+        w.remove(mid, "s1").await;
+        assert!(t1.is_cancelled());
+        assert!(!t2.is_cancelled(), "sibling task's tail must keep running");
+        assert_eq!(w.list_for_mission(mid).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_absent_task_is_noop() {
+        let w = SharedBackgroundWatcher::new();
+        let mid = Uuid::new_v4();
+        w.remove(mid, "ghost").await; // must not panic
+        assert!(w.list_for_mission(mid).await.is_empty());
+    }
+
+    // ── State parsing ────────────────────────────────────────────────
+    // The `.complete` sidecar is the ground-truth "process exited"
+    // signal written by the pod-side daemon. `parse_state_blob` must
+    // surface it (as `is_complete`) so a tick can recognise a finished
+    // task instead of waiting on a live process forever.
+
+    #[test]
+    fn parse_state_blob_detects_complete_sidecar() {
+        let blob = "\
+===HEAD===
+first line
+===TAIL===
+last line
+===SIZE===
+1024
+===TS===
+0\t2026-06-01T00:00:00+00:00
+===COMPLETE===
+YES
+===PS===
+(no pid sidecar)
+===END===
+";
+        let st = parse_state_blob(blob, &mk_task("s1")).expect("parse");
+        assert!(st.is_complete, ".complete=YES must set is_complete");
+        assert_eq!(st.output_head, "first line");
+        assert_eq!(st.output_tail, "last line");
+        assert!(st.last_output_at.is_some());
+        assert!(
+            st.pid_stats.is_none(),
+            "a parenthesised sentinel line is not real ps output"
+        );
+    }
+
+    #[test]
+    fn parse_state_blob_running_task_with_live_pid() {
+        let blob = "\
+===HEAD===
+building
+===TAIL===
+still building
+===SIZE===
+2048
+===TS===
+===COMPLETE===
+NO
+===PS===
+  4242  12.5  3.1  90210 R    01:23
+===END===
+";
+        let st = parse_state_blob(blob, &mk_task("s2")).expect("parse");
+        assert!(!st.is_complete);
+        assert!(st.pid_stats.is_some(), "real ps output must be captured");
+        assert!(
+            st.last_output_at.is_none(),
+            "empty TS section yields no last-output timestamp"
+        );
+    }
 }
