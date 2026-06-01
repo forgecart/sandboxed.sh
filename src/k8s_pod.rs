@@ -858,7 +858,7 @@ impl K8sPodClient {
         requests.insert("cpu".to_string(), Quantity("2000m".to_string()));
         requests.insert("memory".to_string(), Quantity("4Gi".to_string()));
         let mut limits = BTreeMap::new();
-        limits.insert("cpu".to_string(), Quantity("4000m".to_string()));
+        limits.insert("cpu".to_string(), Quantity("8000m".to_string()));
         limits.insert("memory".to_string(), Quantity("16Gi".to_string()));
 
         let container = Container {
