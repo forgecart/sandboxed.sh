@@ -1747,6 +1747,27 @@ done
                 )
                 .await;
             if probe.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+                // Existing checkout (re-run / resume). Deepen it to full
+                // history if it was made by an older shallow clone so the
+                // dashboard's History panel shows the real root instead of
+                // the shallow-boundary commit. Best-effort + non-fatal; git
+                // removes `.git/shallow` on success, so this self-skips next
+                // time. The cloned origin URL still carries the token, so the
+                // fetch authenticates without re-deriving credentials here.
+                let unshallow_cmd = format!(
+                    "cd {0} 2>/dev/null || exit 0; [ -f .git/shallow ] || exit 0; \
+                     git fetch --unshallow",
+                    shell_quote(&target_str)
+                );
+                let _ = self
+                    .exec_command(
+                        mission_id,
+                        None,
+                        "/bin/sh",
+                        &["-lc".to_string(), unshallow_cmd],
+                        &HashMap::new(),
+                    )
+                    .await;
                 results.push(crate::api::github_app::RepoCloneResult {
                     full_name: sel.full_name.clone(),
                     branch: sel.branch.clone(),

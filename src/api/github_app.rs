@@ -351,6 +351,44 @@ impl GithubAppClient {
             // pre-existing repo. Marking success: true so the agent doesn't see
             // a fail-state for a healthy checkout.
             if target.exists() {
+                // Existing checkout (re-run / resume). If it was made by an
+                // older shallow clone, deepen it to full history so the
+                // dashboard's History panel shows the real root instead of
+                // the shallow-boundary commit. Best-effort + non-fatal: an
+                // offline box or an already-complete repo must not turn a
+                // healthy checkout into a fail-state. git removes
+                // `.git/shallow` on success, so this self-skips next time.
+                if target.join(".git/shallow").exists() {
+                    let out = tokio::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&target)
+                        .args(["fetch", "--unshallow"])
+                        .output()
+                        .await;
+                    match out {
+                        Ok(o) if o.status.success() => {
+                            tracing::info!(
+                                repo = %sel.full_name,
+                                "deepened existing shallow checkout to full history"
+                            );
+                        }
+                        Ok(o) => {
+                            let detail = String::from_utf8_lossy(&o.stderr).replace(&token, "***");
+                            tracing::warn!(
+                                repo = %sel.full_name,
+                                detail = %detail.lines().last().unwrap_or(""),
+                                "git fetch --unshallow failed (non-fatal)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                repo = %sel.full_name,
+                                error = %e,
+                                "git fetch --unshallow spawn failed (non-fatal)"
+                            );
+                        }
+                    }
+                }
                 results.push(RepoCloneResult {
                     full_name: sel.full_name.clone(),
                     branch: sel.branch.clone(),
